@@ -102,10 +102,15 @@ async function findExistingAncestor(targetPath: string): Promise<string | undefi
 export async function createPathGuard(workspace: string): Promise<PathGuard> {
   const resolvedWorkspace = path.resolve(workspace)
 
-  // 工作区的真实路径。解析失败就用解析后的绝对路径兜底。
+  // 工作区的真实路径。
+  // 用 resolveRealPath 而不是 fs.realpath:工作区可能还不存在,
+  // 这时要逐级向上找到最近的已存在祖先再解析。
+  // 不这么做的话,Windows 上工作区是短路径(C:\Users\RUNNER~1\...)
+  // 而请求路径解析出长路径(C:\Users\runneradmin\...),
+  // 两边形式不一致会把合法路径误判成越界。
   let realWorkspace = resolvedWorkspace
   try {
-    realWorkspace = await fs.realpath(resolvedWorkspace)
+    realWorkspace = await resolveRealPath(resolvedWorkspace)
   } catch {
     // 工作区还不存在,后续访问会失败,这里不影响边界判断
   }
