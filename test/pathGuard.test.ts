@@ -113,9 +113,9 @@ test('符号链接指向工作区内时被允许', async () => {
 })
 
 test('工作区路径与 realpath 不同时仍能正常访问', async () => {
-  // Windows CI 上 os.tmpdir() 常返回短路径(8.3 形式),而 realpath 返回长路径。
-  // 两者字符串不同但指向同一目录,混用比较基准会把合法路径误判成越界。
-  // 这里用符号链接制造同样的情况。
+  // Windows CI 上 os.tmpdir() 返回短路径(8.3 形式,如 C:\Users\RUNNER~1\...),
+  // 而 realpath 返回长路径(C:\Users\runneradmin\...)。两者字符串不同但指向同一目录。
+  // 这里用符号链接制造同样的情况:工作区用链接路径,请求用真实路径,反之亦然。
   const root = path.join(os.tmpdir(), `grassagent-shortpath-${process.pid}-${Date.now()}`)
   const realDir = path.join(root, 'real')
   const aliasDir = path.join(root, 'alias')
@@ -136,9 +136,32 @@ test('工作区路径与 realpath 不同时仍能正常访问', async () => {
     const absoluteViaAlias = await guard.resolve(path.join(aliasDir, 'file.txt'))
     assert.equal(await fs.readFile(absoluteViaAlias, 'utf-8'), '内容')
 
-    // 工作区内的相对路径要能访问
+    // 工作区内的绝对路径(用真实路径形式)也要能访问
     const viaReal = await guard.resolve(path.join(realDir, 'file.txt'))
     assert.equal(await fs.readFile(viaReal, 'utf-8'), '内容')
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('软链指向外部时即使有原始路径兜底也不能放行', async () => {
+  // 回归测试:曾经有一版实现里,软链解析失败后的兜底判断会放行越界路径。
+  // 兜底只在路径没被真正解析过时才允许生效。
+  const root = path.join(os.tmpdir(), `grassagent-fallback-${process.pid}-${Date.now()}`)
+  const outside = path.join(root, 'outside')
+  const work = path.join(root, 'work')
+  await fs.mkdir(outside, { recursive: true })
+  await fs.mkdir(work, { recursive: true })
+
+  try {
+    await fs.writeFile(path.join(outside, 'secret.txt'), '机密', 'utf-8')
+    await fs.symlink(outside, path.join(work, 'alias'), 'junction')
+
+    const guard = await createPathGuard(work)
+    await assert.rejects(
+      () => guard.resolve(path.join('alias', 'secret.txt')),
+      PathOutsideWorkspaceError,
+    )
   } finally {
     await fs.rm(root, { recursive: true, force: true })
   }

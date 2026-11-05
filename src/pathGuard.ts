@@ -131,38 +131,37 @@ export async function createPathGuard(workspace: string): Promise<PathGuard> {
     // 相对路径锚定到工作目录,绝对路径按原样解析
     const resolved = path.resolve(resolvedWorkspace, trimmed)
 
-    // 第一道:字符串层面的边界检查。拦住 ../ 越界和跨盘路径。
-    // 两个基准都要认:原始形式和真实形式。
-    // Windows 上临时目录常是短路径(8.3 形式),realpath 返回长路径,
-    // 调用方可能用任一种形式传绝对路径进来。
-    const normalizedResolved = normalizeForComparison(resolved)
-    const insideRawWorkspace = isPathInside(comparisonWorkspace, normalizedResolved)
-    const insideRealWorkspace = isPathInside(comparisonRealWorkspace, normalizedResolved)
-    if (!insideRawWorkspace && !insideRealWorkspace) {
-      throw new PathOutsideWorkspaceError(
-        `路径越界,已拒绝访问。目标路径 "${trimmed}" 解析后位于工作目录 "${resolvedWorkspace}" 之外。` +
-        `只能访问工作目录内的文件。`,
-        {
-          requestedPath: trimmed,
-          resolvedPath: resolved,
-          workspace: realWorkspace,
-        },
-      )
-    }
-
-    // 第二道:解析符号链接后的真实边界检查。
-    // 工作区里的软链可能指向外部,这道检查才拦得住。
+    // 解析符号链接,拿到真实路径。
+    // 这一步同时解决两个问题:软链指向外部,以及 Windows 短路径(8.3 形式)。
+    // Windows 上 os.tmpdir() 常返回 C:\Users\RUNNER~1\... 这种短路径,
+    // 而 realpath 返回 C:\Users\runneradmin\... 长路径——两者字符串不同
+    // 但指向同一目录。只做字符串比较会把合法路径误判成越界。
     const realPath = await resolveRealPath(resolved)
-    if (!isPathInside(comparisonRealWorkspace, normalizeForComparison(realPath))) {
-      throw new PathOutsideWorkspaceError(
-        `路径越界,已拒绝访问。目标路径 "${trimmed}" 通过符号链接指向工作目录 "${resolvedWorkspace}" 之外。` +
-        `只能访问工作目录内的文件。`,
-        {
-          requestedPath: trimmed,
-          resolvedPath: realPath,
-          workspace: realWorkspace,
-        },
-      )
+
+    // 边界检查:真实路径 vs 工作区真实路径。
+    // 两边都规范化过,比较才有意义。
+    const normalizedRealPath = normalizeForComparison(realPath)
+    const insideRealWorkspace = isPathInside(comparisonRealWorkspace, normalizedRealPath)
+
+    if (!insideRealWorkspace) {
+      // 兜底:realpath 解析失败时(权限不足、竞态删除等)退回原始路径判断。
+      // 只有在路径没被真正解析过的情况下才能用原始路径兜底——
+      // 否则软链指向外部时,原始路径看着在工作区内,就越过防线了。
+      const realPathUnchanged = realPath === resolved
+      const insideRawWorkspace = realPathUnchanged
+        && isPathInside(comparisonWorkspace, normalizeForComparison(resolved))
+
+      if (!insideRawWorkspace) {
+        throw new PathOutsideWorkspaceError(
+          `路径越界,已拒绝访问。目标路径 "${trimmed}" 解析后位于工作目录 "${resolvedWorkspace}" 之外。` +
+          `只能访问工作目录内的文件。`,
+          {
+            requestedPath: trimmed,
+            resolvedPath: realPath,
+            workspace: realWorkspace,
+          },
+        )
+      }
     }
 
     return realPath
