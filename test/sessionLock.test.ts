@@ -18,7 +18,13 @@ function spawnInstance(sessionFilePath: string): { child: ReturnType<typeof spaw
     ['--experimental-strip-types', cliPath],
     {
       cwd: projectRoot,
-      env: { ...process.env, GRASSAGENT_SESSION_FILE: sessionFilePath },
+      env: {
+        ...process.env,
+        GRASSAGENT_SESSION_FILE: sessionFilePath,
+        // 必须给 API Key:CI 环境没有 .env,配置校验不过的话进程在启动阶段就退出了,
+        // 根本走不到拿锁那步。子进程不会真的调 API,这个 key 只是过校验。
+        GRASSAGENT_API_KEY: process.env.GRASSAGENT_API_KEY ?? 'test-key-for-lock-only',
+      },
       // stdin 必须保持打开:stdin EOF 会让 readline 关闭、TUI 退出、进程释放锁。
       // 用 'ignore' 的话第一个实例会立刻退出,测不出锁的效果。
       stdio: ['pipe', 'pipe', 'pipe'],
