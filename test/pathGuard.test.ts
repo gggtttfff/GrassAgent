@@ -112,8 +112,39 @@ test('符号链接指向工作区内时被允许', async () => {
   }
 })
 
-test('工作区本身是符号链接时不会被误判越界', async () => {
-  const root = path.join(os.tmpdir(), `grassagent-symlink-ws-${process.pid}-${Date.now()}`)
+test('工作区路径与 realpath 不同时仍能正常访问', async () => {
+  // Windows CI 上 os.tmpdir() 常返回短路径(8.3 形式),而 realpath 返回长路径。
+  // 两者字符串不同但指向同一目录,混用比较基准会把合法路径误判成越界。
+  // 这里用符号链接制造同样的情况。
+  const root = path.join(os.tmpdir(), `grassagent-shortpath-${process.pid}-${Date.now()}`)
+  const realDir = path.join(root, 'real')
+  const aliasDir = path.join(root, 'alias')
+  await fs.mkdir(realDir, { recursive: true })
+
+  try {
+    await fs.writeFile(path.join(realDir, 'file.txt'), '内容', 'utf-8')
+    await fs.symlink(realDir, aliasDir, 'junction')
+
+    // 工作区用符号链接路径(模拟短路径场景)
+    const guard = await createPathGuard(aliasDir)
+
+    // 工作区内的相对路径要能访问
+    const resolved = await guard.resolve('file.txt')
+    assert.equal(await fs.readFile(resolved, 'utf-8'), '内容')
+
+    // 工作区内的绝对路径(用符号链接形式)也要能访问
+    const absoluteViaAlias = await guard.resolve(path.join(aliasDir, 'file.txt'))
+    assert.equal(await fs.readFile(absoluteViaAlias, 'utf-8'), '内容')
+
+    // 工作区内的相对路径要能访问
+    const viaReal = await guard.resolve(path.join(realDir, 'file.txt'))
+    assert.equal(await fs.readFile(viaReal, 'utf-8'), '内容')
+  } finally {
+    await fs.rm(root, { recursive: true, force: true })
+  }
+})
+
+test('工作区本身是符号链接时不会被误判越界', async () => {  const root = path.join(os.tmpdir(), `grassagent-symlink-ws-${process.pid}-${Date.now()}`)
   const real = path.join(root, 'real')
   const alias = path.join(root, 'alias')
   await fs.mkdir(real, { recursive: true })

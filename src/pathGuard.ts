@@ -110,25 +110,37 @@ export async function createPathGuard(workspace: string): Promise<PathGuard> {
     // 工作区还不存在,后续访问会失败,这里不影响边界判断
   }
 
-  const comparisonWorkspace = normalizeForComparison(realWorkspace)
+  // 两套比较基准,各有用途:
+  // - resolvedWorkspace:原始形式。相对路径以它为锚点,字符串判断也用它。
+  //   Windows 上临时目录常是短路径(8.3 形式),而 realpath 返回长路径,
+  //   两者字符串不同但指向同一目录。混用会导致合法路径被误判越界。
+  // - realWorkspace:真实路径。符号链接判断用它。
+  const comparisonWorkspace = normalizeForComparison(resolvedWorkspace)
+  const comparisonRealWorkspace = normalizeForComparison(realWorkspace)
 
   const resolve = async (requestedPath: string): Promise<string> => {
     const trimmed = requestedPath.trim()
     if (!trimmed) {
       throw new PathOutsideWorkspaceError('路径不能为空', {
         requestedPath,
-        resolvedPath: realWorkspace,
+        resolvedPath: resolvedWorkspace,
         workspace: realWorkspace,
       })
     }
 
     // 相对路径锚定到工作目录,绝对路径按原样解析
-    const resolved = path.resolve(realWorkspace, trimmed)
+    const resolved = path.resolve(resolvedWorkspace, trimmed)
 
     // 第一道:字符串层面的边界检查。拦住 ../ 越界和跨盘路径。
-    if (!isPathInside(comparisonWorkspace, normalizeForComparison(resolved))) {
+    // 两个基准都要认:原始形式和真实形式。
+    // Windows 上临时目录常是短路径(8.3 形式),realpath 返回长路径,
+    // 调用方可能用任一种形式传绝对路径进来。
+    const normalizedResolved = normalizeForComparison(resolved)
+    const insideRawWorkspace = isPathInside(comparisonWorkspace, normalizedResolved)
+    const insideRealWorkspace = isPathInside(comparisonRealWorkspace, normalizedResolved)
+    if (!insideRawWorkspace && !insideRealWorkspace) {
       throw new PathOutsideWorkspaceError(
-        `路径越界,已拒绝访问。目标路径 "${trimmed}" 解析后位于工作目录 "${realWorkspace}" 之外。` +
+        `路径越界,已拒绝访问。目标路径 "${trimmed}" 解析后位于工作目录 "${resolvedWorkspace}" 之外。` +
         `只能访问工作目录内的文件。`,
         {
           requestedPath: trimmed,
@@ -141,9 +153,9 @@ export async function createPathGuard(workspace: string): Promise<PathGuard> {
     // 第二道:解析符号链接后的真实边界检查。
     // 工作区里的软链可能指向外部,这道检查才拦得住。
     const realPath = await resolveRealPath(resolved)
-    if (!isPathInside(comparisonWorkspace, normalizeForComparison(realPath))) {
+    if (!isPathInside(comparisonRealWorkspace, normalizeForComparison(realPath))) {
       throw new PathOutsideWorkspaceError(
-        `路径越界,已拒绝访问。目标路径 "${trimmed}" 通过符号链接指向工作目录 "${realWorkspace}" 之外。` +
+        `路径越界,已拒绝访问。目标路径 "${trimmed}" 通过符号链接指向工作目录 "${resolvedWorkspace}" 之外。` +
         `只能访问工作目录内的文件。`,
         {
           requestedPath: trimmed,
