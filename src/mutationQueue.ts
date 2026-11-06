@@ -6,7 +6,6 @@
 // 各自改完写回,后写的那个把前一个的修改冲掉了。
 //
 // 做法:按文件真实路径排队,同一路径的操作依次执行,不同路径照常并行。
-// 借鉴 pi 的 file-mutation-queue 设计。
 
 import { realpath } from 'node:fs/promises'
 import { resolve } from 'node:path'

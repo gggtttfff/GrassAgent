@@ -51,19 +51,13 @@ async function main() {
   })
 
   // 会话存储:SQLite,多进程可同时读写同一个库。
-  // 每个进程用独立 sessionId,各存各的会话,互不干扰——
-  // 不像之前的锁文件方案会拒绝第二个实例。
+  // 每个进程用独立 sessionId,各存各的会话,互不干扰。
   const sessionId = config.SessionId ?? generateSessionId()
   const sessionStore = new SessionStore({
     databasePath: config.SessionDatabasePath,
     sessionId,
   })
   logger.info({ sessionId, databasePath: config.SessionDatabasePath }, '会话存储已打开')
-
-  // 进程退出时关闭数据库,确保数据落盘
-  process.once('exit', () => {
-    sessionStore.close()
-  })
 
   // 初始化 context：system prompt 用专用字段，messages 从会话库加载
   const context: Context = {
@@ -116,6 +110,20 @@ async function main() {
   console.log('GrassAgent 已启动。输入内容后回车。')
   tui.start()
 
+  // 进程收尾:停掉 TUI、关掉数据库。
+  // tui.stop() 必须调——readline 在 raw 模式下会改终端状态,
+  // 不清理的话 Ctrl+D 退出后终端还留在原始模式,后续命令看着像失灵了。
+  const shutdown = (): void => {
+    tui.stop()
+    sessionStore.close()
+  }
+  process.once('exit', shutdown)
+  process.once('SIGINT', () => {
+    // 第一次 Ctrl+C 是"打断当前回合",由 TUI 的 keypress 处理。
+    // 走到这里说明用户想退出进程。
+    shutdown()
+    process.exit(130)
+  })
 }
 
 function entryFilePath(entryArgument: string): string {

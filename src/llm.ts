@@ -1,10 +1,8 @@
 // src/llm.ts
 // LLM 门面 —— 对外保留 stream() 的调用方式,内部按模型选 provider。
 //
-// 这一层现在只做三件事:解析 provider、转发调用、注册内置 provider。
+// 这一层只做三件事:解析 provider、转发调用、注册内置 provider。
 // 具体的协议细节(消息转换、SSE 解析)都在 src/providers/ 下,按厂商分文件。
-//
-// 借鉴 pi 的做法:核心循环只依赖统一协议,provider 细节不外泄。
 
 import type { Context } from './messages.ts'
 import {

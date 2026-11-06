@@ -3,8 +3,6 @@
 //
 // 抽象出这一层的意义:agent 循环、上下文压缩、工具调度都不再关心
 // 底层是 OpenAI 兼容、Anthropic 还是本地模型。加新 provider = 实现这个接口 + 注册。
-//
-// 借鉴 pi 的做法:统一 LLM API 放在 packages/ai,核心循环 packages/agent 只依赖协议。
 
 import type { Context } from './messages.ts'
 import type { Transport } from './transport.ts'

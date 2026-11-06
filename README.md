@@ -11,7 +11,7 @@
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
-- **会话持久化** —— 追加式 JSONL，进程崩溃也不会丢历史
+- **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
 - **路径沙箱** —— 文件读写和命令执行都限制在工作区内
@@ -149,13 +149,17 @@ npm start
 
 队列是可重入的：工具内部自己再包一层也不会死等。同一文件的操作严格按调用顺序执行，模型说「先写 A 再改 A」就是这个顺序。
 
+一个工具要改多个文件时，会按路径排序后依次拿锁——所有工具用同一套排序，不会出现两个工具互相等对方锁的死锁。
+
+还有一种是工具压根不该并发：声明 `sequential: true`，它就会单独跑，不和同一轮里的其他工具抢跑。
+
 结果事件的顺序始终和模型发出的顺序一致，不按完成顺序——UI 显示和模型意图能对上，排障时不用猜。
 
 想退回串行：`GRASSAGENT_TOOL_EXECUTION=sequential`。
 
 **会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
-WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——不像之前的 JSONL 方案要靠锁文件拒绝第二个实例。
+WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——允许多实例同时跑。
 
 `node:sqlite` 目前是实验性 API，会打印 `ExperimentalWarning`。启动脚本已加 `--disable-warning=ExperimentalWarning` 精确静音这一类警告（其他警告不受影响），`src/sessionStore.ts` 里还有一层运行时兜底，直接跑 `node src/cli.ts` 也是干净的。
 
@@ -227,6 +231,8 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
 然后加进 `builtinTools()` 的返回数组。工具是纯函数，不持有 agent 状态。
 
 不声明 `mutatesFiles` 的工具可以自由并发。声明了但操作的是「读-改-写」流程的（像 `edit`），必须声明，否则并发时会丢更新。
+
+工具压根不该并发（比如要独占某个资源），声明 `sequential: true`，它会单独跑，不和同一轮里的其他工具抢跑。
 
 ## License
 

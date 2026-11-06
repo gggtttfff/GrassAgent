@@ -4,8 +4,6 @@
 // 分层的意义:内部表示不绑定任何一家厂商的协议。
 // 只有在真正发请求的边界(见 src/providers/)才转成 OpenAI/Anthropic 等格式。
 // 这样加一个新 provider 只需要写一个转换器,不用改 agent 循环和上下文管理。
-//
-// 借鉴 pi 的做法:AgentMessage 是内部类型,convertToLlm 只在 LLM 调用边界发生。
 
 /** 内容块:文本 */
 export interface TextBlock {
@@ -77,8 +75,8 @@ export function buildToolResultMessage(
   }
 }
 
-// 会话文件的兼容处理。
-// 早期版本的 session.jsonl 用的是同样的结构,但字段名可能不一致
+// 会话记录的兼容处理。
+// 早期版本用 JSONL 文件存会话,结构一样但字段名可能不一致
 // (比如 content 数组里的 tool_use 叫 name/input,tool_result 叫 tool_use_id)。
 // 这里做一次归一化,坏数据宁可跳过也不要让整个会话加载失败。
 
