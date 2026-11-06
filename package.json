@@ -10,10 +10,10 @@
   },
   "keywords": ["ai", "agent", "llm", "openai", "cli"],
   "scripts": {
-    "start": "node --experimental-strip-types src/cli.ts",
+    "start": "node --disable-warning=ExperimentalWarning --experimental-strip-types src/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types e2e-smoke.ts",
-    "test:unit": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "test": "node --disable-warning=ExperimentalWarning --experimental-strip-types e2e-smoke.ts",
+    "test:unit": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec \"test/**/*.test.ts\"",
     "test:all": "npm run typecheck && npm run test:unit && npm test"
   },
   "engines": {

@@ -1,6 +1,6 @@
 // src/cli.ts
 // 拼装层 —— 把 llm / agent / tui / tools / config 粘起来，是唯一入口。
-// session 持久化：每轮结束把 context.messages append 到 ~/.grassagent/session.jsonl。
+// session 持久化：每轮结束把 context.messages 写进 ~/.grassagent/sessions.db。
 
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +10,7 @@ import { builtinTools } from './tools.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { createLoggerFromConfig } from './logger.ts'
 import { createTransport } from './transport.ts'
-import { SessionStore, SessionLockError } from './session.ts'
+import { SessionStore, generateSessionId } from './sessionStore.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
@@ -50,32 +50,25 @@ async function main() {
     logger,
   })
 
-  // 会话存储:持锁,防止多进程写坏同一个会话文件
-  let sessionStore: SessionStore
-  try {
-    sessionStore = await SessionStore.open({
-      filePath: config.SessionFile,
-      maxFileBytes: config.SessionMaxFileBytes,
-      maxBackupFiles: config.SessionMaxBackupFiles,
-    })
-  } catch (error) {
-    if (error instanceof SessionLockError) {
-      console.error(`[grassagent] ${error.message}`)
-      process.exit(1)
-    }
-    throw error
-  }
+  // 会话存储:SQLite,多进程可同时读写同一个库。
+  // 每个进程用独立 sessionId,各存各的会话,互不干扰——
+  // 不像之前的锁文件方案会拒绝第二个实例。
+  const sessionId = config.SessionId ?? generateSessionId()
+  const sessionStore = new SessionStore({
+    databasePath: config.SessionDatabasePath,
+    sessionId,
+  })
+  logger.info({ sessionId, databasePath: config.SessionDatabasePath }, '会话存储已打开')
 
-  // 进程退出时释放锁。锁文件残留会被 staleLockMs 后的接管逻辑清理,但正常退出要主动清掉。
-  const releaseSessionLock = () => {
-    void sessionStore.release()
-  }
-  process.once('exit', releaseSessionLock)
+  // 进程退出时关闭数据库,确保数据落盘
+  process.once('exit', () => {
+    sessionStore.close()
+  })
 
-  // 初始化 context：system prompt 用专用字段，messages 从 session 文件加载
+  // 初始化 context：system prompt 用专用字段，messages 从会话库加载
   const context: Context = {
     systemPrompt: SYSTEM_PROMPT,
-    messages: await sessionStore.load(),
+    messages: sessionStore.load(),
   }
 
   // 工具的文件访问被限制在工作区内

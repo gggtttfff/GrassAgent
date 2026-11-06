@@ -16,6 +16,7 @@ cli.ts → agent.ts → llm.ts → protocol.ts
 config.ts  pathGuard.ts
    ↓
 logger.ts / transport.ts / retry.ts
+sessionStore.ts
 ```
 
 `messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。
@@ -65,9 +66,11 @@ logger.ts / transport.ts / retry.ts
 
 **9. 工具参数必须先校验再执行。** `agent.ts` 在执行前调 `validateToolArguments`，校验失败不执行工具，把错误回填给 context 让模型重发。执行时要用校验后的参数（类型转换的结果要生效），不是原始参数。
 
-**10. 会话存储的锁是进程生命周期级的。** `SessionStore.open` 拿不到锁就抛 `SessionLockError`，第二个实例应当直接退出。不要为了"方便"把锁降级成只保护单次写——那样防不住语义交错（两个进程往同一对话交替写消息）。
+**10. 会话用 SQLite 存，不自己管锁文件。** `src/sessionStore.ts` 用 Node 内置的 `node:sqlite`，WAL 模式 + `busy_timeout` 支持多进程并发读写。每个进程独立的 `sessionId`，会话互相隔离。不要再加锁文件机制——SQLite 已经处理了，而且锁文件方案会拒绝第二个实例，多会话共存更合理。
 
 **11. `createPathGuard` 和 `builtinTools` 是异步的。** 它们要先 `realpath` 解析工作区的真实路径才能做沙箱判断。改动它们的调用方时要跟着 await。
+
+**12. `node:sqlite` 的实验性警告要压掉。** 启动脚本用 `--disable-warning=ExperimentalWarning`（按类型精确静音，不影响其他警告），`src/sessionStore.ts` 里还有运行时兜底。**兜底必须拦 `process.emit` 而不是 `process.emitWarning`**——Node 派发警告走的是前者，只拦后者无效（实测过）。
 
 ## 已知取舍
 
@@ -88,11 +91,13 @@ logger.ts / transport.ts / retry.ts
 
 ## 会话存储
 
-`~/.grassagent/session.jsonl`，追加式写入。`SessionStore` 负责轮转和并发保护，详见 `src/session.ts`。
+`~/.grassagent/sessions.db`，SQLite 库。`SessionStore` 负责读写，详见 `src/sessionStore.ts`。
 
-`sync(messages)` 传的是**完整会话列表**，不是增量——内部按 `persistedCount` 切片只写新增部分。传增量会写不进去（切片后为空）。
+`sync(messages)` 传的是**完整会话列表**，不是增量——内部按 `persistedCount` 切片只写新增部分。传增量会写不进去（切片后为空）。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏配对关系。
 
-跨进程测试时，spawn 出来的子进程 stdin 必须保持打开（`stdio: ['pipe', ...]`）：stdin EOF 会让 readline 关闭、TUI 退出、进程释放锁，用 `'ignore'` 测不出锁的效果。
+多进程可以同时用同一个库文件（WAL 模式），各自的 `sessionId` 隔离。想接着上次的对话，把上次的 `sessionId` 传给 `GRASSAGENT_SESSION_ID`。
+
+跨进程测试时，spawn 出来的子进程 stdin 必须保持打开（`stdio: ['pipe', ...]`）：stdin EOF 会让 readline 关闭、TUI 退出、进程提前结束。
 
 ## 提交规范
 

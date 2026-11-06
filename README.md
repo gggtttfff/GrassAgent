@@ -35,7 +35,7 @@ src/
   transport.ts   传输层：超时 + 重试 + 并发控制
   pathGuard.ts   沙箱层：路径越界检测
   validation.ts  校验层：工具参数 JSON Schema 校验 + 类型转换
-  session.ts     会话层：JSONL 存储 + 文件轮转 + 并发写保护
+  sessionStore.ts 会话层：SQLite 存储（node:sqlite，零依赖）
 
 test/            单元测试（node:test，无测试框架依赖）
 e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 27 项断言
@@ -87,9 +87,8 @@ npm start
 | `GRASSAGENT_REQUEST_TIMEOUT_MS` | 请求超时毫秒 | `120000` |
 | `GRASSAGENT_LOG_LEVEL` | 日志级别 | `info` |
 | `GRASSAGENT_LOG_FORMAT` | `json` 或 `pretty` | `json` |
-| `GRASSAGENT_SESSION_FILE` | 会话文件路径 | `~/.grassagent/session.jsonl` |
-| `GRASSAGENT_SESSION_MAX_FILE_BYTES` | 会话文件轮转阈值（字节） | `5242880` |
-| `GRASSAGENT_SESSION_MAX_BACKUP_FILES` | 保留几个备份文件 | `5` |
+| `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
+| `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -115,7 +114,7 @@ npm start
   → 边收边把文本增量推给 TUI 显示
   → 模型决定调工具 → tools.ts 执行（路径过沙箱）
   → 结果回填 context，再调一次模型
-  → 模型不再调工具 → 回合结束，消息追加到 session.jsonl
+  → 模型不再调工具 → 回合结束，消息写入 sessions.db
 ```
 
 几个刻意保留的细节，也是这个项目想讲清楚的东西：
@@ -126,7 +125,7 @@ npm start
 
 **上下文压缩。** 消息超过 50 条时，先让模型总结前 30 条，用摘要替换，保留最近 20 条。压缩失败则保留原样，不会用空摘要毁掉整个会话。
 
-**容错读取会话。** `session.jsonl` 是逐行解析的，坏行跳过而不是整个文件丢弃。进程崩溃可能写出半行 JSON，逐行容错才能保住剩下的历史。
+**容错读取会话。** 消息在 SQLite 里按序列号存，读出来逐条校验结构，坏行跳过而不是丢弃整个会话。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏 tool_call / tool_result 的配对关系。
 
 **参数 JSON 损坏的兜底。** tool_call 的参数是流式拼接的 JSON，可能因为截断或模型输出错误而无法解析。解析失败时不会当成空对象 `{}` 传给工具——那会让 `write_file` 拿到 `undefined` 路径乱写。而是标记为无效、跳过执行，把错误回填给模型让它重发。
 
@@ -142,14 +141,18 @@ npm start
 
 **provider 分层。** 内部消息模型不绑定任何厂商协议，只有在真正发请求的边界才转成 OpenAI/Anthropic 等格式。加一个新 provider = 实现 `Provider` 接口 + 注册，agent 循环一行都不用改。
 
-**会话文件的轮转和并发保护。** 会话是追加式 JSONL，跑久了会无限增长，所以超过阈值（默认 5MB）就滚动成 `session.1.jsonl`、`session.2.jsonl`……启动时按时间顺序把备份和当前文件拼起来，历史不会丢。
+**会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
-并发保护用的是**会话所有权**（锁文件），不是只保护单次写。只锁单次写能防住文件行交错，但防不住语义交错——两个进程往同一个对话交替写消息，上下文会互相污染。所以第二个实例启动时会直接被拒绝并提示。持锁进程崩溃留下的残留锁会被自动接管（检查 pid 是否还活着）。想同时跑多个实例，用 `GRASSAGENT_SESSION_FILE` 给它们指定不同的会话文件。
+WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——不像之前的 JSONL 方案要靠锁文件拒绝第二个实例。
+
+`node:sqlite` 目前是实验性 API，会打印 `ExperimentalWarning`。启动脚本已加 `--disable-warning=ExperimentalWarning` 精确静音这一类警告（其他警告不受影响），`src/sessionStore.ts` 里还有一层运行时兜底，直接跑 `node src/cli.ts` 也是干净的。
+
+> 早期版本用 JSONL 文件存会话。升级后旧文件不会自动导入，需要的话可以自己写脚本转换。
 
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑

@@ -75,17 +75,12 @@ export const configSchema = z.object({
     error: 'LogFormat 只能是 json 或 pretty',
   }).default('json'),
 
-  // 会话存储
-  SessionFile: z.string().min(1, { error: 'SessionFile 不能为空' })
-    .default(() => path.join(os.homedir(), '.grassagent', 'session.jsonl')),
-  // 会话文件超过这个字节数就轮转
-  SessionMaxFileBytes: numericOption({
-    minimum: 1024, maximum: 1024 * 1024 * 1024, defaultValue: 5 * 1024 * 1024, label: 'SessionMaxFileBytes',
-  }),
-  // 保留几个轮转出来的备份文件
-  SessionMaxBackupFiles: numericOption({
-    minimum: 0, maximum: 100, defaultValue: 5, label: 'SessionMaxBackupFiles',
-  }),
+  // 会话存储。SQLite 数据库文件,多个进程可以同时读写同一个文件,
+  // 各自的会话用 sessionId 隔离。
+  SessionDatabasePath: z.string().min(1, { error: 'SessionDatabasePath 不能为空' })
+    .default(() => path.join(os.homedir(), '.grassagent', 'sessions.db')),
+  // 会话 ID。留空则每次启动自动生成,相当于开一个新会话。
+  SessionId: z.string().min(1, { error: 'SessionId 不能为空' }).optional(),
 
   // run_bash 的命令超时。编译、跑测试这类任务通常要超过默认的 3 秒
   CommandTimeoutMs: numericOption({
@@ -120,9 +115,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   RequestTimeoutMs: `${ENV_PREFIX}REQUEST_TIMEOUT_MS`,
   LogLevel: `${ENV_PREFIX}LOG_LEVEL`,
   LogFormat: `${ENV_PREFIX}LOG_FORMAT`,
-  SessionFile: `${ENV_PREFIX}SESSION_FILE`,
-  SessionMaxFileBytes: `${ENV_PREFIX}SESSION_MAX_FILE_BYTES`,
-  SessionMaxBackupFiles: `${ENV_PREFIX}SESSION_MAX_BACKUP_FILES`,
+  SessionDatabasePath: `${ENV_PREFIX}SESSION_DATABASE_PATH`,
+  SessionId: `${ENV_PREFIX}SESSION_ID`,
   CommandTimeoutMs: `${ENV_PREFIX}COMMAND_TIMEOUT_MS`,
 }
 
