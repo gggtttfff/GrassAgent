@@ -77,7 +77,7 @@ const server = createServer((req, res) => {
     const next = queue.shift()
     if (!next) {
       // 队列被提前耗尽说明用例编排与实际请求轮数不符,保留告警便于定位
-      console.warn('[mock] 响应队列已空,返回 500')
+      console.warn(`[mock] 响应队列已空,返回 500 (第 ${receivedRequests.length} 个请求)`)
       res.writeHead(500).end('no responder queued')
       return
     }
@@ -279,13 +279,18 @@ console.log('\n用例 4: Ctrl+C 打断后,每个 tool_call 都有 tool_result')
   // 第一个工具执行后立刻 abort,模拟用户按 Ctrl+C
   // 注意:并行执行时两个工具是同时启动的,abort 时第二个可能已经在跑了。
   // 这里验证的是核心不变量——每个 tool_call 都有配对的 tool_result。
-  let toolCount = 0
+  //
+  // 用一个独立的标志位而不是计数器:并行执行下工具完成顺序不确定,
+  // 计数器会出现"醒来时已经不是 1"的情况,abort 根本触发不了。
+  let abortTriggered = false
   const wrappedTools = tools.map((t) => ({
     ...t,
     execute: async (args: unknown, signal?: AbortSignal) => {
-      toolCount++
       const result = await t.execute(args, signal)
-      if (toolCount === 1) ctrl.abort()
+      if (!abortTriggered) {
+        abortTriggered = true
+        ctrl.abort()
+      }
       return result
     }
   }))
@@ -318,6 +323,11 @@ console.log('\n用例 4: Ctrl+C 打断后,每个 tool_call 都有 tool_result')
   check('所有 tool_use 都有配对 tool_result',
     toolUseIds.every((id: string) => toolResultIds.includes(id)),
     `use: ${JSON.stringify(toolUseIds)} result: ${JSON.stringify(toolResultIds)}`)
+
+  // 打断后不该再发请求:发出去也会被 abort 白跑一趟,
+  // 而且重试逻辑不认 abort,会把打断后的失败当网络错误重试。
+  check('打断后没有额外请求', receivedRequests.length === 1,
+    `got: ${receivedRequests.length}`)
 }
 
 // ========== 用例 5: 上下文压缩 ==========

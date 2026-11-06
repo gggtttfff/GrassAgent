@@ -1,6 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
+import { promises as fs } from 'node:fs'
+import * as path from 'node:path'
+import * as os from 'node:os'
 import { runAgent } from '../src/agent.ts'
 import type { AgentTool } from '../src/agent.ts'
 import type { Model, Context } from '../src/llm.ts'
@@ -188,14 +191,18 @@ test('abort 后每个 tool_call 仍有配对的 tool_result', async () => {
     const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
     const controller = new AbortController()
 
-    let callCount = 0
+    // 用标志位而不是计数器:并行执行下工具完成顺序不确定,
+    // 计数器会出现"醒来时已经不是 1"的情况,abort 根本触发不了。
+    let abortTriggered = false
     const tool: AgentTool = {
       name: 'slow_tool',
       description: '慢工具',
       parameters: { type: 'object', properties: {}, required: [] },
       execute: async () => {
-        callCount++
-        if (callCount === 1) controller.abort()
+        if (!abortTriggered) {
+          abortTriggered = true
+          controller.abort()
+        }
         await new Promise((resolve) => setTimeout(resolve, 50))
         return '完成'
       },
@@ -226,6 +233,55 @@ test('abort 后每个 tool_call 仍有配对的 tool_result', async () => {
     }
   } finally {
     await stopMockServer(mock.server)
+  }
+})
+
+test('abort 后不再发新的请求', async () => {
+  // 打断发生在工具执行期间时,工具跑完不该再去问模型。
+  // 发出去的请求也会被 abort 白跑一趟,重试逻辑还会把它当网络错误重试。
+  let requestCount = 0
+  const server = createServer((request, response) => {
+    request.on('data', () => {})
+    request.on('end', () => {
+      requestCount++
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      response.end(body([
+        toolCallFrame(0, 'call_1', 'slow_tool', '{}'),
+        finishFrame('tool_calls'),
+      ]))
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${port}/v1` }
+    const controller = new AbortController()
+
+    const tool: AgentTool = {
+      name: 'slow_tool',
+      description: '慢工具',
+      parameters: { type: 'object', properties: {}, required: [] },
+      execute: async () => {
+        controller.abort()
+        await new Promise((resolve) => setTimeout(resolve, 30))
+        return '完成'
+      },
+    }
+
+    const context: Context = { messages: [{ role: 'user', content: '中断' }] }
+    let stopReason = ''
+    for await (const event of runAgent(model, context, [tool], controller.signal, { toolExecution: 'parallel' })) {
+      if (event.type === 'turn_end') stopReason = event.stopReason
+    }
+
+    assert.equal(stopReason, 'aborted', '回合应以 aborted 结束')
+    assert.equal(requestCount, 1, `打断后不该再发请求,实际发了 ${requestCount} 个`)
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
   }
 })
 
@@ -273,6 +329,63 @@ test('修改同一文件的工具串行执行,不会丢更新', async () => {
     assert.equal(fileContents.get('target.txt'), 'start+1+1', '并发修改同一文件会丢更新')
   } finally {
     await stopMockServer(mock.server)
+  }
+})
+
+test('一个工具改多个文件时,每个文件都会被串行化', async () => {
+  // 声明了多个路径的工具必须锁住全部路径。
+  // 只锁第一个的话,第二个文件上的并发写就会互相覆盖。
+  const directory = path.join(os.tmpdir(), `grassagent-multi-${process.pid}-${Date.now()}`)
+  await fs.mkdir(directory, { recursive: true })
+
+  const firstFile = path.join(directory, 'first.txt')
+  const secondFile = path.join(directory, 'second.txt')
+
+  const tool: AgentTool = {
+    name: 'multi_edit_tool',
+    description: '同时改两个文件',
+    parameters: { type: 'object', properties: {}, required: [] },
+    mutatesFiles: ['paths'],
+    execute: async (args) => {
+      const paths = (args as { paths: string[] }).paths
+      // 读-改-写之间有延迟,放大竞态窗口
+      const contents = await Promise.all(paths.map(async (filePath) => {
+        const current = await fs.readFile(filePath, 'utf-8').catch(() => '')
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return [filePath, current] as const
+      }))
+      for (const [filePath, current] of contents) {
+        await fs.writeFile(filePath, `${current}+1`, 'utf-8')
+      }
+      return 'ok'
+    },
+  }
+
+  const mock = await startMockServer([
+    {
+      status: 200,
+      body: body([
+        toolCallFrame(0, 'call_1', 'multi_edit_tool', JSON.stringify({ paths: [firstFile, secondFile] })),
+        toolCallFrame(1, 'call_2', 'multi_edit_tool', JSON.stringify({ paths: [firstFile, secondFile] })),
+        finishFrame('tool_calls'),
+      ]),
+    },
+    { status: 200, body: body([textFrame('完成'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = { messages: [{ role: 'user', content: '改两个文件' }] }
+    for await (const event of runAgent(model, context, [tool], undefined, { toolExecution: 'parallel' })) {
+      if (event.type === 'turn_end') break
+    }
+
+    // 两个文件的修改都要保留
+    assert.equal(await fs.readFile(firstFile, 'utf-8'), '+1+1', '第一个文件的修改丢了')
+    assert.equal(await fs.readFile(secondFile, 'utf-8'), '+1+1', '第二个文件的修改丢了')
+  } finally {
+    await stopMockServer(mock.server)
+    await fs.rm(directory, { recursive: true, force: true })
   }
 })
 
@@ -356,6 +469,70 @@ test('未声明 mutatesFiles 的工具自由并发', async () => {
     }
 
     assert.ok(concurrentPeak >= 2, `未声明 mutatesFiles 的工具应并发,实际峰值 ${concurrentPeak}`)
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('声明 sequential 的工具不和其他工具并发', async () => {
+  // sequential 的意思是"这个工具必须单独跑"。
+  // 不管有没有声明 mutatesFiles,别的工具都不能和它同时执行。
+  const events: string[] = []
+
+  const sequentialTool: AgentTool = {
+    name: 'sequential_tool',
+    description: '必须单独跑',
+    parameters: { type: 'object', properties: {}, required: [] },
+    sequential: true,
+    execute: async () => {
+      events.push('sequential 开始')
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      events.push('sequential 结束')
+      return 'ok'
+    },
+  }
+
+  const normalTool: AgentTool = {
+    name: 'normal_tool',
+    description: '普通工具',
+    parameters: { type: 'object', properties: {}, required: [] },
+    execute: async () => {
+      events.push('normal 开始')
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      events.push('normal 结束')
+      return 'ok'
+    },
+  }
+
+  const mock = await startMockServer([
+    {
+      status: 200,
+      body: body([
+        toolCallFrame(0, 'call_1', 'normal_tool', '{}'),
+        toolCallFrame(1, 'call_2', 'sequential_tool', '{}'),
+        toolCallFrame(2, 'call_3', 'normal_tool', '{}'),
+        finishFrame('tool_calls'),
+      ]),
+    },
+    { status: 200, body: body([textFrame('完成'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = { messages: [{ role: 'user', content: '混合' }] }
+    for await (const event of runAgent(model, context, [sequentialTool, normalTool], undefined, { toolExecution: 'parallel' })) {
+      if (event.type === 'turn_end') break
+    }
+
+    // sequential 工具的起止之间不能有别的工具在跑
+    const sequentialStart = events.indexOf('sequential 开始')
+    const sequentialEnd = events.indexOf('sequential 结束')
+    const inside = events.slice(sequentialStart + 1, sequentialEnd)
+    assert.ok(sequentialStart >= 0 && sequentialEnd > sequentialStart, `事件顺序不对: ${events.join(',')}`)
+    assert.ok(
+      inside.every((entry) => entry.startsWith('sequential')),
+      `sequential 工具执行期间不该有别的工具,实际: ${events.join(',')}`,
+    )
   } finally {
     await stopMockServer(mock.server)
   }
