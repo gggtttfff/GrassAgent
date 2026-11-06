@@ -15,7 +15,7 @@ cli.ts → agent.ts → llm.ts → protocol.ts
    ↓        ↓                (openai.ts)
 config.ts  pathGuard.ts
    ↓
-logger.ts / transport.ts / retry.ts
+logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
 ```
 
@@ -74,6 +74,16 @@ sessionStore.ts
 
 **13. 用 `DatabaseSync` 而不是 `Database`。** `DatabaseSync` 在 Node 26.11 起是文档级弃用别名（DEP0210），但 `Database` 导出要到 v26.11 才有——当前 `@types/node` 也只有 `DatabaseSync`。所以现在只能用 `DatabaseSync`，等 Node 26.11 普及后再换。
 
+**14. 修改文件的工具必须声明 `mutatesFiles`。** 并行执行时，声明了 `mutatesFiles: ['path']` 的工具会按文件真实路径排队（`src/mutationQueue.ts`），同一文件依次执行、不同文件并行。
+
+没声明的工具默认自由并发。**「读-改-写」流程的工具（像 `edit`）必须声明**，否则两个并发 edit 同一文件会互相覆盖，丢更新。
+
+**15. 工具结果的顺序必须和 tool_call 原始顺序一致。** 事件可以按完成顺序发，但写进 context 的结果顺序不能乱——API 要求每个 tool_call 有配对的 tool_result，顺序错了下次恢复会话会 400。
+
+**16. 文件队列的 key 解析必须在注册队列内部。** `src/mutationQueue.ts` 里 `getMutationQueueKey` 要放进 `registrationQueue` 里面执行，不能在外面先 await。否则两个并发调用解析 key 的完成顺序不确定，同一文件的操作可能按 `[2, 1]` 而不是 `[1, 2]` 执行——模型说"先写 A 再改 A"时顺序就错了。
+
+**17. 文件队列必须可重入。** 用 `AsyncLocalStorage` 跟踪当前执行链持有的 key。工具内部自己又包一层 `withFileMutationQueue` 是安全的，不会把自己等死（没有可重入支持时会静默挂住 agent）。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -84,6 +94,7 @@ sessionStore.ts
 - 上下文压缩只保留最近 20 条，长对话的早期细节会丢失
 - TUI 是单行输入，不做 diff 渲染、组件树、markdown 渲染
 - 工具参数用封闭对象（`additionalProperties: false`），模型多传字段会被拒绝
+- 并行执行时 abort 语义变了：所有工具同时启动，abort 后已经在跑的工具不会停下（`error:aborted` 只补给还没开始的）
 
 ## 测试
 

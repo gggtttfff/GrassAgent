@@ -1,0 +1,24 @@
+feat(agent): 工具并发执行,同文件写操作按队列串行
+
+一轮里多个 tool_call 并发跑,不用排队等。
+
+并发有个陷阱:edit 是"读-改-写"三步,两个并发 edit 同一文件
+会互相覆盖,丢更新。所以工具新增 mutatesFiles 声明,
+声明了会修改哪些文件,这类操作按文件真实路径排队——
+同一文件依次执行,不同文件并行。write_file 和 edit 都做了声明。
+
+新增 src/mutationQueue.ts,借鉴 pi 的 file-mutation-queue 设计。
+用 AsyncLocalStorage 做成可重入:工具内部自己再包一层队列
+不会把自己等死(否则会静默挂住 agent)。
+
+队列的 key 解析放在注册队列内部,保证同一文件的操作
+按调用顺序执行——模型说"先写 A 再改 A"时顺序不能反。
+
+结果顺序始终和 tool_call 原始顺序一致,API 要求每个
+tool_call 有配对的 tool_result,顺序错了下次恢复会话会 400。
+
+abort 语义有变化:并行时所有工具同时启动,已经在跑的
+不会停下,error:aborted 只补给还没开始的。
+
+配置项 GRASSAGENT_TOOL_EXECUTION=parallel|sequential,
+默认 parallel,遇到竞态时可降级排查。

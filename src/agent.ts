@@ -5,6 +5,7 @@
 
 import {stream ,buildAssistantMessage,buildToolResultMessage,type Model,type Context,type StreamOptions} from './llm.ts'
 import { validateToolArguments } from './validation.ts'
+import { withFileMutationQueue } from './mutationQueue.ts'
 import type { Transport } from './transport.ts'
 import type { Logger } from './logger.ts'
 
@@ -15,6 +16,19 @@ export type AgentTool={
     description:string
     parameters:object   //JSON Schema
     execute:(args:unknown,signal?:AbortSignal)=>Promise<string>
+    /**
+     * 这个工具会修改哪些文件(相对于参数里的路径)。
+     * 声明了就会按文件串行化,避免并发执行时互相覆盖。
+     *
+     * 格式是参数名的列表,比如 ['path'] 表示 args.path 是被修改的文件。
+     * 不声明则视为不修改文件,可以自由并发。
+     */
+    mutatesFiles?: string[]
+    /**
+     * 强制串行执行,不管有没有声明 mutatesFiles。
+     * 用于本身就不适合并发的工具。
+     */
+    sequential?: boolean
 }
 
 //agent 对外的事件流,提供UI消费
@@ -75,7 +89,7 @@ export async function* runAgent(
     context:Context,
     tools:AgentTool[],
     signal?:AbortSignal,
-    options:{transport?:Transport;logger?:Logger}={}
+    options:{transport?:Transport;logger?:Logger;toolExecution?:'parallel'|'sequential'}={}
 ) :AsyncGenerator<AgentEvent>{
     const toolMap=new Map(tools.map(t=>[t.name,t]))
     const toolDefs=tools.map(t=>({name:t.name,description:t.description,parameters:t.parameters}))
@@ -137,44 +151,147 @@ export async function* runAgent(
             return
         }
 
-        //5.串行执行tool_calls(pi有sequential和parallel,nano只写串行)
+        //5.执行tool_calls
         //参数校验在执行前做:不合法就不执行,把错误回填给模型让它重发
         //参数JSON损坏时不执行(argsInvalid):空对象会让工具拿到undefined参数乱写
-        const results:{tool_use_id:string;content:string}[]=[]
-        for(const tc of toolCalls){
-            const tool =toolMap.get(tc.name)
-            let result :string
-            if (tc.argsInvalid){
-                result=`error:tool"${tc.name}" arguments are not valid JSON,please resend complete arguments.`
-            }else if (!tool){
-                result=`error:tool "${tc.name} not found`
-            }else{
-                //校验并顺带做类型转换。模型传 "42" 当数字用会被转成 42,
-                //转不了才算失败。失败时不执行工具,让模型看到错误后重新发
-                const validation=validateToolArguments(tool.parameters,tc.args,tc.name)
-                if(!validation.ok){
-                    result=validation.error
-                }else{
-                    try{
-                        //用校验后的参数执行,不是原始参数:类型转换的结果要生效
-                        result=await tool.execute(validation.value,signal)
-                    }catch(e){
-                        result=`error: ${(e as Error).message}`
-                    }
-                }
+        const prepared=prepareToolCalls(toolCalls,toolMap)
+
+        //执行并发出事件。事件按原始顺序发,写进 context 的结果也按原始顺序——
+        //顺序错了下次恢复会话会 400,API 要求每个 tool_call 有配对的 tool_result。
+        const results:ToolResultEntry[]=[]
+        for await (const event of executeToolCalls(prepared,signal,options.toolExecution)){
+            if(event.type==='tool_result'){
+                results.push({tool_use_id:event.id,content:event.result})
             }
-            results.push(({tool_use_id:tc.id,content:result}))
-            yield{type:'tool_result',id:tc.id,name:tc.name,result}
-            if (signal?.aborted) break
+            yield{type:'tool_result',id:event.id,name:event.name,result:event.result}
         }
 
-        //6.为被abort 跳过的tool_call补上错误结果(API要求每个tool_call都有对应tool_result)
-        for(const tc of toolCalls.slice(results.length)){
-            results.push({tool_use_id:tc.id,content:'error:aborted'})
-            yield{type:'tool_result',id:tc.id,name:tc.name,result:'error:aborted'}
-        }
-
-        //7.把tool_result放回Context
+        //6.把tool_result放回Context
         context.messages.push(buildToolResultMessage(results))
+    }
+}
+
+//一个待执行的工具调用:预检(参数校验)已经做完
+type PreparedToolCall={
+    id:string
+    name:string
+    //校验后的参数,执行时用它而不是原始参数
+    args:unknown
+    tool:AgentTool
+    //预检失败时的错误文本,非空则不执行
+    error?:string
+}
+
+//tool_result 的内容
+type ToolResultEntry={tool_use_id:string;content:string}
+
+//预检:校验参数。不合法的不执行,把错误留给模型纠正。
+//这一步是串行的——校验要读 schema,顺便把类型转换做掉。
+function prepareToolCalls(
+    toolCalls:{id:string;name:string;args:unknown;argsInvalid:boolean}[],
+    toolMap:Map<string,AgentTool>
+):PreparedToolCall[]{
+    const prepared:PreparedToolCall[]=[]
+    for(const tc of toolCalls){
+        const tool=toolMap.get(tc.name)
+        if(tc.argsInvalid){
+            prepared.push({id:tc.id,name:tc.name,args:{},tool:undefined as unknown as AgentTool,
+                error:`error:tool"${tc.name}" arguments are not valid JSON,please resend complete arguments.`})
+            continue
+        }
+        if(!tool){
+            prepared.push({id:tc.id,name:tc.name,args:{},tool:undefined as unknown as AgentTool,
+                error:`error:tool "${tc.name} not found`})
+            continue
+        }
+        //校验并顺带做类型转换。模型传 "42" 当数字用会被转成 42,
+        //转不了才算失败
+        const validation=validateToolArguments(tool.parameters,tc.args,tc.name)
+        if(!validation.ok){
+            prepared.push({id:tc.id,name:tc.name,args:{},tool,error:validation.error})
+            continue
+        }
+        prepared.push({id:tc.id,name:tc.name,args:validation.value,tool})
+    }
+    return prepared
+}
+
+//执行单个工具,捕获异常
+async function executeOneTool(
+    prepared:PreparedToolCall,
+    signal?:AbortSignal
+):Promise<string>{
+    try{
+        return await prepared.tool.execute(prepared.args,signal)
+    }catch(e){
+        return `error: ${(e as Error).message}`
+    }
+}
+
+//取工具要修改的文件路径
+function getMutatedFilePaths(prepared:PreparedToolCall):string[]{
+    if(!prepared.tool.mutatesFiles) return []
+    const args=prepared.args as Record<string,unknown>
+    const paths:string[]=[]
+    for(const parameterName of prepared.tool.mutatesFiles){
+        const value=args[parameterName]
+        if(typeof value==='string'&&value) paths.push(value)
+    }
+    return paths
+}
+
+//执行工具,按完成顺序发出 tool_result 事件。
+//
+// 两层保证:
+// 1. 修改同一文件的工具按文件路径串行化(mutatesFiles),不会互相覆盖
+// 2. 事件按原始顺序发,和模型发出的顺序一致,便于对照排查
+async function* executeToolCalls(
+    prepared:PreparedToolCall[],
+    signal?:AbortSignal,
+    mode:'parallel'|'sequential'='parallel'
+):AsyncGenerator<{type:'tool_result';id:string;name:string;result:string}>{
+    if(mode==='sequential'){
+        for(const item of prepared){
+            let content:string
+            if(item.error){
+                content=item.error
+            }else if(signal?.aborted){
+                content='error:aborted'
+            }else{
+                content=await executeOneTool(item,signal)
+            }
+            yield{type:'tool_result',id:item.id,name:item.name,result:content}
+        }
+        return
+    }
+
+    //并行:所有工具同时跑,完成后按原始顺序发事件
+    const results:string[]=new Array(prepared.length)
+    const tasks=prepared.map(async(item,index)=>{
+        let content:string
+        if(item.error){
+            content=item.error
+        }else if(signal?.aborted){
+            content='error:aborted'
+        }else{
+            //需要修改文件的工具走队列,同一文件依次执行,不同文件并行
+            const mutatedPaths=getMutatedFilePaths(item)
+            if(mutatedPaths.length>0&&!item.tool.sequential){
+                content=await withFileMutationQueue(mutatedPaths[0],async()=>{
+                    //排队期间可能已经被 abort 了,这时不必再执行
+                    if(signal?.aborted) return 'error:aborted'
+                    return await executeOneTool(item,signal)
+                })
+            }else{
+                content=await executeOneTool(item,signal)
+            }
+        }
+        results[index]=content
+    })
+
+    await Promise.all(tasks)
+    for(let index=0;index<prepared.length;index++){
+        const item=prepared[index]
+        yield{type:'tool_result',id:item.id,name:item.name,result:results[index]}
     }
 }

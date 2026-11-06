@@ -97,6 +97,8 @@ function buildWriteFile(pathGuard:PathGuard):AgentTool{
         name:'write_file',
         description:'写入文件(覆盖).父目录不存在时自动创建.参数:path(路径),content(内容)',
         parameters:writeFileParameters,
+        //声明会修改 path 指向的文件:并发执行时同一文件的写操作会排队,不会互相覆盖
+        mutatesFiles:['path'],
         execute:async (args)=>{
             const {path:filePath,content}=args as {path :string;content:string}
             try{
@@ -117,6 +119,8 @@ function buildEdit(pathGuard:PathGuard):AgentTool{
         name:'edit',
         description:'编辑文件:精确替换一段文本.参数:path,old_string,new_string.old_string必须在文件中唯一,否则报错',
         parameters:editParameters,
+        //edit 是"读-改-写",并发执行同一文件会丢更新,必须排队
+        mutatesFiles:['path'],
         execute:async(args)=>{
             const {path:filePath,old_string,new_string}=args as {path:string;old_string:string;new_string:string}
             try{

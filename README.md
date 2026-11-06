@@ -35,6 +35,7 @@ src/
   transport.ts   传输层：超时 + 重试 + 并发控制
   pathGuard.ts   沙箱层：路径越界检测
   validation.ts  校验层：工具参数 JSON Schema 校验 + 类型转换
+  mutationQueue.ts 变更队列：按文件串行化写操作
   sessionStore.ts 会话层：SQLite 存储（node:sqlite，零依赖）
 
 test/            单元测试（node:test，无测试框架依赖）
@@ -87,6 +88,7 @@ npm start
 | `GRASSAGENT_REQUEST_TIMEOUT_MS` | 请求超时毫秒 | `120000` |
 | `GRASSAGENT_LOG_LEVEL` | 日志级别 | `info` |
 | `GRASSAGENT_LOG_FORMAT` | `json` 或 `pretty` | `json` |
+| `GRASSAGENT_TOOL_EXECUTION` | `parallel` 或 `sequential` | `parallel` |
 | `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 
@@ -141,6 +143,16 @@ npm start
 
 **provider 分层。** 内部消息模型不绑定任何厂商协议，只有在真正发请求的边界才转成 OpenAI/Anthropic 等格式。加一个新 provider = 实现 `Provider` 接口 + 注册，agent 循环一行都不用改。
 
+**工具并发执行。** 一轮里多个 tool_call 会并发跑，不用排队等。模型要改三个文件时，三个写入同时进行。
+
+但并发有个陷阱：`edit` 是「读-改-写」三步，两个并发 edit 同一文件会互相覆盖。所以工具可以声明自己会修改哪些文件（`mutatesFiles: ['path']`），这类操作按文件真实路径排队——同一文件依次执行，不同文件照常并行。`write_file` 和 `edit` 都做了声明。
+
+队列是可重入的：工具内部自己再包一层也不会死等。同一文件的操作严格按调用顺序执行，模型说「先写 A 再改 A」就是这个顺序。
+
+结果事件的顺序始终和模型发出的顺序一致，不按完成顺序——UI 显示和模型意图能对上，排障时不用猜。
+
+想退回串行：`GRASSAGENT_TOOL_EXECUTION=sequential`。
+
 **会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
 WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——不像之前的 JSONL 方案要靠锁文件拒绝第二个实例。
@@ -152,7 +164,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -202,6 +214,8 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
     name: 'my_tool',
     description: '工具做什么，写给模型看的',
     parameters: { type: 'object', properties: { ... }, required: [...] },
+    // 会修改文件的话声明一下,并发执行时同一文件的操作会排队
+    mutatesFiles: ['path'],
     execute: async (args) => {
       // 涉及文件路径时用 pathGuard.resolve 限制在工作区内
       return '结果字符串'
@@ -211,6 +225,8 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
 ```
 
 然后加进 `builtinTools()` 的返回数组。工具是纯函数，不持有 agent 状态。
+
+不声明 `mutatesFiles` 的工具可以自由并发。声明了但操作的是「读-改-写」流程的（像 `edit`），必须声明，否则并发时会丢更新。
 
 ## License
 

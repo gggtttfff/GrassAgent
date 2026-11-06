@@ -87,7 +87,11 @@ async function main() {
       const ctrl = new AbortController()
       tui.onAbort(() => ctrl.abort())  // 每轮新建 AbortController，需重新注册回调指向新的 controller
 
-      for await (const ev of runAgent(model, context, tools, ctrl.signal, { transport, logger })) {
+      for await (const ev of runAgent(model, context, tools, ctrl.signal, {
+        transport,
+        logger,
+        toolExecution: config.ToolExecution,
+      })) {
         switch (ev.type) {
           case 'assistant_text': tui.printText(ev.delta); break
           case 'tool_call': tui.printToolCall(ev.name, ev.args); break

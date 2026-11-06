@@ -86,6 +86,11 @@ export const configSchema = z.object({
   CommandTimeoutMs: numericOption({
     minimum: 100, maximum: 600_000, defaultValue: 3000, label: 'CommandTimeoutMs',
   }),
+
+  // 工具执行方式。parallel 会并发跑独立的工具,同一文件的写操作仍串行。
+  ToolExecution: z.enum(['parallel', 'sequential'], {
+    error: 'ToolExecution 只能是 parallel 或 sequential',
+  }).default('parallel'),
 })
 
 export type AgentConfig = z.infer<typeof configSchema>
@@ -118,6 +123,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SessionDatabasePath: `${ENV_PREFIX}SESSION_DATABASE_PATH`,
   SessionId: `${ENV_PREFIX}SESSION_ID`,
   CommandTimeoutMs: `${ENV_PREFIX}COMMAND_TIMEOUT_MS`,
+  ToolExecution: `${ENV_PREFIX}TOOL_EXECUTION`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。
