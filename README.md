@@ -49,7 +49,7 @@ e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场�
 
 ## 环境要求
 
-- Node.js >= 22.6（需要 `--experimental-strip-types` 直接跑 TypeScript，无需编译）
+- Node.js >= 24（`node:sqlite` 需要 24+，type stripping 在 24.3+ 默认启用，不用编译）
 - 一个 OpenAI 兼容的模型服务（OpenAI、DeepSeek、Ollama、vLLM 等均可）
 
 ## 快速开始

@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # type stripping 需要 Node 22.6+,这里用 24 走稳定通道
+          # node:sqlite 需要 Node 24+,type stripping 在 24.3+ 默认启用
           node-version: '24'
 
       - name: 安装依赖

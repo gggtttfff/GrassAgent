@@ -1,6 +1,6 @@
 // e2e-smoke.ts
 // 端到端冒烟测试:起一个本地 mock SSE 服务,验证 agent 循环的关键约束。
-// 运行: node --experimental-strip-types e2e-smoke.ts
+// 运行: npm test
 // 会往临时目录写文件,不碰项目源码。
 
 import { createServer } from 'node:http'
