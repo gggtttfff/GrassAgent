@@ -26,3 +26,6 @@ Thumbs.db
 # 测试残留
 coverage/
 .nyc_output/
+
+# 临时提交消息文件(git commit -F 用,提交后删掉)
+.commit-msg-*.txt
