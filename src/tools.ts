@@ -9,7 +9,7 @@ import { exec } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import { obj, str } from '@earendil-works/pi-schema'
+import { obj, str, arr } from '@earendil-works/pi-schema'
 import type { AgentTool } from './agent.ts'
 import { createPathGuard, describePathError, type PathGuard } from './pathGuard.ts'
 
@@ -67,6 +67,18 @@ const editParameters = obj({
   path: str({ description: '文件路径,相对路径基于工作目录' }),
   old_string: str({ description: '要替换的文本,必须在文件中唯一匹配' }),
   new_string: str({ description: '替换后的文本' }),
+})
+
+// 批量替换的参数。每一项和单次 edit 一样,只是排成数组。
+const editBatchParameters = obj({
+  path: str({ description: '文件路径,相对路径基于工作目录' }),
+  edits: arr(
+    obj({
+      old_string: str({ description: '要替换的文本,必须在文件中唯一匹配' }),
+      new_string: str({ description: '替换后的文本' }),
+    }),
+    { description: '替换列表,按顺序依次应用', minItems: 1 },
+  ),
 })
 
 const runBashParameters = obj({
@@ -131,13 +143,90 @@ function buildEdit(pathGuard: PathGuard): AgentTool {
       try {
         const resolvedPath = await pathGuard.resolve(filePath)
         const content = await fs.readFile(resolvedPath, 'utf-8')
-        const count = countOccurrences(content, old_string)
-        if (count === 0) throw new Error(`old_string not found in ${resolvedPath}`)
-        if (count > 1) throw new Error(`old_string matches ${count} places in ${resolvedPath},must be unique`)
+        const failure = checkUniqueMatch(content, old_string)
+        if (failure?.reason === 'not_found') {
+          throw new Error(`old_string not found in ${resolvedPath}`)
+        }
+        if (failure?.reason === 'not_unique') {
+          throw new Error(`old_string matches ${failure.count} places in ${resolvedPath},must be unique`)
+        }
         // 用函数替换,避免 new_string 里的 $ 特殊字符($& $` $' $1) 被 String.replace 解释
         const newContent = content.replace(old_string, () => new_string)
         await fs.writeFile(resolvedPath, newContent, 'utf-8')
         return `edited ${resolvedPath}:replace ${old_string.length} chars`
+      } catch (error) {
+        return describePathError(error)
+      }
+    },
+  }
+}
+
+// old_string 必须唯一匹配。
+// 返回 null 表示匹配唯一、可以替换;否则返回失败原因。
+// 规则只有这一份实现——单次编辑和批量编辑只是措辞不同,避免两边漂移。
+type MatchFailure = { reason: 'not_found' } | { reason: 'not_unique'; count: number }
+
+function checkUniqueMatch(content: string, old_string: string): MatchFailure | null {
+  const count = countOccurrences(content, old_string)
+  if (count === 0) return { reason: 'not_found' }
+  if (count > 1) return { reason: 'not_unique', count }
+  return null
+}
+
+// 批量替换的核心逻辑。
+//
+// 语义:
+// 1. 顺序应用——每一项都在前一项的结果上替换。模型说"先把 A 改成 B,再把 B 改成 C"
+//    时,结果应该和按顺序调两次 edit 一致
+// 2. 原子性——全部替换成功才写文件。中间任何一项失败,文件保持原样。
+//    半改完的文件比没改更糟:模型看不到哪些成功了,下一轮重试会重复应用
+// 3. 唯一性——每一项的 old_string 都必须在当前内容里唯一匹配。
+//    这条比单次 edit 更严:同一批里两次替换可能命中同一段文本
+function applyEdits(
+  content: string,
+  edits: { old_string: string; new_string: string }[],
+  filePath: string,
+): string {
+  let result = content
+  for (let index = 0; index < edits.length; index++) {
+    const { old_string, new_string } = edits[index]
+    // 错误信息标出是第几处出的问题,模型才知道该改哪一项
+    const failure = checkUniqueMatch(result, old_string)
+    if (failure?.reason === 'not_found') {
+      throw new Error(`第 ${index + 1} 处替换的 old_string 在 ${filePath} 中找不到`)
+    }
+    if (failure?.reason === 'not_unique') {
+      throw new Error(`第 ${index + 1} 处替换的 old_string 匹配了 ${failure.count} 处,必须唯一`)
+    }
+    // 用函数替换,避免 new_string 里的 $ 特殊字符($& $` $' $1) 被 String.replace 解释
+    result = result.replace(old_string, () => new_string)
+  }
+  return result
+}
+
+// edit_batch:一次改多处。所有替换成功才写文件,任一失败则文件保持原样。
+function buildEditBatch(pathGuard: PathGuard): AgentTool {
+  return {
+    name: 'edit_batch',
+    description:
+      '批量编辑文件:一次替换多处.参数:path(文件路径),edits(替换列表,每项含old_string和new_string).' +
+      '按顺序依次应用,old_string每次都必须在当前内容里唯一匹配.全部成功才写入,任一失败则文件不变',
+    parameters: editBatchParameters,
+    // 读-改-写,并发执行同一文件会丢更新,必须排队
+    mutatesFiles: ['path'],
+    execute: async (args) => {
+      const { path: filePath, edits } = args as {
+        path: string
+        edits: { old_string: string; new_string: string }[]
+      }
+      try {
+        const resolvedPath = await pathGuard.resolve(filePath)
+        const content = await fs.readFile(resolvedPath, 'utf-8')
+        // applyEdits 抛错时文件还没被碰过,天然满足原子性
+        const newContent = applyEdits(content, edits, resolvedPath)
+        await fs.writeFile(resolvedPath, newContent, 'utf-8')
+        const replacedChars = edits.reduce((total, edit) => total + edit.old_string.length, 0)
+        return `edited ${resolvedPath}:${edits.length} replacements, ${replacedChars} chars`
       } catch (error) {
         return describePathError(error)
       }
@@ -181,6 +270,7 @@ export async function builtinTools(options: { workspace?: string; commandTimeout
     buildReadFile(pathGuard),
     buildWriteFile(pathGuard),
     buildEdit(pathGuard),
+    buildEditBatch(pathGuard),
     buildRunBash(pathGuard, options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS),
   ]
 }

@@ -5,6 +5,7 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { runAgent } from '../src/agent.ts'
+import { builtinTools } from '../src/tools.ts'
 import type { AgentTool } from '../src/agent.ts'
 import type { Model, Context } from '../src/llm.ts'
 
@@ -471,6 +472,49 @@ test('未声明 mutatesFiles 的工具自由并发', async () => {
     assert.ok(concurrentPeak >= 2, `未声明 mutatesFiles 的工具应并发,实际峰值 ${concurrentPeak}`)
   } finally {
     await stopMockServer(mock.server)
+  }
+})
+
+test('两个 edit_batch 并发改同一文件,两处修改都保留', async () => {
+  // 用真实工具验证:edit_batch 声明了 mutatesFiles,
+  // agent 层会按文件路径把它们串行化,不会丢更新。
+  const directory = path.join(os.tmpdir(), `grassagent-batch-parallel-${process.pid}-${Date.now()}`)
+  await fs.mkdir(directory, { recursive: true })
+  const filePath = path.join(directory, 'target.txt')
+  await fs.writeFile(filePath, 'alpha beta', 'utf-8')
+
+  const tools = await builtinTools({ workspace: directory })
+
+  const mock = await startMockServer([
+    {
+      status: 200,
+      body: body([
+        toolCallFrame(0, 'call_1', 'edit_batch', JSON.stringify({
+          path: filePath,
+          edits: [{ old_string: 'alpha', new_string: 'ALPHA' }],
+        })),
+        toolCallFrame(1, 'call_2', 'edit_batch', JSON.stringify({
+          path: filePath,
+          edits: [{ old_string: 'beta', new_string: 'BETA' }],
+        })),
+        finishFrame('tool_calls'),
+      ]),
+    },
+    { status: 200, body: body([textFrame('完成'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = { messages: [{ role: 'user', content: '改两处' }] }
+    for await (const event of runAgent(model, context, tools, undefined, { toolExecution: 'parallel' })) {
+      if (event.type === 'turn_end') break
+    }
+
+    // 两处修改都要保留。如果并发执行,第二个会读到旧内容,把第一个的修改覆盖掉
+    assert.equal(await fs.readFile(filePath, 'utf-8'), 'ALPHA BETA', '并发修改同一文件会丢更新')
+  } finally {
+    await stopMockServer(mock.server)
+    await fs.rm(directory, { recursive: true, force: true })
   }
 })
 

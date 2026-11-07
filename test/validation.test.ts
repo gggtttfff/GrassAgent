@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { obj, str, num, opt, bool } from '@earendil-works/pi-schema'
+import { obj, str, num, opt, bool, arr } from '@earendil-works/pi-schema'
 import { validateToolArguments, checkToolArguments } from '../src/validation.ts'
 
 const schema = obj({
@@ -97,5 +97,52 @@ test('嵌套对象的错误路径是点号形式', () => {
   assert.equal(result.ok, false)
   if (!result.ok) {
     assert.ok(result.error.includes('edits.oldText'), `实际: ${result.error}`)
+  }
+})
+
+// 数组参数:批量编辑这类工具的 schema 形状
+const arraySchema = obj({
+  path: str(),
+  edits: arr(
+    obj({
+      old_string: str(),
+      new_string: str(),
+    }),
+    { minItems: 1 },
+  ),
+})
+
+test('数组参数通过校验', () => {
+  const result = validateToolArguments(
+    arraySchema,
+    { path: 'a.ts', edits: [{ old_string: 'x', new_string: 'y' }] },
+    'test_tool',
+  )
+  assert.equal(result.ok, true)
+})
+
+test('空数组被 minItems 拒绝', () => {
+  const result = validateToolArguments(arraySchema, { path: 'a.ts', edits: [] }, 'test_tool')
+  assert.equal(result.ok, false)
+})
+
+test('数组元素的多余字段被拒绝', () => {
+  const result = validateToolArguments(
+    arraySchema,
+    { path: 'a.ts', edits: [{ old_string: 'x', new_string: 'y', extra: 1 }] },
+    'test_tool',
+  )
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    // 错误路径要指到具体的元素,模型才知道是第几项错了
+    assert.ok(result.error.includes('edits.0.extra'), `实际: ${result.error}`)
+  }
+})
+
+test('数组元素缺字段时报错路径指到具体元素', () => {
+  const result = validateToolArguments(arraySchema, { path: 'a.ts', edits: [{ old_string: 'x' }] }, 'test_tool')
+  assert.equal(result.ok, false)
+  if (!result.ok) {
+    assert.ok(result.error.includes('edits.0.new_string'), `实际: ${result.error}`)
   }
 })

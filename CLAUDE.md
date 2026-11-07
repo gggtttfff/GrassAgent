@@ -98,7 +98,7 @@ sessionStore.ts
 
 - `run_bash` 用 shell 字符串拼接执行，有注入风险。工作目录已锁定在沙箱内，但命令内容不做参数化
 - `edit` 工具的 `old_string` 未做大小写与空白归一化
-- `edit` 工具一次只能改一处，改多处要调多次
+- `edit` 工具一次只能改一处，要改多处用 `edit_batch`
 - 上下文压缩只保留最近 20 条，长对话的早期细节会丢失
 - TUI 是单行输入，不做 diff 渲染、组件树、markdown 渲染
 - 工具参数用封闭对象（`additionalProperties: false`），模型多传字段会被拒绝

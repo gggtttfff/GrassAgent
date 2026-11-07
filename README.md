@@ -26,7 +26,7 @@ src/
   messages.ts    内部消息模型（provider 无关）
   providers/     按厂商分文件：openai.ts 等
   agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
-  tools.ts       内置工具：read_file / write_file / edit / run_bash
+  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
   tui.ts         极简终端界面：单行输入 + 流式输出 + Ctrl+C
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
@@ -39,7 +39,7 @@ src/
   sessionStore.ts 会话层：SQLite 存储（node:sqlite，零依赖）
 
 test/            单元测试（node:test，无测试框架依赖）
-e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 27 项断言
+e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 28 项断言
 ```
 
 依赖方向单向向下，没有循环引用。想换掉任何一层，都不影响其他层。
@@ -140,6 +140,12 @@ npm start
 **参数校验。** 工具参数是模型的输出，属于不可信输入。执行前用 JSON Schema 校验，失败就不执行工具，把错误回填给 context 让模型自己纠正后重发——和 `max_tokens` 截断、`argsInvalid` 是同一套处理机制。
 
 校验开了宽松类型转换：模型传 `"42"` 当数字用会自动转成 `42`，传 `null` 当可选字段的省略也会被丢弃。只有转不了的（比如 `"abc"` 当数字）才算校验失败，不会为此多跑一轮。多余的字段会被拒绝（封闭对象），因为那通常是模型的幻觉。
+
+**批量编辑的原子性。** `edit_batch` 一次改多处，两个语义值得留意。
+
+一是**顺序应用**：每一项都在前一项的结果上替换。模型说「先把 A 改成 B，再把 B 改成 C」，结果和按顺序调两次 `edit` 一致——不是对着原文同时替换。
+
+二是**原子性**：全部替换成功才写文件，中间任何一项失败则文件保持原样。半改完的文件比没改更糟——模型看不出哪些成功了，下一轮重试会重复应用已经生效的那几处。唯一性校验也跟着变严：每一项的 `old_string` 都必须在当前内容里唯一匹配，同一批里两次替换命中同一段文本会直接报错。
 
 **provider 分层。** 内部消息模型不绑定任何厂商协议，只有在真正发请求的边界才转成 OpenAI/Anthropic 等格式。加一个新 provider = 实现 `Provider` 接口 + 注册，agent 循环一行都不用改。
 

@@ -111,6 +111,101 @@ test('edit 拒绝修改工作区外的文件', async () => {
   await fs.rm(outsidePath, { force: true })
 })
 
+test('edit_batch 一次替换多处', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  const filePath = path.join(workDir, 'batch.txt')
+  await fs.writeFile(filePath, 'alpha beta gamma', 'utf-8')
+  const result = await (await findTool('edit_batch')).execute({
+    path: 'batch.txt',
+    edits: [
+      { old_string: 'alpha', new_string: 'ALPHA' },
+      { old_string: 'gamma', new_string: 'GAMMA' },
+    ],
+  })
+  assert.ok(result.startsWith('edited '), `实际: ${result}`)
+  assert.equal(await fs.readFile(filePath, 'utf-8'), 'ALPHA beta GAMMA')
+})
+
+test('edit_batch 按顺序应用,后一项基于前一项的结果', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  const filePath = path.join(workDir, 'sequential.txt')
+  await fs.writeFile(filePath, 'A', 'utf-8')
+  // 第一项把 A 改成 B,第二项再把 B 改成 C。
+  // 如果是"对着原文同时替换"而不是顺序应用,第二项会找不到 B。
+  await (await findTool('edit_batch')).execute({
+    path: 'sequential.txt',
+    edits: [
+      { old_string: 'A', new_string: 'B' },
+      { old_string: 'B', new_string: 'C' },
+    ],
+  })
+  assert.equal(await fs.readFile(filePath, 'utf-8'), 'C')
+})
+
+test('edit_batch 中任一项失败则文件保持原样', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  const filePath = path.join(workDir, 'atomic.txt')
+  const original = 'alpha beta'
+  await fs.writeFile(filePath, original, 'utf-8')
+  const result = await (await findTool('edit_batch')).execute({
+    path: 'atomic.txt',
+    edits: [
+      { old_string: 'alpha', new_string: 'ALPHA' },
+      { old_string: 'zzz', new_string: 'ZZZ' },
+    ],
+  })
+  assert.ok(result.includes('找不到'), `实际: ${result}`)
+  // 原子性:第一项虽然匹配成功,但整批不写入
+  assert.equal(await fs.readFile(filePath, 'utf-8'), original, '失败时不应改动文件')
+})
+
+test('edit_batch 中某项匹配多处时报错并保持原样', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  const filePath = path.join(workDir, 'dup-batch.txt')
+  const original = 'aXbXc'
+  await fs.writeFile(filePath, original, 'utf-8')
+  const result = await (await findTool('edit_batch')).execute({
+    path: 'dup-batch.txt',
+    edits: [
+      { old_string: 'a', new_string: 'A' },
+      { old_string: 'X', new_string: 'Y' },
+    ],
+  })
+  assert.ok(result.includes('必须唯一'), `实际: ${result}`)
+  assert.equal(await fs.readFile(filePath, 'utf-8'), original, '失败时不应改动文件')
+})
+
+test('edit_batch 的错误信息标出是第几处出的问题', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  await fs.writeFile(path.join(workDir, 'index.txt'), 'alpha beta', 'utf-8')
+  const result = await (await findTool('edit_batch')).execute({
+    path: 'index.txt',
+    edits: [
+      { old_string: 'alpha', new_string: 'ALPHA' },
+      { old_string: 'zzz', new_string: 'ZZZ' },
+    ],
+  })
+  assert.ok(result.includes('第 2 处'), `实际: ${result}`)
+})
+
+test('edit_batch 拒绝修改工作区外的文件', async () => {
+  const outsidePath = path.join(os.tmpdir(), `grassagent-escape-batch-${process.pid}.txt`)
+  await fs.writeFile(outsidePath, 'abc', 'utf-8')
+  const result = await (await findTool('edit_batch')).execute({
+    path: outsidePath,
+    edits: [{ old_string: 'abc', new_string: 'xyz' }],
+  })
+  assert.ok(result.startsWith('error:'), `实际: ${result}`)
+  assert.equal(await fs.readFile(outsidePath, 'utf-8'), 'abc', '越界时不应改动文件')
+  await fs.rm(outsidePath, { force: true })
+})
+
+test('edit_batch 声明了 mutatesFiles,同一文件的并发写会排队', async () => {
+  await fs.mkdir(workDir, { recursive: true })
+  const tool = await findTool('edit_batch')
+  assert.deepEqual(tool.mutatesFiles, ['path'])
+})
+
 test('run_bash 在工作区内执行', async () => {
   await fs.mkdir(workDir, { recursive: true })
   await fs.writeFile(path.join(workDir, 'cwd-check.txt'), 'x', 'utf-8')
