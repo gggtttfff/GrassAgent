@@ -29,3 +29,6 @@ coverage/
 
 # 临时提交消息文件(git commit -F 用,提交后删掉)
 .commit-msg-*.txt
+
+# 临时验证脚本(写完跑完就删,别进版本库)
+scratch-*.ts

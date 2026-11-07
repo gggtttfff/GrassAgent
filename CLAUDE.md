@@ -4,7 +4,7 @@
 
 ## 设计前提
 
-**依赖策略**：核心逻辑（LLM 调用、SSE 解析、Agent 循环、工具执行）只用 Node 内置能力，不引运行时包。基础设施层允许少量成熟库，当前 5 个：`zod`（配置校验）、`pino`（结构化日志）、`p-retry`（退避重试）、`p-limit`（并发控制）、`@earendil-works/pi-schema`（工具参数校验）。新增运行时依赖前先和用户确认。
+**依赖策略**：核心逻辑（LLM 调用、SSE 解析、Agent 循环、工具执行）只用 Node 内置能力，不引运行时包。基础设施层允许少量成熟库，当前 6 个：`zod`（配置校验）、`pino`（结构化日志）、`p-retry`（退避重试）、`p-limit`（并发控制）、`@earendil-works/pi-schema`（工具参数校验）、`@earendil-works/pi-tui`（终端界面）。新增运行时依赖前先和用户确认。
 
 **每个模块单一职责**，依赖方向单向向下，禁止循环依赖：
 
@@ -20,6 +20,8 @@ sessionStore.ts
 ```
 
 `messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。
+
+`theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
 ## 环境
 
@@ -92,6 +94,14 @@ sessionStore.ts
 
 **21. 测试里模拟 abort 不要用计数器。** 并行执行下工具完成顺序不确定，`counter++` 之后判断 `=== 1` 可能永远不成立（另一个工具已经把计数加到 2 了），abort 根本触发不了，测的还是正常路径。用独立的标志位。
 
+**22. 非交互模式的退出时机。** stdin 读完了（EOF）不代表能退出——那一行触发的回合可能还在跑。`src/cli.ts` 用 `roundRunning` 跟踪，回合结束才退。提前退出会把回合杀在半路上，工具可能执行了一半，会话也没存下来。
+
+**23. 退出前要 flush 渲染。** pi-tui 的 `requestRender` 是 `process.nextTick` 里的异步调度，直接 `process.exit` 的话最后一帧还没画就被杀了，输出缺一截。退出前调 `tui.flush()`（内部是同步的 `renderNow`）。
+
+**24. 非交互模式的输入要逐字符发。** pi-tui 的编辑器把输入当按键序列处理，不是当整行文本。一次发一整行的话 `decodePrintableKey` 只能取到第一个字符。回车要单独发——它是提交键，混在文本里会被当成插入换行。
+
+**25. 非 TTY 时不要发 ANSI 控制序列。** 输出重定向到文件时它们就是乱码。`src/nonInteractiveTerminal.ts` 的 `writeControl` 在 `!process.stdout.isTTY` 时跳过。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -100,10 +110,11 @@ sessionStore.ts
 - `edit` 工具的 `old_string` 未做大小写与空白归一化
 - `edit` 工具一次只能改一处，要改多处用 `edit_batch`
 - 上下文压缩只保留最近 20 条，长对话的早期细节会丢失
-- TUI 是单行输入，不做 diff 渲染、组件树、markdown 渲染
 - 工具参数用封闭对象（`additionalProperties: false`），模型多传字段会被拒绝
 - 并行执行时 abort 语义变了：所有工具同时启动，abort 后已经在跑的工具不会停下（`error:aborted` 只补给还没开始的）
 - 上下文压缩按消息条数判断，不是 token 数——消息长短差异大时压缩时机不准
+- TUI 用主屏渲染（`TuiMainScreen`），不是备用屏——主屏保留终端的滚动历史，代价是不能自己管理滚动条
+- markdown 排版在回合结束后才做，流式期间是纯文本
 
 ## 测试
 

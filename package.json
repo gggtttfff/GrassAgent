@@ -8,7 +8,13 @@
     "type": "git",
     "url": "git+https://github.com/gggtttfff/GrassAgent.git"
   },
-  "keywords": ["ai", "agent", "llm", "openai", "cli"],
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "openai",
+    "cli"
+  ],
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/cli.ts",
     "typecheck": "tsc --noEmit",
@@ -26,6 +32,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-schema": "^1.5.0",
+    "@earendil-works/pi-tui": "^1.5.0",
     "p-limit": "^7.3.3",
     "p-retry": "^8.0.1",
     "pino": "^10.4.0",

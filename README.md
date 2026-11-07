@@ -9,6 +9,7 @@
 ## 特性
 
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
+- **终端界面** —— 差分渲染 + markdown 排版，流式输出不闪屏
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
 - **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
@@ -27,7 +28,8 @@ src/
   providers/     按厂商分文件：openai.ts 等
   agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
   tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
-  tui.ts         极简终端界面：单行输入 + 流式输出 + Ctrl+C
+  tui.ts         终端界面:组件树 + 差分渲染 + markdown 排版
+  theme.ts       配色:markdown / 编辑器 / 列表的主题定义
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
   logger.ts      日志层：结构化 JSON 输出
@@ -68,6 +70,18 @@ npm start
 ```
 
 启动后直接输入内容回车即可。模型回复过程中可以按 Ctrl+C 打断当前回合。
+
+### 非交互模式
+
+stdin 不是终端时（管道输入、CI、IDE 插件调用），界面自动切成逐行模式：
+
+```bash
+echo "读一下 README.md" | npm start
+```
+
+这时输入按行读，回车即提交。输出里的 ANSI 控制序列会被清掉——重定向到文件时它们就是乱码。
+
+管道输入的回合会跑完才退出，不会读到 EOF 就把回合杀在半路上。
 
 ## 配置项
 
@@ -149,6 +163,16 @@ npm start
 
 **provider 分层。** 内部消息模型不绑定任何厂商协议，只有在真正发请求的边界才转成 OpenAI/Anthropic 等格式。加一个新 provider = 实现 `Provider` 接口 + 注册，agent 循环一行都不用改。
 
+**终端界面。** 用的是 [`@earendil-works/pi-tui`](https://github.com/earendil-works/pi)（和本项目的 `pi-schema` 同一个作者，MIT 协议）。它做两件手写实现做不到的事：
+
+一是**差分渲染**——只重画变化的行，不是整屏重排。配合 CSI 2026 同步输出做到无闪烁。边流边打印时这个差别很明显。
+
+二是**markdown 排版**——模型输出的 `**粗体**`、代码块、列表会真的排版好，代码块带缩进和边框。
+
+流式输出有个细节：markdown 组件是整块渲染的，没法边流边排版。所以流式期间用纯文本组件累积（渲染快），回合结束后换成 markdown 组件重新排版一次。用户看到的是「先出字，后成型」，而不是等全部收完才突然排好版。
+
+配色在 `src/theme.ts`，用的是 pi-tui 自带的 `styleText`（不引 chalk）——它会按终端能力降级，真彩色不够时自动降到 256 色。
+
 **工具并发执行。** 一轮里多个 tool_call 会并发跑，不用排队等。模型要改三个文件时，三个写入同时进行。
 
 但并发有个陷阱：`edit` 是「读-改-写」三步，两个并发 edit 同一文件会互相覆盖。所以工具可以声明自己会修改哪些文件（`mutatesFiles: ['path']`），这类操作按文件真实路径排队——同一文件依次执行，不同文件照常并行。`write_file` 和 `edit` 都做了声明。
@@ -174,7 +198,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / nonInteractiveTerminal
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -188,6 +212,8 @@ npm run test:all     # 上面三样一起跑
 - 参数 JSON 损坏但 `finish_reason` 正常时同样拦下
 - Ctrl+C 打断后每个 `tool_call` 都有配对 `tool_result`
 - 消息超阈值后的上下文压缩
+
+另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留。
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 

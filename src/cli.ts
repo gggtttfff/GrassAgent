@@ -72,14 +72,40 @@ async function main() {
   })
   const tui = new Tui()
 
+  // 进程收尾:停掉 TUI、关掉数据库。
+  // tui.stop() 必须调——TUI 接管了终端原始模式,
+  // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
+  const shutdown = (): void => {
+    // 先把最后一帧渲染出来——渲染是异步调度的,
+    // 不 flush 就退出的话,输出会缺最后一截
+    tui.flush()
+    tui.stop()
+    sessionStore.close()
+  }
+
+  // 回合是否在跑。非交互模式(管道输入)下,stdin 读完了不代表能退出——
+  // 那一行触发的回合可能还在跑,得等它跑完。
+  let roundRunning = false
+  let inputClosed = false
+
+  tui.onInputClosed(() => {
+    inputClosed = true
+    // 空闲时(没有回合在跑)直接退
+    if (!roundRunning) {
+      shutdown()
+      process.exit(0)
+    }
+  })
+
   // 每轮：用户输入 → runAgent → 事件转发到 TUI → 持久化
-  tui.onPrompt(async (text) => {
+  tui.bindSubmit(async (text) => {
+    roundRunning = true
     try {
       context.messages.push({ role: 'user', content: text })
 
       tui.setBusy(true)
       const ctrl = new AbortController()
-      tui.onAbort(() => ctrl.abort())  // 每轮新建 AbortController，需重新注册回调指向新的 controller
+      tui.onAbort(() => ctrl.abort())
 
       for await (const ev of runAgent(model, context, tools, ctrl.signal, {
         transport,
@@ -91,9 +117,11 @@ async function main() {
           case 'tool_call': tui.printToolCall(ev.name, ev.args); break
           case 'tool_result': tui.printToolResult(ev.name, ev.result); break
           case 'turn_end':
-            if (ev.stopReason === 'max_tokens') tui.printText('\n[output truncated by max_tokens]')
-            if (ev.stopReason === 'error') tui.printText('\n[error occurred]')
-            tui.printTurnEnd()
+            // 收尾:把流式文本换成排好版的 markdown
+            tui.finishTurn()
+            if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
+            if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
+            if (ev.stopReason === 'error') tui.printError('[执行出错]')
             break
         }
       }
@@ -101,26 +129,25 @@ async function main() {
       await sessionStore.sync(context.messages)
     } catch (e) {
       logger.error({ errorMessage: (e as Error).message }, '回合执行失败')
-      console.error(`\n[error] ${(e as Error).message}`)
+      tui.printError((e as Error).message)
     } finally {
+      roundRunning = false
       tui.setBusy(false)
+      // 输入已经读完且回合跑完了,这才是能退的时候
+      if (inputClosed) {
+        shutdown()
+        process.exit(0)
+      }
     }
   })
 
-  console.log('GrassAgent 已启动。输入内容后回车。')
+  tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。')
   tui.start()
 
-  // 进程收尾:停掉 TUI、关掉数据库。
-  // tui.stop() 必须调——readline 在 raw 模式下会改终端状态,
-  // 不清理的话 Ctrl+D 退出后终端还留在原始模式,后续命令看着像失灵了。
-  const shutdown = (): void => {
-    tui.stop()
-    sessionStore.close()
-  }
   process.once('exit', shutdown)
   process.once('SIGINT', () => {
-    // 第一次 Ctrl+C 是"打断当前回合",由 TUI 的 keypress 处理。
-    // 走到这里说明用户想退出进程。
+    // TUI 在 raw 模式下自己拦 Ctrl+C,能走到这里说明不是打断当前回合,
+    // 是用户想退出进程。
     shutdown()
     process.exit(130)
   })
