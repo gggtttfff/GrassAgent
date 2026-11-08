@@ -11,6 +11,9 @@ import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { createLoggerFromConfig } from './logger.ts'
 import { createTransport } from './transport.ts'
 import { SessionStore, generateSessionId } from './sessionStore.ts'
+import { SlashCommandRegistry } from './slashCommands.ts'
+import { buildSessionChoices } from './sessionPicker.ts'
+import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
@@ -71,7 +74,6 @@ async function main() {
     commandTimeoutMs: config.CommandTimeoutMs,
   })
   const tui = new Tui()
-
   // 进程收尾:停掉 TUI、关掉数据库。
   // tui.stop() 必须调——TUI 接管了终端原始模式,
   // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
@@ -97,8 +99,114 @@ async function main() {
     }
   })
 
-  // 每轮：用户输入 → runAgent → 事件转发到 TUI → 持久化
+  // ---- 斜杠命令 ----
+  // 命令在本地执行,不发给模型。/clear 和 /new 会改会话状态,
+  // 所以它们要能拿到 context 和 sessionStore——这里用闭包传进去。
+  const commandRegistry = new SlashCommandRegistry()
+
+  commandRegistry.register({
+    name: 'clear',
+    description: '清空当前对话,保留会话',
+    execute: async () => {
+      await sessionStore.sync(context.messages)
+      context.messages = []
+      context.compaction = undefined
+      tui.clearTranscript()
+      return '对话已清空'
+    },
+  })
+
+  commandRegistry.register({
+    name: 'new',
+    description: '开一个新会话',
+    execute: async () => {
+      const newSessionId = sessionStore.createSession(context.messages)
+      context.messages = []
+      context.compaction = undefined
+      tui.clearTranscript()
+      logger.info({ sessionId: newSessionId }, '已创建新会话')
+      return `已创建新会话 ${newSessionId}`
+    },
+  })
+
+  commandRegistry.register({
+    name: 'sessions',
+    description: '列出所有会话',
+    execute: async () => {
+      const sessions = sessionStore.listSessionDetails()
+      if (sessions.length === 0) return '还没有任何会话'
+      const lines = sessions.map((session) => {
+        const marker = session.id === sessionStore.sessionId ? '*' : ' '
+        return `${marker} ${session.id}  (${session.messageCount} 条消息)`
+      })
+      return lines.join('\n')
+    },
+  })
+
+  commandRegistry.register({
+    name: 'resume',
+    description: '切换到别的会话',
+    argumentHint: '[会话ID]',
+    execute: async (argument) => {
+      const sessions = sessionStore.listSessionDetails()
+      if (sessions.length === 0) return '还没有任何会话'
+
+      // 给了 ID 就直接切
+      if (argument) {
+        const target = sessions.find((session) => session.id === argument)
+        if (!target) return `找不到会话 ${argument}`
+        return await switchToSession(target.id)
+      }
+
+      // 没给 ID:交互模式弹选择器,非交互模式列出来让用户自己挑
+      if (!canUseInteractiveTerminal()) {
+        return '请指定会话 ID:' + sessions.map((session) => session.id).join(' ')
+      }
+
+      // 选择器是异步的——用户什么时候选中不确定,
+      // 所以这里先返回空,选中后的动作在回调里做。
+      tui.showSessionPicker(
+        buildSessionChoices(sessions, sessionStore.sessionId),
+        (sessionId) => {
+          void switchToSession(sessionId).then((message) => tui.printNotice(message))
+        },
+        () => tui.printNotice('已取消'),
+      )
+      return ''
+    },
+  })
+
+  // 切换会话:存盘当前会话,切过去,载入目标会话的历史
+  const switchToSession = async (targetSessionId: string): Promise<string> => {
+    if (targetSessionId === sessionStore.sessionId) return '已经在该会话中'
+    sessionStore.switchSession(targetSessionId, context.messages)
+    context.messages = sessionStore.load()
+    // 压缩状态跟着会话走——不同会话的历史长度不一样
+    context.compaction = undefined
+    tui.clearTranscript()
+    logger.info({ sessionId: targetSessionId }, '已切换会话')
+    return `已切换到会话 ${targetSessionId}(${context.messages.length} 条消息)`
+  }
+
+  // 命令名补全。交互模式才有意义——非交互模式没键盘。
+  tui.setSlashCommands(
+    commandRegistry.all().map((command) => ({
+      name: command.name,
+      description: command.description,
+      argumentHint: command.argumentHint,
+    })),
+    config.Workspace,
+  )
+
+  // 每轮：用户输入 → 斜杠命令 or runAgent → 事件转发到 TUI → 持久化
   tui.bindSubmit(async (text) => {
+    // 斜杠命令在本地执行,不发给模型
+    const commandResult = await commandRegistry.execute(text)
+    if (commandResult !== null) {
+      if (commandResult) tui.printNotice(commandResult)
+      return
+    }
+
     roundRunning = true
     try {
       context.messages.push({ role: 'user', content: text })
@@ -111,6 +219,10 @@ async function main() {
         transport,
         logger,
         toolExecution: config.ToolExecution,
+        compaction: {
+          threshold: config.CompactThreshold,
+          keepRecent: config.CompactKeepRecent,
+        },
       })) {
         switch (ev.type) {
           case 'assistant_text': tui.printText(ev.delta); break

@@ -17,6 +17,7 @@
 // 用户看到的是"先出字,后成型",而不是等全部收完才突然排好版。
 
 import {
+  CombinedAutocompleteProvider,
   Container,
   Editor,
   Markdown,
@@ -24,9 +25,11 @@ import {
   Text,
   TuiMainScreen,
   matchesKey,
+  type SlashCommand,
   type TUI,
 } from '@earendil-works/pi-tui'
 import { NonInteractiveTerminal, canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
+import { SessionPicker, type SessionChoice } from './sessionPicker.ts'
 import {
   accentText,
   editorTheme,
@@ -92,6 +95,32 @@ export class Tui {
         return { consume: true }
       })
     }
+  }
+
+  /**
+   * 挂上斜杠命令的自动补全。
+   *
+   * 用 pi-tui 自带的 CombinedAutocompleteProvider——它同时管命令名和文件路径,
+   * 命令名从我们这边传进去,文件路径基于工作目录。
+   *
+   * 只在交互模式挂。非交互模式没有键盘,补全列表弹出来也没人选。
+   */
+  setSlashCommands(commands: SlashCommand[], workspace: string): void {
+    if (!canUseInteractiveTerminal()) return
+    const provider = new CombinedAutocompleteProvider(commands, workspace)
+    this.editor.setAutocompleteProvider(provider)
+  }
+
+  /**
+   * 弹出会话选择器。
+   *
+   * 用户选中后调 onSelect,取消后调 onCancel。
+   */
+  showSessionPicker(choices: SessionChoice[], onSelect: (sessionId: string) => void, onCancel: () => void): void {
+    const picker = new SessionPicker(choices)
+    picker.onSelect(onSelect)
+    picker.onCancel(onCancel)
+    picker.show(this.tui)
   }
 
   /** 注册 Ctrl+C 打断回调 */
@@ -212,6 +241,19 @@ export class Tui {
   /** 打印标题(启动时用) */
   printHeader(message: string): void {
     this.transcript.addChild(new Text(accentText(message), EDITOR_PADDING_X, 1))
+    this.tui.requestRender()
+  }
+
+  /**
+   * 清空对话记录。
+   *
+   * 切换会话时用——新会话的历史跟旧的不是一回事,
+   * 混在一起看会以为模型记错了。
+   */
+  clearTranscript(): void {
+    this.transcript.clear()
+    this.streamingText = null
+    this.streamingContent = ''
     this.tui.requestRender()
   }
 

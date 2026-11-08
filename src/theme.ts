@@ -65,6 +65,15 @@ export const selectListTheme: SelectListTheme = {
   noMatch: (text) => dim(text),
 }
 
+// 会话选择器里当前会话的标记
+export function currentSessionMarker(text: string): string {
+  return foreground(text, palette.success, { bold: true })
+}
+
+export function overlayTitle(text: string): string {
+  return foreground(text, palette.accent, { bold: true })
+}
+
 // 编辑器主题
 export const editorTheme: EditorTheme = {
   borderColor: (text) => dim(text),

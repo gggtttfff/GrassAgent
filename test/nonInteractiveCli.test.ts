@@ -123,3 +123,68 @@ test('非交互模式的输出没有 ANSI 控制序列', async () => {
     await mock.close()
   }
 })
+
+// 斜杠命令的端到端测试。
+//
+// 关键断言:命令在本地执行,不发给模型。
+// 未知命令也得拦下来——不然会被当成普通输入发给模型。
+
+const mockEnvironment = (port: number): Record<string, string> => ({
+  GRASSAGENT_API_KEY: 'test-key',
+  GRASSAGENT_MODEL: 'mock-model',
+  GRASSAGENT_BASE_URL: `http://127.0.0.1:${port}/v1`,
+  GRASSAGENT_SESSION_DATABASE_PATH: ':memory:',
+  GRASSAGENT_LOG_FORMAT: 'json',
+})
+
+test('斜杠命令在本地执行,不发给模型', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/clear\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0)
+    assert.ok(output.includes('对话已清空'), `应该提示清空成功,实际: ${output.slice(-300)}`)
+    // 关键:模型没被调用
+    assert.ok(!output.includes('回复'), '命令不该发给模型')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('未知命令给出提示,也不发给模型', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/nope\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0)
+    assert.ok(output.includes('未知命令'), `应该提示未知命令,实际: ${output.slice(-300)}`)
+    assert.ok(!output.includes('回复'), '拼错的命令不该发给模型')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('/sessions 列出会话', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/sessions\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0)
+    assert.ok(/session/i.test(output), `应该列出会话 ID,实际: ${output.slice(-300)}`)
+    assert.ok(!output.includes('回复'), '命令不该发给模型')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('普通输入照常发给模型', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('普通问题\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0)
+    assert.ok(output.includes('回复'), `普通输入应该发给模型,实际: ${output.slice(-300)}`)
+  } finally {
+    await mock.close()
+  }
+})
