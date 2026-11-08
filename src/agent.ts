@@ -14,6 +14,11 @@ import {
 } from './llm.ts'
 import { validateToolArguments } from './validation.ts'
 import { withFileMutationQueue } from './mutationQueue.ts'
+import {
+  buildModelContext,
+  compactContext,
+  type CompactionOptions,
+} from './compaction.ts'
 import type { Transport } from './transport.ts'
 import type { Logger } from './logger.ts'
 
@@ -45,56 +50,14 @@ export type AgentEvent =
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
 
 // compaction 触发阈值:消息数超过这个值就压缩旧消息
-const COMPACT_THRESHOLD = 50
+const DEFAULT_COMPACT_THRESHOLD = 50
 // compaction 保留最近这么多条消息
-const KEEP_RECENT = 20
+const DEFAULT_KEEP_RECENT = 20
 
-// 上下文有上限,满了要压缩——这是 agent 自管上下文的核心能力。
-// 这里按消息条数近似判断,粒度粗但够用;压缩失败时保留原消息,
-// 不用空摘要把整个会话毁掉。
-async function compactContext(
-  model: Model,
-  context: Context,
-  signal?:AbortSignal,
-  options: { transport?: Transport; logger?: Logger } = {},
-): Promise<void> {
-  // abort 时不压缩,省一次请求也避免半截摘要
-  if (signal?.aborted) return
-  if (context.messages.length < COMPACT_THRESHOLD) return
-
-  const oldMessages = context.messages.slice(0, -KEEP_RECENT)
-  const recentMessages = context.messages.slice(-KEEP_RECENT)
-
-  // 把旧消息拍平成纯文本让模型总结
-  const conversationText = oldMessages
-    .map((message) => `${message.role}:${typeof message.content === 'string' ? message.content : JSON.stringify(message.content)}`)
-    .join('\n')
-
-  // 用一轮额外的调用做总结,不走工具
-  const summaryContext: Context = {
-    systemPrompt: '请将以下对话总结为简洁的上下文摘要,保留关键决策,已做的工作和待办事项.',
-    messages: [{ role: 'user', content: conversationText }],
-  }
-
-  let summary = ''
-  let failed = false
-  const summaryOptions: StreamOptions = { signal, transport: options.transport, logger: options.logger }
-  for await (const event of stream(model, summaryContext, summaryOptions)) {
-    if (event.type === 'text_delta') summary += event.delta
-    else if (event.type === 'error' || (event.type === 'done' && event.stopReason === 'aborted')) {
-      failed = true
-      break
-    }
-  }
-
-  // 压缩失败时不替换 context,保留原始消息
-  if (failed || !summary) return
-
-  // 摘要替换旧消息,近期消息原样保留
-  context.messages = [
-    { role: 'user', content: `[context summary]\n${summary}` },
-    ...recentMessages,
-  ]
+// 压缩的默认配置。runAgent 的参数可以覆盖。
+const defaultCompactionOptions: CompactionOptions = {
+  threshold: DEFAULT_COMPACT_THRESHOLD,
+  keepRecent: DEFAULT_KEEP_RECENT,
 }
 
 // 运行 agent 循环,没有步数上限——模型说停就停。
@@ -103,7 +66,12 @@ export async function* runAgent(
   context: Context,
   tools: AgentTool[],
   signal?: AbortSignal,
-  options: { transport?: Transport; logger?: Logger; toolExecution?: 'parallel' | 'sequential' } = {},
+  options: {
+    transport?: Transport
+    logger?: Logger
+    toolExecution?: 'parallel' | 'sequential'
+    compaction?: CompactionOptions
+  } = {},
 ): AsyncGenerator<AgentEvent> {
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]))
   const toolDefs = tools.map((tool) => ({
@@ -112,9 +80,14 @@ export async function* runAgent(
     parameters: tool.parameters,
   }))
 
+  // 压缩状态存在 context.compaction 里,跨回合存活。
+  // 它只影响发给模型的视图,context.messages 始终保持完整——
+  // 会话存储和 /resume 恢复出来的都是完整历史。
+  const compactionOptions = options.compaction ?? defaultCompactionOptions
+
   while (true) {
     // 0. 消息过多时先压缩旧消息
-    await compactContext(model, context, signal, options)
+    await compactContext(model, context, signal, options, compactionOptions)
 
     // 1. 流式调用 LLM,收集文本和 tool_calls
     let text = ''
@@ -127,7 +100,9 @@ export async function* runAgent(
       transport: options.transport,
       logger: options.logger,
     }
-    for await (const event of stream(model, context, streamOptions)) {
+    // 压缩后的视图才是发给模型的内容
+    const modelContext = buildModelContext(context, context.compaction)
+    for await (const event of stream(model, modelContext, streamOptions)) {
       if (event.type === 'text_delta') {
         text += event.delta
         yield { type: 'assistant_text', delta: event.delta }

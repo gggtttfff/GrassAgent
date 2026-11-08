@@ -335,16 +335,15 @@ console.log('\n用例 5: 消息超过阈值后压缩旧消息')
 {
   queue.length = 0
   receivedRequests = []
-  // 先凑够触发阈值的空跑(纯文本,不调工具)
-  queue.push(() => ({ status: 200, body: body([textFrame('ok'), finishFrame('stop')]) }))
+
+  // 压缩会额外发一轮请求,所以需要两个响应:先压缩摘要,再正常回复。
+  // agent 循环一进来就会检查消息数,所以第一个响应就是摘要请求的响应。
+  queue.push(() => ({ status: 200, body: body([textFrame('这是历史对话摘要'), finishFrame('stop')]) }))
+  queue.push(() => ({ status: 200, body: body([textFrame('压缩后继续'), finishFrame('stop')]) }))
 
   const context: Context = {
     messages: Array.from({ length: 55 }, (_, i) => ({ role: 'user' as const, content: `msg ${i}` }))
   }
-
-  // 压缩会额外发一轮请求,所以需要两个响应:先压缩摘要,再正常回复
-  queue.push(() => ({ status: 200, body: body([textFrame('这是历史对话摘要'), finishFrame('stop')]) }))
-  queue.push(() => ({ status: 200, body: body([textFrame('压缩后继续'), finishFrame('stop')]) }))
 
   let text = ''
   for await (const ev of runAgent(model, context, tools)) {
@@ -352,9 +351,25 @@ console.log('\n用例 5: 消息超过阈值后压缩旧消息')
   }
 
   check('触发了压缩(发送了摘要请求)', receivedRequests.length >= 1)
-  check('压缩后消息数下降', context.messages.length < 55, `now: ${context.messages.length}`)
+  // 压缩只影响发给模型的视图,历史不动。
+  // 以前压缩会砍掉历史,带来两个后果:切点可能劈开 tool_use/tool_result
+  // 导致 API 400,以及会话存储按条数切片写不进去。
+  check('历史保持完整(没有消息被删)', context.messages.length === 56,
+    `压缩前 55 条 + 1 条 assistant 回复,now: ${context.messages.length}`)
+  check('压缩状态已记录', (context as any).compaction !== undefined)
+
+  // 摘要只出现在发给模型的请求里,不该进历史
+  const historyText = JSON.stringify(context.messages)
+  check('摘要没进历史', !historyText.includes('[context summary]'))
+  // 但模型确实看到了摘要
+  const lastRequestText = JSON.stringify(receivedRequests[receivedRequests.length - 1]?.messages ?? [])
+  check('模型看到了摘要', lastRequestText.includes('[context summary]') &&
+    lastRequestText.includes('这是历史对话摘要'),
+    lastRequestText.slice(0, 200))
+  // 发给模型的消息比历史少——旧消息被摘要顶替了
+  check('发给模型的消息比历史少',
+    (receivedRequests[receivedRequests.length - 1]?.messages ?? []).length < context.messages.length)
   check('保留了最近消息', context.messages.some((m: any) => typeof m.content === 'string' && m.content.includes('msg 54')))
-  check('摘要已注入', context.messages.some((m: any) => typeof m.content === 'string' && m.content.includes('context summary')))
 }
 
 // ---------- 清理 ----------

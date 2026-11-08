@@ -37,10 +37,30 @@ export interface Message {
   content: string | ContentBlock[]
 }
 
-/** 上下文:系统提示词 + 消息列表 */
+/**
+ * 上下文压缩状态。
+ *
+ * 压缩不改写历史,只标记「前多少条已经被摘要覆盖」。
+ * 历史本身始终完整——它是会话存储的内容,也是 /resume 恢复出来的内容。
+ */
+export interface CompactionState {
+  /** 已经被摘要覆盖的消息条数 */
+  summarizedCount: number
+  /** 摘要正文 */
+  summary: string
+}
+
+/** 上下文:系统提示词 + 消息列表 + 压缩状态 */
 export interface Context {
   systemPrompt?: string
   messages: Message[]
+  /**
+   * 压缩状态。还没压缩过就不设。
+   *
+   * 放在 Context 里是因为它要跨回合存活:
+   * 压缩过的历史不该在下一轮又原样发一遍。
+   */
+  compaction?: CompactionState
 }
 
 /** 构造文本块 */
