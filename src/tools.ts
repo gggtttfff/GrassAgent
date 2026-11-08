@@ -1,5 +1,5 @@
 // src/tools.ts
-// 四个工具:能读写代码并执行验证的最小集。
+// 内置工具:读写代码、执行验证,以及必要时的用户澄清。
 // 每个工具是纯函数:async => string,不耦合 agent 状态。
 // 所有文件路径都要过 pathGuard 沙箱,命令执行的工作目录也锁定在沙箱内。
 // 参数 schema 用 pi-schema 的 builders 写,类型和校验规则只有一处定义。
@@ -84,6 +84,32 @@ const editBatchParameters = obj({
 const runBashParameters = obj({
   command: str({ description: '要执行的 shell 命令' }),
 })
+
+const askUserParameters = obj({
+  question: str({ description: '要问用户的问题,具体且简短' }),
+})
+
+/** 向用户提问并等待回答。由界面层注入,工具本身不持有终端状态。 */
+export type AskUserHandler = (question: string, signal?: AbortSignal) => Promise<string>
+
+// ask_user:信息不足时向用户澄清,回答作为工具结果回填。
+function buildAskUser(askUser: AskUserHandler): AgentTool {
+  return {
+    name: 'ask_user',
+    description:
+      '向用户提问并等待回答.参数:question(问题).仅在缺少关键信息、继续执行可能做错时使用,' +
+      '能自己查到的信息不要问用户',
+    parameters: askUserParameters,
+    // 提问期间不能和其他工具并发:回答决定后续动作,而且界面同时只能接一个问题
+    sequential: true,
+    execute: async (args, signal) => {
+      const { question } = args as { question: string }
+      if (!question.trim()) return 'error:question must not be empty'
+      if (signal?.aborted) return 'error:aborted'
+      return await askUser(question.trim(), signal)
+    },
+  }
+}
 
 // read_file:返回文件内容(截取文件尾部 200 行)
 function buildReadFile(pathGuard: PathGuard): AgentTool {
@@ -264,13 +290,20 @@ function buildRunBash(pathGuard: PathGuard, timeoutMs: number): AgentTool {
 
 // 返回全部内置工具。
 // workspace 缺省用当前工作目录,不传则沙箱范围就是进程启动目录。
-export async function builtinTools(options: { workspace?: string; commandTimeoutMs?: number } = {}): Promise<AgentTool[]> {
+// askUser 由调用方注入;没有交互界面时不注册提问工具,避免模型调用后等不到回答。
+export async function builtinTools(options: {
+  workspace?: string
+  commandTimeoutMs?: number
+  askUser?: AskUserHandler
+} = {}): Promise<AgentTool[]> {
   const pathGuard = await createPathGuard(options.workspace ?? process.cwd())
-  return [
+  const tools = [
     buildReadFile(pathGuard),
     buildWriteFile(pathGuard),
     buildEdit(pathGuard),
     buildEditBatch(pathGuard),
     buildRunBash(pathGuard, options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS),
   ]
+  if (options.askUser) tools.push(buildAskUser(options.askUser))
+  return tools
 }

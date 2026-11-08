@@ -43,6 +43,14 @@ import {
 // 输入框上下留白
 const EDITOR_PADDING_X = 1
 
+// 等待用户回答的状态。一次只能有一个问题,避免多个工具抢同一个输入框。
+type PendingAnswer = {
+  resolve: (answer: string) => void
+  reject: (error: Error) => void
+  signal?: AbortSignal
+  onAbort: () => void
+}
+
 export class Tui {
   private readonly tui: TUI
   private readonly editor: Editor
@@ -58,11 +66,14 @@ export class Tui {
 
   private busy = false
   private stopped = false
+  private pendingAnswer: PendingAnswer | null = null
+  private readonly interactive: boolean
 
   constructor() {
     // 交互式终端用 ProcessTerminal(接管原始模式,按键响应快);
     // 非交互环境(管道、CI)用逐行模式,不然"你好\n" 会被当成一串按键。
     const interactive = canUseInteractiveTerminal()
+    this.interactive = interactive
     const terminal = interactive ? new ProcessTerminal() : new NonInteractiveTerminal()
     this.tui = new TuiMainScreen(terminal)
     this.editor = new Editor(this.tui, editorTheme, { paddingX: EDITOR_PADDING_X })
@@ -83,7 +94,7 @@ export class Tui {
     //
     // 非交互环境不注册这个监听:那边没有原始模式,Ctrl+C 会正常触发 SIGINT,
     // 由 cli 层的 SIGINT 处理函数接管。
-    if (canUseInteractiveTerminal()) {
+    if (this.interactive) {
       this.tui.addInputListener((data) => {
         if (!matchesKey(data, 'ctrl+c')) return undefined
         if (this.busy) {
@@ -106,7 +117,7 @@ export class Tui {
    * 只在交互模式挂。非交互模式没有键盘,补全列表弹出来也没人选。
    */
   setSlashCommands(commands: SlashCommand[], workspace: string): void {
-    if (!canUseInteractiveTerminal()) return
+    if (!this.interactive) return
     const provider = new CombinedAutocompleteProvider(commands, workspace)
     this.editor.setAutocompleteProvider(provider)
   }
@@ -146,6 +157,7 @@ export class Tui {
   /** 停止界面,清理终端状态 */
   stop(): void {
     if (this.stopped) return
+    this.settlePendingAnswer(new Error('界面已关闭'))
     this.stopped = true
     this.tui.stop()
   }
@@ -167,8 +179,45 @@ export class Tui {
     this.busy = busy
     // 打断后不能直接解锁——用户可能还在按 Ctrl+C,编辑器会立刻再次提交。
     // 回合真正结束时由 cli 层调用 setBusy(false) 解锁。
-    this.editor.disableSubmit = busy
+    // 提问期间除外:那时虽然回合仍在跑,输入框要用来接收回答。
+    this.editor.disableSubmit = busy && !this.pendingAnswer
     this.tui.requestRender()
+  }
+
+  /**
+   * 向用户提问,并等待下一次输入作为回答。
+   *
+   * 回合仍在运行,但这里临时打开输入框。bindSubmit 看到 pendingAnswer
+   * 就会把输入交给这个问题,不会启动新的 agent 回合。
+   */
+  askUser(question: string, signal?: AbortSignal): Promise<string> {
+    if (!this.interactive) {
+      return Promise.reject(new Error('非交互模式无法接收用户回答'))
+    }
+    if (this.stopped) return Promise.reject(new Error('界面已关闭'))
+    if (this.pendingAnswer) return Promise.reject(new Error('已有问题等待用户回答'))
+    if (signal?.aborted) return Promise.reject(new Error('aborted'))
+
+    this.printNotice(`[提问] ${question}`)
+    return new Promise<string>((resolve, reject) => {
+      const onAbort = () => this.settlePendingAnswer(new Error('aborted'))
+      this.pendingAnswer = { resolve, reject, signal, onAbort }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      this.editor.disableSubmit = false
+      this.tui.requestRender()
+    })
+  }
+
+  // 结束一次提问,恢复回合运行时的输入框状态。
+  private settlePendingAnswer(error: Error | null, answer = ''): void {
+    const pending = this.pendingAnswer
+    if (!pending) return
+    this.pendingAnswer = null
+    pending.signal?.removeEventListener('abort', pending.onAbort)
+    this.editor.disableSubmit = this.busy
+    this.tui.requestRender()
+    if (error) pending.reject(error)
+    else pending.resolve(answer)
   }
 
   /** 流式打印 assistant 文本增量 */
@@ -263,6 +312,12 @@ export class Tui {
       const trimmed = text.trim()
       if (!trimmed) return
       this.editor.addToHistory(trimmed)
+      // 正在等提问的回答:输入只属于这个问题,不能触发新的回合或斜杠命令
+      if (this.pendingAnswer) {
+        this.printNotice(`[回答] ${trimmed}`)
+        this.settlePendingAnswer(null, trimmed)
+        return
+      }
       handler(trimmed)
     }
   }

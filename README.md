@@ -13,6 +13,7 @@
 - **斜杠命令** —— `/clear` `/new` `/sessions` `/resume`，本地执行，带命令补全
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息，历史本身不丢
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
+- **用户提问** —— 模型缺少关键信息时调用 `ask_user`，回答回填后继续执行
 - **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
@@ -29,7 +30,7 @@ src/
   providers/     按厂商分文件：openai.ts 等
   agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
   compaction.ts  压缩层：决定发给模型看哪一段，不改历史
-  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
+  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash / ask_user
   tui.ts         终端界面:组件树 + 差分渲染 + markdown 排版
   theme.ts       配色:markdown / 编辑器 / 列表的主题定义
   slashCommands.ts 斜杠命令：解析 + 分发
@@ -214,6 +215,10 @@ echo "读一下 README.md" | npm start
 
 想退回串行：`GRASSAGENT_TOOL_EXECUTION=sequential`。
 
+**用户提问。** 模型遇到「改 A 还是改 B」这类不能靠读代码决定的问题时，会调用 `ask_user`，把问题显示在对话区。回答作为 `tool_result` 回填，模型据此继续，不会重复执行已经完成的工具。
+
+提问期间输入框只接收回答，不触发新回合或斜杠命令；回答后恢复原来的状态。`ask_user` 声明 `sequential: true`，不会和其他工具同时抢输入。非交互模式没有下一条输入可读，会返回「无法接收回答」的兜底结果，让模型基于已有信息继续，而不是挂住进程。
+
 **会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
 WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——允许多实例同时跑。
@@ -227,7 +232,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / askUser / tuiQuestion / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -241,8 +246,9 @@ npm run test:all     # 上面三样一起跑
 - 参数 JSON 损坏但 `finish_reason` 正常时同样拦下
 - Ctrl+C 打断后每个 `tool_call` 都有配对 `tool_result`
 - 消息超阈值后的上下文压缩
+- 模型调用 `ask_user` 时，用户回答回填后继续执行；等待回答时也能打断
 
-另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型。
+另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型、`ask_user` 无法接收回答时有兜底。
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 

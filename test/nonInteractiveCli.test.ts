@@ -15,16 +15,18 @@ import { fileURLToPath } from 'node:url'
 
 const projectRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 
-// 起一个 mock SSE 服务,返回一个固定回复
-async function startMockServer(): Promise<{ port: number; close: () => Promise<void> }> {
+// 起一个 mock SSE 服务。默认每次返回同一个固定回复;
+// 传入 responses 时按请求顺序依次返回,用于编排工具调用回合。
+async function startMockServer(responses?: string[]): Promise<{ port: number; close: () => Promise<void> }> {
+  const defaultResponse =
+    'data: {"choices":[{"delta":{"content":"回复**加粗**内容"},"finish_reason":"stop"}]}\n\n' +
+    'data: [DONE]\n\n'
+  const queue = [...(responses ?? [])]
   const server = createServer((request, response) => {
     request.on('data', () => {})
     request.on('end', () => {
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
-      response.end(
-        'data: {"choices":[{"delta":{"content":"回复**加粗**内容"},"finish_reason":"stop"}]}\n\n' +
-          'data: [DONE]\n\n',
-      )
+      response.end(responses ? queue.shift() ?? defaultResponse : defaultResponse)
     })
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -184,6 +186,26 @@ test('普通输入照常发给模型', async () => {
 
     assert.equal(exitCode, 0)
     assert.ok(output.includes('回复'), `普通输入应该发给模型,实际: ${output.slice(-300)}`)
+  } finally {
+    await mock.close()
+  }
+})
+
+test('非交互模式遇到 ask_user 会兜底,不挂住进程', async () => {
+  const askUserResponse =
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"要继续吗?\\"}"}}]}}]}\n\n' +
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+    'data: [DONE]\n\n'
+  const finalResponse =
+    'data: {"choices":[{"delta":{"content":"已根据已有信息继续"},"finish_reason":"stop"}]}\n\n' +
+    'data: [DONE]\n\n'
+  const mock = await startMockServer([askUserResponse, finalResponse])
+  try {
+    const { exitCode, output } = await runCliWithInput('开始任务\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0, `进程不应卡在等待回答,实际退出码 ${exitCode}`)
+    assert.ok(output.includes('非交互模式'), `应该给出无法提问的兜底,实际: ${output.slice(-500)}`)
+    assert.ok(output.includes('已根据已有信息继续'), '收到兜底结果后应继续回合')
   } finally {
     await mock.close()
   }

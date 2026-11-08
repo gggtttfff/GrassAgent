@@ -17,7 +17,7 @@ import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
-const SYSTEM_PROMPT = '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。'
+const SYSTEM_PROMPT = '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。缺少关键信息时用 ask_user 向用户提问，不要凭空猜测。'
 
 async function main() {
   // 配置先加载并校验:启动阶段就报错，比第一次调 API 失败好排查
@@ -68,12 +68,21 @@ async function main() {
     messages: sessionStore.load(),
   }
 
-  // 工具的文件访问被限制在工作区内
+  const tui = new Tui()
+  // 工具的文件访问被限制在工作区内。提问能力由界面注入,
+  // 工具本身不接触终端,也不持有 agent 状态。
   const tools = await builtinTools({
     workspace: config.Workspace,
     commandTimeoutMs: config.CommandTimeoutMs,
+    askUser: async (question, signal) => {
+      if (!canUseInteractiveTerminal()) {
+        // 管道输入可能已经没有下一行了,等待回答只会把进程挂住
+        logger.warn({ questionLength: question.length }, '非交互模式无法回答模型提问')
+        throw new Error('当前是非交互模式,无法接收用户回答。请基于已有信息继续,或说明需要用户补充什么。')
+      }
+      return await tui.askUser(question, signal)
+    },
   })
-  const tui = new Tui()
   // 进程收尾:停掉 TUI、关掉数据库。
   // tui.stop() 必须调——TUI 接管了终端原始模式,
   // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
