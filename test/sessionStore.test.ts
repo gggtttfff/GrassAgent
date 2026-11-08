@@ -122,6 +122,130 @@ test('listSessions 列出所有会话', () => {
   }
 })
 
+test('listSessionDetails 带出消息条数', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    store.sync([userMessage('一'), { role: 'assistant', content: '二' }])
+    const details = store.listSessionDetails()
+    assert.equal(details.length, 1)
+    assert.equal(details[0].id, 's1')
+    assert.equal(details[0].messageCount, 2)
+    assert.ok(details[0].updatedAt > 0)
+  } finally {
+    store.close()
+  }
+})
+
+test('历史被替换后能重新写入', () => {
+  // /clear 会把历史清空。清空之后新说的话必须能存进去——
+  // 按「新增条数」切片的话,历史变短了切片就是空的,消息会静默丢掉。
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    store.sync([userMessage('清空前'), { role: 'assistant', content: '清空前' }])
+    assert.equal(store.load().length, 2)
+
+    // 历史被清空
+    const cleared: Message[] = []
+    store.sync(cleared)
+
+    // 清空后新说的话
+    const written = store.sync([userMessage('清空后')])
+    assert.equal(written, 1, '清空后的新消息应该写进去')
+
+    const loaded = store.load()
+    assert.equal(loaded.length, 1)
+    assert.equal(loaded[0].content, '清空后')
+  } finally {
+    store.close()
+  }
+})
+
+test('历史内容被换掉时能重新写入', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    store.sync([userMessage('第一条'), userMessage('第二条')])
+
+    // 内容变了但条数没变——按条数切片看不出来,但内容确实换了
+    const replaced: Message[] = [userMessage('换了'), userMessage('也换了')]
+    store.sync(replaced)
+
+    const loaded = store.load()
+    assert.equal(loaded.length, 2)
+    assert.equal(loaded[0].content, '换了')
+    assert.equal(loaded[1].content, '也换了')
+  } finally {
+    store.close()
+  }
+})
+
+test('createSession 开新会话,旧会话保留', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 'session-a' })
+  try {
+    const oldMessages = [userMessage('A 的消息')]
+    store.sync(oldMessages)
+
+    const newSessionId = store.createSession(oldMessages)
+    assert.notEqual(newSessionId, 'session-a')
+    assert.equal(store.sessionId, newSessionId)
+
+    // 新会话是空的
+    assert.equal(store.load().length, 0)
+
+    // 旧会话还在库里
+    store.switchSession('session-a', [])
+    assert.equal(store.load()[0].content, 'A 的消息')
+  } finally {
+    store.close()
+  }
+})
+
+test('switchSession 切换后各自的史独立', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 'session-a' })
+  try {
+    const messagesA = [userMessage('A1'), userMessage('A2')]
+    store.sync(messagesA)
+
+    const newSessionId = store.createSession(messagesA)
+    const messagesB = [userMessage('B1')]
+    store.sync(messagesB)
+
+    // 切回 A,历史还在
+    store.switchSession('session-a', messagesB)
+    assert.deepEqual(store.load().map((message) => message.content), ['A1', 'A2'])
+
+    // A 里追加一条,应该写进 A
+    const messagesA2 = [...messagesA, userMessage('A3')]
+    store.sync(messagesA2)
+    assert.equal(store.load().length, 3)
+
+    // 切回 B,B 里还是只有一条
+    store.switchSession(newSessionId, messagesA2)
+    assert.deepEqual(store.load().map((message) => message.content), ['B1'])
+  } finally {
+    store.close()
+  }
+})
+
+test('switchSession 切到当前会话不做任何事', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    const messages = [userMessage('x')]
+    store.sync(messages)
+    store.switchSession('s1', messages)
+    assert.equal(store.sessionId, 's1')
+    assert.equal(store.load().length, 1)
+  } finally {
+    store.close()
+  }
+})
+
+test('关闭后切换会话会报错', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  store.close()
+  assert.throws(() => store.switchSession('s2', []), /已关闭/)
+  assert.throws(() => store.createSession([]), /已关闭/)
+})
+
 test('关闭后写入会报错', () => {
   const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
   store.close()

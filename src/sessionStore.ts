@@ -91,17 +91,20 @@ const SCHEMA_STATEMENTS = [
  */
 export class SessionStore {
   readonly databasePath: string
-  readonly sessionId: string
 
   private readonly database: DatabaseSync
+  private currentSessionId: string
   // 已持久化的消息数。sync 只写 seq 大于这个值的,避免重复写。
   private persistedCount = 0
+  // 已持久化的消息内容(序列化后的 JSON)。
+  // 用来判断历史是不是被替换过——/clear 和切换会话都会换掉内容。
+  private persistedContents: string[] = []
   private closed = false
 
   constructor(options: SessionStoreOptions) {
     this.databasePath =
       options.databasePath === ':memory:' ? ':memory:' : path.resolve(options.databasePath)
-    this.sessionId = options.sessionId
+    this.currentSessionId = options.sessionId
 
     // 内存库不能设 WAL,会报错
     if (this.databasePath !== ':memory:') {
@@ -132,13 +135,18 @@ export class SessionStore {
     this.ensureSessionRow()
   }
 
+  /** 当前会话的 ID */
+  get sessionId(): string {
+    return this.currentSessionId
+  }
+
   /**
    * 读取当前会话的历史消息,按 seq 升序。
    */
   load(): Message[] {
     const rows = this.database
       .prepare('SELECT content FROM messages WHERE session_id = ? ORDER BY seq ASC')
-      .all(this.sessionId) as Array<{ content: string }>
+      .all(this.currentSessionId) as Array<{ content: string }>
 
     const messages: Message[] = []
     for (const row of rows) {
@@ -151,17 +159,33 @@ export class SessionStore {
     }
 
     this.persistedCount = messages.length
+    this.persistedContents = messages.map((message) => JSON.stringify(message))
     return messages
   }
 
   /**
-   * 把完整会话同步到存储。只写 persistedCount 之后的新增部分。
+   * 把完整会话同步到存储。
+   *
+   * 正常情况只写 persistedCount 之后的新增部分。
+   *
+   * 但历史有可能被整体替换——/clear 清空对话、切换会话换掉内容。
+   * 这时按「新增条数」切片就会算错:历史变短了,切片切到空,
+   * 之后新说的话一条也写不进去。
+   *
+   * 所以先对一下账:传进来的列表如果跟已存的内容对不上,
+   * 就当成「历史被替换」,把旧的删掉重写一遍。
    *
    * 注意:参数是**完整的会话消息列表**,不是增量。
    * 传增量会写不进去(切片后为空)。
    */
   sync(messages: Message[]): number {
     if (this.closed) throw new Error('会话存储已关闭')
+
+    // 历史被替换过:删掉旧内容,从头重写
+    if (this.historyReplaced(messages)) {
+      return this.rewrite(messages)
+    }
+
     const newMessages = messages.slice(this.persistedCount)
     if (newMessages.length === 0) return 0
 
@@ -178,7 +202,7 @@ export class SessionStore {
       let seq = this.persistedCount
       for (const message of newMessages) {
         insert.run(
-          this.sessionId,
+          this.currentSessionId,
           seq,
           message.role,
           JSON.stringify(message),
@@ -186,7 +210,7 @@ export class SessionStore {
         )
         seq++
       }
-      touch.run(now, this.sessionId)
+      touch.run(now, this.currentSessionId)
       this.database.exec('COMMIT')
     } catch (error) {
       this.database.exec('ROLLBACK')
@@ -194,7 +218,105 @@ export class SessionStore {
     }
 
     this.persistedCount = messages.length
+    for (const message of newMessages) {
+      this.persistedContents.push(JSON.stringify(message))
+    }
     return newMessages.length
+  }
+
+  /**
+   * 判断传进来的历史是不是被替换过。
+   *
+   * 判据:已存的前 persistedCount 条,跟这次传进来的对应位置内容一致。
+   * 不一致就说明中途被换掉了。
+   */
+  private historyReplaced(messages: Message[]): boolean {
+    // 比已存的还短:历史被砍短了(/clear)
+    if (messages.length < this.persistedCount) return true
+    for (let index = 0; index < this.persistedCount; index++) {
+      if (JSON.stringify(messages[index]) !== this.persistedContents[index]) {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * 删掉当前会话的旧内容,从头重写。
+   *
+   * 整个会话的序号会重新分配——历史被替换过之后,
+   * 原来的序号对不上新的内容,续着写只会乱序。
+   */
+  private rewrite(messages: Message[]): number {
+    const insert = this.database.prepare(
+      'INSERT INTO messages (session_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?)',
+    )
+    const clear = this.database.prepare('DELETE FROM messages WHERE session_id = ?')
+    const touch = this.database.prepare('UPDATE sessions SET updated_at = ? WHERE id = ?')
+
+    const now = Date.now()
+    this.database.exec('BEGIN')
+    try {
+      clear.run(this.currentSessionId)
+      let seq = 0
+      for (const message of messages) {
+        insert.run(
+          this.currentSessionId,
+          seq,
+          message.role,
+          JSON.stringify(message),
+          now,
+        )
+        seq++
+      }
+      touch.run(now, this.currentSessionId)
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+
+    this.persistedCount = messages.length
+    this.persistedContents = messages.map((message) => JSON.stringify(message))
+    return messages.length
+  }
+
+  /**
+   * 切换到另一个会话。
+   *
+   * 切之前要先把当前会话存盘——不然这一轮的消息会丢。
+   * 切完重置计数,下一次 sync 会从头写新会话的内容。
+   */
+  switchSession(sessionId: string, messages: Message[]): void {
+    if (this.closed) throw new Error('会话存储已关闭')
+    if (sessionId === this.currentSessionId) return
+
+    // 当前会话先落盘
+    this.sync(messages)
+
+    this.currentSessionId = sessionId
+    this.ensureSessionRow()
+    // 新会话的消息数从头算
+    this.persistedCount = 0
+    this.persistedContents = []
+  }
+
+  /**
+   * 开一个新会话。
+   *
+   * 返回新会话的 ID。旧会话的内容保留在库里,可以用 /resume 切回来。
+   */
+  createSession(messages: Message[], sessionId?: string): string {
+    if (this.closed) throw new Error('会话存储已关闭')
+    // 旧会话先落盘
+    this.sync(messages)
+
+    const newSessionId = sessionId ?? generateSessionId()
+    this.currentSessionId = newSessionId
+    this.ensureSessionRow()
+    this.persistedCount = 0
+    this.persistedContents = []
+    return newSessionId
   }
 
   /** 关闭数据库。进程退出前调用,确保数据落盘 */
@@ -212,7 +334,7 @@ export class SessionStore {
         'INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?) ' +
           'ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at',
       )
-      .run(this.sessionId, now, now)
+      .run(this.currentSessionId, now, now)
   }
 
   /** 列出数据库里所有会话的 ID,按更新时间倒序 */
@@ -222,6 +344,37 @@ export class SessionStore {
       .all() as Array<{ id: string }>
     return rows.map((row) => row.id)
   }
+
+  /**
+   * 列出所有会话的详情,按更新时间倒序。
+   *
+   * 消息条数一并查出来,列表里直接显示,用户不用逐个点进去看。
+   */
+  listSessionDetails(): SessionDetail[] {
+    const rows = this.database
+      .prepare(
+        'SELECT s.id AS id, s.updated_at AS updatedAt, ' +
+          '(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messageCount ' +
+          'FROM sessions s ORDER BY s.updated_at DESC',
+      )
+      .all() as Array<{ id: string; updatedAt: number; messageCount: number }>
+
+    return rows.map((row) => ({
+      id: row.id,
+      updatedAt: row.updatedAt,
+      messageCount: row.messageCount,
+    }))
+  }
+}
+
+/** 一个会话的概要信息 */
+export interface SessionDetail {
+  /** 会话 ID */
+  id: string
+  /** 最后更新时间(毫秒时间戳) */
+  updatedAt: number
+  /** 消息条数 */
+  messageCount: number
 }
 
 /**
