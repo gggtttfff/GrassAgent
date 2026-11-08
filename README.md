@@ -10,7 +10,8 @@
 
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
 - **终端界面** —— 差分渲染 + markdown 排版，流式输出不闪屏
-- **上下文自管理** —— 消息过多时让模型自己总结旧消息
+- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume`，本地执行，带命令补全
+- **上下文自管理** —— 消息过多时让模型自己总结旧消息，历史本身不丢
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
 - **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
@@ -27,9 +28,12 @@ src/
   messages.ts    内部消息模型（provider 无关）
   providers/     按厂商分文件：openai.ts 等
   agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
+  compaction.ts  压缩层：决定发给模型看哪一段，不改历史
   tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
   tui.ts         终端界面:组件树 + 差分渲染 + markdown 排版
   theme.ts       配色:markdown / 编辑器 / 列表的主题定义
+  slashCommands.ts 斜杠命令：解析 + 分发
+  sessionPicker.ts  会话选择器：列表 + 弹窗
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
   logger.ts      日志层：结构化 JSON 输出
@@ -41,7 +45,7 @@ src/
   sessionStore.ts 会话层：SQLite 存储（node:sqlite，零依赖）
 
 test/            单元测试（node:test，无测试框架依赖）
-e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 28 项断言
+e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 31 项断言
 ```
 
 依赖方向单向向下，没有循环引用。想换掉任何一层，都不影响其他层。
@@ -70,6 +74,19 @@ npm start
 ```
 
 启动后直接输入内容回车即可。模型回复过程中可以按 Ctrl+C 打断当前回合。
+
+### 斜杠命令
+
+输入 `/` 会弹出命令补全列表，回车执行。命令在本地执行，不会发给模型。
+
+| 命令 | 说明 |
+| --- | --- |
+| `/clear` | 清空当前对话，保留会话 |
+| `/new` | 开一个新会话 |
+| `/sessions` | 列出所有会话 |
+| `/resume` | 切换到别的会话 |
+
+`/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
 
 ### 非交互模式
 
@@ -103,6 +120,8 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_LOG_LEVEL` | 日志级别 | `info` |
 | `GRASSAGENT_LOG_FORMAT` | `json` 或 `pretty` | `json` |
 | `GRASSAGENT_TOOL_EXECUTION` | `parallel` 或 `sequential` | `parallel` |
+| `GRASSAGENT_COMPACT_THRESHOLD` | 上下文压缩触发阈值（消息条数） | `50` |
+| `GRASSAGENT_COMPACT_KEEP_RECENT` | 压缩时保留最近多少条消息 | `20` |
 | `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 
@@ -139,7 +158,15 @@ echo "读一下 README.md" | npm start
 
 **abort 后的配对补全。** API 要求每个 `tool_call` 都有对应的 `tool_result`。被 Ctrl+C 打断时跳过的工具，会补上 `error:aborted`，否则下次启动恢复会话时直接 400。
 
-**上下文压缩。** 消息超过 50 条时，先让模型总结前 30 条，用摘要替换，保留最近 20 条。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**上下文压缩。** 消息超过阈值时，先让模型把旧消息总结成摘要，之后发给模型的内容变成「摘要 + 最近若干条」。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+
+压缩**只改发给模型的视图，不改历史**。`context.messages` 始终是完整的，摘要单独记在 `context.compaction` 里。这一点很关键，因为改历史会出两个问题：
+
+一是**切点可能劈开工具调用**。切点落在 `assistant(tool_use)` 和它的 `tool_result` 之间时，发出去的是一条没有来由的 `role:tool` 消息，OpenAI 侧直接 400。所以切点会往前挪，挪到不劈开为止。
+
+二是**新消息会存不进去**。会话存储按「新增条数」增量写，历史被砍之后切片就空了，后面说的话全部消失。
+
+阈值可以配：`GRASSAGENT_COMPACT_THRESHOLD`（默认 50）和 `GRASSAGENT_COMPACT_KEEP_RECENT`（默认 20）。
 
 **容错读取会话。** 消息在 SQLite 里按序列号存，读出来逐条校验结构，坏行跳过而不是丢弃整个会话。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏 tool_call / tool_result 的配对关系。
 
@@ -191,6 +218,8 @@ echo "读一下 README.md" | npm start
 
 WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——允许多实例同时跑。
 
+写入按「新增条数」增量进行。但历史有可能被整体换掉（`/clear` 清空、`/resume` 切换会话），这时存储层会对账——发现内容对不上就删掉旧内容重写，不然按条数切片会算错，新消息一条也写不进去。
+
 `node:sqlite` 目前是实验性 API，会打印 `ExperimentalWarning`。启动脚本已加 `--disable-warning=ExperimentalWarning` 精确静音这一类警告（其他警告不受影响），`src/sessionStore.ts` 里还有一层运行时兜底，直接跑 `node src/cli.ts` 也是干净的。
 
 > 早期版本用 JSONL 文件存会话。升级后旧文件不会自动导入，需要的话可以自己写脚本转换。
@@ -198,7 +227,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / nonInteractiveTerminal
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -213,7 +242,7 @@ npm run test:all     # 上面三样一起跑
 - Ctrl+C 打断后每个 `tool_call` 都有配对 `tool_result`
 - 消息超阈值后的上下文压缩
 
-另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留。
+另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型。
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 

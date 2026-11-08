@@ -77,6 +77,39 @@ test('布尔型环境变量接受多种写法', () => {
   assert.equal(config.MaxRetries, 0)
 })
 
+test('压缩阈值有默认值', () => {
+  const config = validateConfig({ ApiKey: 'k' })
+  assert.equal(config.CompactThreshold, 50)
+  assert.equal(config.CompactKeepRecent, 20)
+})
+
+test('压缩阈值可以配', () => {
+  const config = validateConfig({
+    ApiKey: 'k',
+    CompactThreshold: '30',
+    CompactKeepRecent: '10',
+  })
+  assert.equal(config.CompactThreshold, 30)
+  assert.equal(config.CompactKeepRecent, 10)
+})
+
+test('保留条数不小于阈值时报错', () => {
+  // 保留的条数比阈值还多,就永远没有可摘要的旧消息
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', CompactThreshold: '10', CompactKeepRecent: '20' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_COMPACT_KEEP_RECENT')))
+      return true
+    },
+  )
+})
+
+test('压缩阈值过小时被拒绝', () => {
+  assert.throws(() => validateConfig({ ApiKey: 'k', CompactThreshold: '1' }), ConfigError)
+  assert.throws(() => validateConfig({ ApiKey: 'k', CompactKeepRecent: '0' }), ConfigError)
+})
+
 test('系统环境变量优先于 .env 文件', () => {
   const fileValues = { GRASSAGENT_MODEL: 'from-file', GRASSAGENT_MAX_TOKENS: '100' }
   const environment = { GRASSAGENT_MODEL: 'from-env' }

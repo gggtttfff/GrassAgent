@@ -91,7 +91,23 @@ export const configSchema = z.object({
   ToolExecution: z.enum(['parallel', 'sequential'], {
     error: 'ToolExecution 只能是 parallel 或 sequential',
   }).default('parallel'),
-})
+
+  // 上下文压缩。未压缩的消息数超过 CompactThreshold 就把旧消息总结成摘要,
+  // 摘要 + 最近 CompactKeepRecent 条一起发给模型。
+  // 历史本身不会被删掉,只是发给模型的内容变短了。
+  CompactThreshold: numericOption({
+    minimum: 4, maximum: 10_000, defaultValue: 50, label: 'CompactThreshold',
+  }),
+  CompactKeepRecent: numericOption({
+    minimum: 1, maximum: 5_000, defaultValue: 20, label: 'CompactKeepRecent',
+  }),
+}).check(z.refine(
+  (config) => config.CompactKeepRecent < config.CompactThreshold,
+  {
+    path: ['CompactKeepRecent'],
+    message: 'CompactKeepRecent 必须小于 CompactThreshold,否则压缩后没有可摘要的旧消息',
+  },
+))
 
 export type AgentConfig = z.infer<typeof configSchema>
 
@@ -124,6 +140,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SessionId: `${ENV_PREFIX}SESSION_ID`,
   CommandTimeoutMs: `${ENV_PREFIX}COMMAND_TIMEOUT_MS`,
   ToolExecution: `${ENV_PREFIX}TOOL_EXECUTION`,
+  CompactThreshold: `${ENV_PREFIX}COMPACT_THRESHOLD`,
+  CompactKeepRecent: `${ENV_PREFIX}COMPACT_KEEP_RECENT`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

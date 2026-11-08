@@ -102,6 +102,14 @@ sessionStore.ts
 
 **25. 非 TTY 时不要发 ANSI 控制序列。** 输出重定向到文件时它们就是乱码。`src/nonInteractiveTerminal.ts` 的 `writeControl` 在 `!process.stdout.isTTY` 时跳过。
 
+**26. 上下文压缩只改「发给模型的视图」，不改历史。** `context.messages` 是完整历史（也是会话存储的内容），`context.compaction` 记录「前多少条已被摘要覆盖」。发给模型的是 `buildModelContext()` 拼出来的摘要 + 保留区。改历史会带来两个后果：切点可能劈开 tool_use/tool_result 导致 API 400；会话存储按条数切片，历史被砍之后新消息写不进去。
+
+**27. 压缩的切点不能劈开工具调用和结果。** `findSafeBoundary` 遇到「保留区里有落单的 tool_result」就把切点往前挪。判据直接看结果本身，不用猜配对关系。
+
+**28. 会话存储要能识别「历史被替换」。** `sync()` 按条数切片只写新增部分——但 `/clear` 和切换会话会换掉历史内容，这时切片就错了。`sessionStore.ts` 用 `persistedContents` 对账，发现历史被换过就删掉旧内容重写。
+
+**29. 斜杠命令在本地执行，不发给模型。** 命令名拼错也要拦下来——否则会被当成普通输入发给模型。命令实现注入进 `SlashCommandRegistry`，TUI 只管显示。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -109,12 +117,13 @@ sessionStore.ts
 - `run_bash` 用 shell 字符串拼接执行，有注入风险。工作目录已锁定在沙箱内，但命令内容不做参数化
 - `edit` 工具的 `old_string` 未做大小写与空白归一化
 - `edit` 工具一次只能改一处，要改多处用 `edit_batch`
-- 上下文压缩只保留最近 20 条，长对话的早期细节会丢失
+- 上下文压缩后长对话的早期细节会丢失（只剩摘要）——历史还在库里，但模型看不到
 - 工具参数用封闭对象（`additionalProperties: false`），模型多传字段会被拒绝
 - 并行执行时 abort 语义变了：所有工具同时启动，abort 后已经在跑的工具不会停下（`error:aborted` 只补给还没开始的）
 - 上下文压缩按消息条数判断，不是 token 数——消息长短差异大时压缩时机不准
 - TUI 用主屏渲染（`TuiMainScreen`），不是备用屏——主屏保留终端的滚动历史，代价是不能自己管理滚动条
 - markdown 排版在回合结束后才做，流式期间是纯文本
+- 压缩状态存在内存里，不进数据库——重启后第一次回合会重新压缩一次
 
 ## 测试
 
@@ -128,9 +137,19 @@ sessionStore.ts
 
 `sync(messages)` 传的是**完整会话列表**，不是增量——内部按 `persistedCount` 切片只写新增部分。传增量会写不进去（切片后为空）。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏配对关系。
 
+历史被替换时（`/clear` 清空、切换会话换内容），`sync` 会用 `persistedContents` 对账，发现对不上就删掉旧内容重写——不然按条数切片会算错，新消息一条也写不进去。
+
 多进程可以同时用同一个库文件（WAL 模式），各自的 `sessionId` 隔离。想接着上次的对话，把上次的 `sessionId` 传给 `GRASSAGENT_SESSION_ID`。
 
 跨进程测试时，spawn 出来的子进程 stdin 必须保持打开（`stdio: ['pipe', ...]`）：stdin EOF 会让 readline 关闭、TUI 退出、进程提前结束。
+
+## 斜杠命令
+
+`/clear`、`/new`、`/sessions`、`/resume` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+
+`/resume` 不带参数时弹会话选择器（`SelectList` + overlay），回车切换、Esc 取消。非交互模式没键盘，改成列出所有会话 ID 让人自己挑。
+
+命令实现在 `src/cli.ts` 里注册，`src/slashCommands.ts` 只管解析和分发。
 
 ## 提交规范
 
