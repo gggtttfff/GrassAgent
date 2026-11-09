@@ -315,3 +315,60 @@ test('第二次压缩会把上一次的摘要一起总结进去', async () => {
     await stopMockServer(mock.server)
   }
 })
+
+test('小模型用 JSON 表示要压缩时,只留下摘要正文', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('{"compact":true,"summary":"留下的决策"}'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'small', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = { messages: plainMessages(30) }
+
+    await compactContext(model, context, undefined, {}, compactionOptions)
+
+    assert.equal(context.compaction?.summary, '留下的决策')
+    assert.ok((context.compaction?.summarizedCount ?? 0) > 0)
+    const view = buildModelMessages(context, context.compaction)
+    assert.ok(String(view[0].content).includes('留下的决策'))
+    assert.equal(String(view[0].content).includes('compact'), false)
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('小模型判断先不压缩时不写空摘要,短时间内也不再问', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('{"compact":false,"summary":""}'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'small', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = {
+      messages: plainMessages(30),
+      compaction: { summarizedCount: 5, summary: '已有摘要' },
+    }
+
+    await compactContext(model, context, undefined, {}, compactionOptions)
+    await compactContext(model, context, undefined, {}, compactionOptions)
+
+    assert.equal(mock.receivedRequests.length, 1, '判断过先不压之后不该马上再问')
+    assert.equal(context.compaction?.summarizedCount, 5, '不压缩就不该推进切点')
+    assert.equal(context.compaction?.summary, '已有摘要', '不压缩不该清掉已有摘要')
+    assert.ok((context.compaction?.deferUntilLength ?? 0) > context.messages.length)
+    // 没有新摘要时视图仍用原来的摘要,而不是空的
+    const view = buildModelMessages(context, context.compaction)
+    assert.ok(String(view[0].content).includes('已有摘要'))
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('只有「先不压」记录时,发给模型的仍是完整历史', () => {
+  const messages = plainMessages(4)
+  const view = buildModelMessages(
+    { messages },
+    { summarizedCount: 0, summary: '', deferUntilLength: 20 },
+  )
+  assert.deepEqual(view, messages)
+})

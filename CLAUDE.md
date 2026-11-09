@@ -10,11 +10,11 @@
 
 ```
 cli.ts → agent.ts → llm.ts → protocol.ts
-   ↓        ↓                      ↑
-  tui.ts   tools.ts           providers/
-   ↓        ↓                (openai.ts)
+   ↓        ↓          ↑           ↑
+  tui.ts   tools.ts   completeText.ts   providers/
+   ↓        ↓         ↑                (openai.ts)
 config.ts  pathGuard.ts
-   ↓
+   ↓         modelRoster.ts / sessionTitle.ts / approval.ts
 logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
 ```
@@ -111,6 +111,8 @@ sessionStore.ts
 **29. 斜杠命令在本地执行，不发给模型。** 命令名拼错也要拦下来——否则会被当成普通输入发给模型。命令实现注入进 `SlashCommandRegistry`，TUI 只管显示。
 
 **30. `ask_user` 的回答是 tool_result，不能再开一轮用户消息。** 它必须 `sequential: true`，独占输入。非交互模式下，回合进行中到达的整行要先入队，而且要在处理当前行的第一个 `await` 之前就占住输入——晚了的话管道里已经缓冲的下一行会冲进编辑器，回车被丢掉。EOF 时正在等的提问必须立刻结束，否则回合不收尾，进程也不退。
+
+**31. 三类模型不要串岗。** 标题和「要不要压缩」走小模型，对话和工具循环走主力模型，写文件和命令的放行走审批模型。审批失败、抛错或结果无法解析时拒绝执行，不要默许。小模型说先不压时不能写入空摘要，也不能因此每一轮都再问一次。
 
 ## 已知取舍
 

@@ -112,6 +112,8 @@ function buildWriteFile(pathGuard: PathGuard): AgentTool {
     parameters: writeFileParameters,
     // 声明会修改 path 指向的文件:并发执行时同一文件的写操作会排队,不会互相覆盖
     mutatesFiles: ['path'],
+    // 覆盖写会丢掉原文件,先过审批模型
+    requiresApproval: true,
     execute: async (args) => {
       const { path: filePath, content } = args as { path: string; content: string }
       try {
@@ -134,6 +136,7 @@ function buildEdit(pathGuard: PathGuard): AgentTool {
     parameters: editParameters,
     // edit 是"读-改-写",并发执行同一文件会丢更新,必须排队
     mutatesFiles: ['path'],
+    requiresApproval: true,
     execute: async (args) => {
       const { path: filePath, old_string, new_string } = args as {
         path: string
@@ -214,6 +217,7 @@ function buildEditBatch(pathGuard: PathGuard): AgentTool {
     parameters: editBatchParameters,
     // 读-改-写,并发执行同一文件会丢更新,必须排队
     mutatesFiles: ['path'],
+    requiresApproval: true,
     execute: async (args) => {
       const { path: filePath, edits } = args as {
         path: string
@@ -241,6 +245,8 @@ function buildRunBash(pathGuard: PathGuard, timeoutMs: number): AgentTool {
     name: 'run_bash',
     description: '执行shell命令.参数:command(命令字符串).在工作目录内执行,返回stdout+stderr,截取最后200行',
     parameters: runBashParameters,
+    // 命令能改工作区里的任何文件,和写文件一样先审批
+    requiresApproval: true,
     execute: async (args, signal) => {
       const { command } = args as { command: string }
       try {

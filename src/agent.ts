@@ -21,6 +21,7 @@ import {
 } from './compaction.ts'
 import type { Transport } from './transport.ts'
 import type { Logger } from './logger.ts'
+import type { Message } from './messages.ts'
 
 // 工具定义:name + 描述 + JSON Schema 参数 + execute 函数
 export type AgentTool = {
@@ -40,13 +41,36 @@ export type AgentTool = {
    * 用于本身就不适合并发的工具。
    */
   sequential?: boolean
+  /**
+   * 执行前要经过审批模型。
+   * 写文件、改文件、跑命令会改工作区,不能由主力模型自己放行。
+   * 没注入审批器时不拦——测试和旧调用保持直接执行。
+   */
+  requiresApproval?: boolean
 }
+
+/** 交给审批模型的一次工具调用 */
+export interface ApprovalRequest {
+  toolName: string
+  args: unknown
+  /** 最近一条用户原话,用来对照这个动作是不是用户要的 */
+  userIntent: string
+}
+
+/** 审批结论。解析失败时调用方应当成拒绝 */
+export interface ApprovalDecision {
+  allowed: boolean
+  reason: string
+}
+
+export type Approver = (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
 
 // agent 对外的事件流,给 UI 消费
 export type AgentEvent =
   | { type: 'assistant_text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; result: string }
+  | { type: 'permission'; id: string; name: string; allowed: boolean; reason: string }
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
 
 // compaction 触发阈值:消息数超过这个值就压缩旧消息
@@ -71,6 +95,13 @@ export async function* runAgent(
     logger?: Logger
     toolExecution?: 'parallel' | 'sequential'
     compaction?: CompactionOptions
+    /**
+     * 压缩用的小模型。不传就用主力模型,避免旧调用突然多一条配置。
+     * 正式入口会传小模型,对话循环本身仍只用 model。
+     */
+    compactionModel?: Model
+    /** 有副作用的工具在执行前问它。不传则不审批 */
+    approve?: Approver
   } = {},
 ): AsyncGenerator<AgentEvent> {
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]))
@@ -86,8 +117,14 @@ export async function* runAgent(
   const compactionOptions = options.compaction ?? defaultCompactionOptions
 
   while (true) {
-    // 0. 消息过多时先压缩旧消息
-    await compactContext(model, context, signal, options, compactionOptions)
+    // 0. 消息过多时先让小模型判断要不要压缩。对话循环不拿主力模型做这件事。
+    await compactContext(
+      options.compactionModel ?? model,
+      context,
+      signal,
+      options,
+      compactionOptions,
+    )
 
     // 1. 流式调用 LLM,收集文本和 tool_calls
     let text = ''
@@ -164,10 +201,21 @@ export async function* runAgent(
     //    事件按原始顺序发,写进 context 的结果也按原始顺序:
     //    顺序错了下次恢复会话会 400,API 要求每个 tool_call 有配对的 tool_result
     const results: ToolResultEntry[] = []
-    for await (const event of executeToolCalls(prepared, signal, options.toolExecution)) {
-      if (event.type === 'tool_result') {
-        results.push({ tool_use_id: event.id, content: event.result })
+    for await (const event of executeToolCalls(
+      prepared,
+      signal,
+      options.toolExecution,
+      {
+        approve: options.approve,
+        logger: options.logger,
+        userIntent: latestUserIntent(context.messages),
+      },
+    )) {
+      if (event.type === 'permission') {
+        yield event
+        continue
       }
+      results.push({ tool_use_id: event.id, content: event.result })
       yield { type: 'tool_result', id: event.id, name: event.name, result: event.result }
     }
 
@@ -279,20 +327,65 @@ async function withMutationQueues(paths: string[], operation: () => Promise<stri
   return await run()
 }
 
-// 执行一个工具调用,返回结果文本
-async function runOneTool(prepared: PreparedToolCall, signal?: AbortSignal): Promise<string> {
-  if (prepared.error) return prepared.error
-  if (signal?.aborted) return 'error:aborted'
+// 最近一条用户原话。tool_result 也是 role:user,但它是数组,不能当成意图。
+function latestUserIntent(messages: Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message.role !== 'user' || typeof message.content !== 'string') continue
+    const text = message.content.trim()
+    if (text) return text
+  }
+  return ''
+}
+
+type ToolRunOutcome = {
+  result: string
+  permission?: { allowed: boolean; reason: string }
+}
+
+// 需要审批的工具先问审批模型,通过了才执行。
+// 审批在拿文件锁之前做:被拒绝的调用不该占着队列。
+async function runOneTool(
+  prepared: PreparedToolCall,
+  signal: AbortSignal | undefined,
+  gate: { approve?: Approver; logger?: Logger; userIntent: string },
+): Promise<ToolRunOutcome> {
+  if (prepared.error) return { result: prepared.error }
+  if (signal?.aborted) return { result: 'error:aborted' }
+
+  let permission: ToolRunOutcome['permission']
+  if (prepared.tool?.requiresApproval && gate.approve) {
+    let decision: ApprovalDecision
+    try {
+      decision = await gate.approve(
+        { toolName: prepared.name, args: prepared.args, userIntent: gate.userIntent },
+        signal,
+      )
+    } catch (error) {
+      // 审批器自己抛错也拒绝。放行会把故障变成一次没人看过的写操作。
+      gate.logger?.warn(
+        { toolName: prepared.name, errorMessage: (error as Error).message },
+        '审批器抛错,拒绝执行',
+      )
+      decision = { allowed: false, reason: '审批过程出错,已拒绝执行' }
+    }
+    if (signal?.aborted) return { result: 'error:aborted' }
+    permission = { allowed: decision.allowed, reason: decision.reason }
+    if (!decision.allowed) {
+      return { result: `error:permission denied: ${decision.reason}`, permission }
+    }
+  }
 
   const mutatedPaths = getMutatedFilePaths(prepared)
   if (mutatedPaths.length > 0) {
-    return await withMutationQueues(mutatedPaths, async () => {
+    const result = await withMutationQueues(mutatedPaths, async () => {
       // 排队期间可能已经被 abort 了,这时不必再执行
       if (signal?.aborted) return 'error:aborted'
       return await executeOneTool(prepared, signal)
     })
+    return { result, permission }
   }
-  return await executeOneTool(prepared, signal)
+  return { result: await executeOneTool(prepared, signal), permission }
 }
 
 // 把工具批次切成若干段:连续的普通工具合成一段并发跑,
@@ -320,38 +413,62 @@ function splitIntoSegments(prepared: PreparedToolCall[]): number[][] {
 // 两层保证:
 // 1. 修改同一文件的工具按文件路径串行化(mutatesFiles),不会互相覆盖
 // 2. 事件按原始顺序发,和模型发出的顺序一致,便于对照排查
+type ToolExecutionEvent =
+  | { type: 'tool_result'; id: string; name: string; result: string }
+  | { type: 'permission'; id: string; name: string; allowed: boolean; reason: string }
+
+function yieldToolOutcome(
+  prepared: PreparedToolCall,
+  outcome: ToolRunOutcome,
+): ToolExecutionEvent[] {
+  const events: ToolExecutionEvent[] = []
+  if (outcome.permission) {
+    events.push({
+      type: 'permission',
+      id: prepared.id,
+      name: prepared.name,
+      allowed: outcome.permission.allowed,
+      reason: outcome.permission.reason,
+    })
+  }
+  events.push({
+    type: 'tool_result',
+    id: prepared.id,
+    name: prepared.name,
+    result: outcome.result,
+  })
+  return events
+}
+
+// 执行工具,按原始顺序发出 tool_result 事件。
+//
+// 两层保证:
+// 1. 修改同一文件的工具按文件路径串行化(mutatesFiles),不会互相覆盖
+// 2. 事件按原始顺序发,和模型发出的顺序一致,便于对照排查
 async function* executeToolCalls(
   prepared: PreparedToolCall[],
   signal?: AbortSignal,
   mode: 'parallel' | 'sequential' = 'parallel',
-): AsyncGenerator<{ type: 'tool_result'; id: string; name: string; result: string }> {
-  const results: string[] = new Array(prepared.length)
+  gate: { approve?: Approver; logger?: Logger; userIntent: string } = { userIntent: '' },
+): AsyncGenerator<ToolExecutionEvent> {
+  const outcomes: ToolRunOutcome[] = new Array(prepared.length)
 
   if (mode === 'sequential') {
     for (let index = 0; index < prepared.length; index++) {
-      results[index] = await runOneTool(prepared[index], signal)
-      yield {
-        type: 'tool_result',
-        id: prepared[index].id,
-        name: prepared[index].name,
-        result: results[index],
-      }
+      outcomes[index] = await runOneTool(prepared[index], signal, gate)
+      yield* yieldToolOutcome(prepared[index], outcomes[index])
     }
     return
   }
 
-  // 并行:段内并发,段与段之间等前一段跑完
+  // 并行:段内并发,段与段之间等前一段跑完。
+  // 审批可以同时问,但事件仍按模型发出的顺序吐出。
   for (const segment of splitIntoSegments(prepared)) {
     await Promise.all(segment.map(async (index) => {
-      results[index] = await runOneTool(prepared[index], signal)
+      outcomes[index] = await runOneTool(prepared[index], signal, gate)
     }))
     for (const index of segment) {
-      yield {
-        type: 'tool_result',
-        id: prepared[index].id,
-        name: prepared[index].name,
-        result: results[index],
-      }
+      yield* yieldToolOutcome(prepared[index], outcomes[index])
     }
   }
 }

@@ -7,8 +7,8 @@ import type { SessionDetail } from '../src/sessionStore.ts'
 // 选的是「显示成什么样」,不涉及交互——交互由 pi-tui 的 SelectList 管。
 
 // 造一个会话概要
-function session(id: string, updatedAt: number, messageCount = 1): SessionDetail {
-  return { id, updatedAt, messageCount }
+function session(id: string, updatedAt: number, messageCount = 1, title: string | null = null): SessionDetail {
+  return { id, updatedAt, messageCount, title }
 }
 
 // 拿到选择器的弹窗内容组件,能渲染也能发按键。
@@ -108,6 +108,15 @@ test('buildSessionChoices 标记当前会话', () => {
   const other = choices.find((choice) => choice.id === 'a')
   assert.equal(current?.isCurrent, true)
   assert.equal(other?.isCurrent, false)
+})
+
+test('buildSessionChoices 有标题时用标题当主文案', () => {
+  const now = 1_700_000_000_000
+  const choices = buildSessionChoices([session('s1', now, 3, '修登录 bug')], 'other', now)
+
+  assert.ok(choices[0].label.includes('修登录 bug'))
+  assert.equal(choices[0].label.includes('s1'), false)
+  assert.ok(choices[0].description.includes('s1'))
 })
 
 test('buildSessionChoices 会话列表为空时返回空数组', () => {

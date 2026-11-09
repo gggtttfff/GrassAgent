@@ -25,6 +25,10 @@
 ```
 src/
   llm.ts         LLM 门面：按模型选 provider，转发调用
+  modelRoster.ts 三个模型角色：小模型 / 主力模型 / 审批模型
+  completeText.ts 不带工具的一次性文本补全
+  sessionTitle.ts 小模型生成会话标题
+  approval.ts    审批模型判断写文件和命令能不能执行
   protocol.ts    Provider 协议 + 注册表
   messages.ts    内部消息模型（provider 无关）
   providers/     按厂商分文件：openai.ts 等
@@ -110,8 +114,16 @@ echo "读一下 README.md" | npm start
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
 | `GRASSAGENT_API_KEY` | API 密钥（必填） | 无 |
-| `GRASSAGENT_MODEL` | 模型名称 | `gpt-4o-mini` |
-| `GRASSAGENT_BASE_URL` | API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_MODEL` | 主力模型，负责对话和解决问题 | `gpt-4o-mini` |
+| `GRASSAGENT_BASE_URL` | 主力模型 API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_SMALL_MODEL` | 小模型，负责标题和压缩判断。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_SMALL_BASE_URL` | 小模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_SMALL_API_KEY` | 小模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_SMALL_MAX_TOKENS` | 小模型单次生成上限。留空则用 `GRASSAGENT_MAX_TOKENS` | 主力上限 |
+| `GRASSAGENT_APPROVAL_MODEL` | 审批模型，决定写文件和命令能不能执行。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_APPROVAL_BASE_URL` | 审批模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_APPROVAL_API_KEY` | 审批模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_APPROVAL_MAX_TOKENS` | 审批模型单次生成上限 | `512` |
 | `GRASSAGENT_WORKSPACE` | 工作区沙箱根目录 | 进程启动目录 |
 | `GRASSAGENT_COMMAND_TIMEOUT_MS` | `run_bash` 超时（毫秒） | `3000` |
 | `GRASSAGENT_MAX_TOKENS` | 单次生成上限 | `4096` |
@@ -165,7 +177,9 @@ echo "读一下 README.md" | npm start
 
 管道输入时，回合进行中到达的下一行先排队。提问就用这一行当回答；没人问的话，本轮结束再按顺序开下一轮。输入已经结束（EOF）还在等回答时，工具返回「没有用户可以回答」，模型按现有信息继续，进程不会挂住。
 
-**上下文压缩。** 消息超过阈值时，先让模型把旧消息总结成摘要，之后发给模型的内容变成「摘要 + 最近若干条」。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**模型分工。** 三个角色不串岗。主力模型只负责对话和调用工具把问题解决掉。小模型负责给会话起标题，以及判断旧消息要不要压成摘要。审批模型只在写文件、改文件、执行命令之前决定放不放行；读文件仍只过路径沙箱。没单独配置的角色会继承主力模型，旧的单模型配置不用改也能跑。审批请求失败，或者结论解析不了，一律拒绝执行。
+
+**上下文压缩。** 消息超过阈值时，由小模型判断这段值不值得压。值得就总结成摘要，之后发给主力模型的内容变成「摘要 + 最近若干条」。判断先不压时不会写入空摘要，也不会每一轮都再问一次。压缩失败则保留原样。
 
 压缩**只改发给模型的视图，不改历史**。`context.messages` 始终是完整的，摘要单独记在 `context.compaction` 里。这一点很关键，因为改历史会出两个问题：
 

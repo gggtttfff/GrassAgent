@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
+import { mkdirSync } from 'node:fs'
 import { SessionStore, generateSessionId } from '../src/sessionStore.ts'
 import type { Message } from '../src/messages.ts'
 
@@ -342,6 +344,39 @@ test('工具调用消息能完整存储', () => {
     assert.equal(blocks[1].type, 'tool_use')
     const resultBlocks = loaded[1].content as Array<{ type: string }>
     assert.equal(resultBlocks[0].type, 'tool_result')
+  } finally {
+    store.close()
+  }
+})
+
+test('标题能写进当前会话,列表里也能看到', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    assert.equal(store.getTitle(), null)
+    store.setTitle('  修登录  ')
+    assert.equal(store.getTitle(), '修登录')
+    assert.equal(store.listSessionDetails()[0].title, '修登录')
+    store.setTitle('   ')
+    assert.equal(store.getTitle(), '修登录', '空标题不该把已有标题擦掉')
+  } finally {
+    store.close()
+  }
+})
+
+test('没有 title 列的旧库打开后能补上', () => {
+  const databasePath = createDatabasePath()
+  mkdirSync(path.dirname(databasePath), { recursive: true })
+  const legacy = new DatabaseSync(databasePath)
+  legacy.exec(
+    'CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)',
+  )
+  legacy.prepare('INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)').run('old', 1, 1)
+  legacy.close()
+
+  const store = new SessionStore({ databasePath, sessionId: 'old' })
+  try {
+    store.setTitle('旧库标题')
+    assert.equal(store.getTitle(), '旧库标题')
   } finally {
     store.close()
   }

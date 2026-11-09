@@ -32,6 +32,33 @@ const numericOption = (options: {
       .default(options.defaultValue),
   )
 
+// 可选文本:不填或空字符串表示「继承主力模型」,不是空模型名。
+const optionalText = (emptyMessage: string) =>
+  z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: emptyMessage }).optional(),
+  )
+
+const optionalUrl = (invalidMessage: string) =>
+  z.preprocess(
+    emptyToUndefined,
+    z.url({ error: invalidMessage }).optional(),
+  )
+
+// 可选整数。未设置时留空,由模型分工决定继承谁的上限。
+const optionalNumericOption = (options: { minimum: number; maximum: number; label: string }) =>
+  z.preprocess(
+    emptyToUndefined,
+    z.union([
+      z.undefined(),
+      z.coerce
+        .number({ error: `${options.label} 必须是数字` })
+        .int({ error: `${options.label} 必须是整数` })
+        .min(options.minimum, { error: `${options.label} 不能小于 ${options.minimum}` })
+        .max(options.maximum, { error: `${options.label} 不能大于 ${options.maximum}` }),
+    ]),
+  )
+
 // 布尔型环境变量:接受 1/0、true/false、yes/no
 const booleanOption = (defaultValue: boolean, label: string) =>
   z.preprocess(
@@ -49,9 +76,26 @@ const booleanOption = (defaultValue: boolean, label: string) =>
 // 配置 schema。字段名用大驼峰,映射到 GRASSAGENT_ 前缀的小写下划线环境变量。
 export const configSchema = z.object({
   ApiKey: z.string().min(1, { error: 'API Key 不能为空' }),
+  // 主力模型:对话和解决问题。下面的小模型、审批模型不填就继承这一组。
   Model: z.string().min(1, { error: '模型名不能为空' }).default('gpt-4o-mini'),
   BaseUrl: z.url({ error: 'API 地址必须是合法 URL' }).default('https://api.openai.com/v1'),
   MaxTokens: numericOption({ minimum: 1, maximum: 1_000_000, defaultValue: 4096, label: 'MaxTokens' }),
+
+  // 小模型:会话标题,以及判断要不要压缩上下文。
+  SmallModel: optionalText('小模型名不能为空'),
+  SmallBaseUrl: optionalUrl('小模型 API 地址必须是合法 URL'),
+  SmallApiKey: optionalText('小模型 API Key 不能为空'),
+  SmallMaxTokens: optionalNumericOption({
+    minimum: 1, maximum: 1_000_000, label: 'SmallMaxTokens',
+  }),
+
+  // 审批模型:写文件、改文件、执行命令之前判断放不放行。
+  ApprovalModel: optionalText('审批模型名不能为空'),
+  ApprovalBaseUrl: optionalUrl('审批模型 API 地址必须是合法 URL'),
+  ApprovalApiKey: optionalText('审批模型 API Key 不能为空'),
+  ApprovalMaxTokens: optionalNumericOption({
+    minimum: 1, maximum: 1_000_000, label: 'ApprovalMaxTokens',
+  }),
 
   // 工作目录沙箱:所有文件读写和命令执行都限制在这个目录内
   Workspace: z.string().min(1, { error: 'Workspace 不能为空' }).default(() => process.cwd()),
@@ -128,6 +172,14 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   Model: `${ENV_PREFIX}MODEL`,
   BaseUrl: `${ENV_PREFIX}BASE_URL`,
   MaxTokens: `${ENV_PREFIX}MAX_TOKENS`,
+  SmallModel: `${ENV_PREFIX}SMALL_MODEL`,
+  SmallBaseUrl: `${ENV_PREFIX}SMALL_BASE_URL`,
+  SmallApiKey: `${ENV_PREFIX}SMALL_API_KEY`,
+  SmallMaxTokens: `${ENV_PREFIX}SMALL_MAX_TOKENS`,
+  ApprovalModel: `${ENV_PREFIX}APPROVAL_MODEL`,
+  ApprovalBaseUrl: `${ENV_PREFIX}APPROVAL_BASE_URL`,
+  ApprovalApiKey: `${ENV_PREFIX}APPROVAL_API_KEY`,
+  ApprovalMaxTokens: `${ENV_PREFIX}APPROVAL_MAX_TOKENS`,
   Workspace: `${ENV_PREFIX}WORKSPACE`,
   MaxRetries: `${ENV_PREFIX}MAX_RETRIES`,
   RetryBaseDelayMs: `${ENV_PREFIX}RETRY_BASE_DELAY_MS`,

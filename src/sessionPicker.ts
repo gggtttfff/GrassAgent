@@ -75,10 +75,13 @@ export function buildSessionChoices(
     const marker = isCurrent ? currentSessionMarker('●') : ' '
     const relativeTime = formatRelativeTime(session.updatedAt, now)
     const messageText = session.messageCount === 1 ? '1 条消息' : `${session.messageCount} 条消息`
+    const title = session.title?.trim()
     return {
       id: session.id,
-      label: `${marker} ${session.id}`,
-      description: `${messageText} · ${relativeTime}`,
+      label: `${marker} ${title || session.id}`,
+      description: title
+        ? `${session.id} · ${messageText} · ${relativeTime}`
+        : `${messageText} · ${relativeTime}`,
       isCurrent,
     }
   })
