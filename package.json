@@ -20,7 +20,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning e2e-smoke.ts",
     "test:unit": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec \"test/**/*.test.ts\"",
-    "test:all": "npm run typecheck && npm run test:unit && npm test"
+    "test:all": "npm run typecheck && npm run test:unit && npm test",
+    "sandbox:control": "node --disable-warning=ExperimentalWarning src/sandbox/controlServer.ts"
   },
   "engines": {
     "node": ">=24.0.0"
