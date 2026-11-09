@@ -17,6 +17,7 @@ import { withFileMutationQueue } from './mutationQueue.ts'
 import {
   buildModelContext,
   compactContext,
+  compactionPending,
   DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
   DEFAULT_COMPACT_RESERVE_TOKENS,
   DEFAULT_CONTEXT_WINDOW,
@@ -24,6 +25,11 @@ import {
 } from './compaction.ts'
 import type { Transport } from './transport.ts'
 import type { Logger } from './logger.ts'
+import {
+  appendHookContext,
+  type HookEffect,
+  type HookRunner,
+} from './hooks.ts'
 
 // 工具定义:name + 描述 + JSON Schema 参数 + execute 函数
 export type AgentTool = {
@@ -50,7 +56,11 @@ export type AgentEvent =
   | { type: 'assistant_text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; result: string }
+  | { type: 'hook_notice'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
+
+// Stop 钩子可以要求模型继续。没有上限的话,一个总是拒绝的脚本会把回合卡死。
+const DEFAULT_MAX_STOP_CONTINUATIONS = 5
 
 // 压缩的默认配置。runAgent 的参数可以覆盖。
 // 数字和配置层的默认值是同一组,定义在 compaction.ts。
@@ -71,6 +81,9 @@ export async function* runAgent(
     logger?: Logger
     toolExecution?: 'parallel' | 'sequential'
     compaction?: CompactionOptions
+    hooks?: HookRunner
+    /** Stop 钩子最多把回合拉回来几次。测试可以把它调小。 */
+    maxStopContinuations?: number
   } = {},
 ): AsyncGenerator<AgentEvent> {
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]))
@@ -84,10 +97,37 @@ export async function* runAgent(
   // 它只影响发给模型的视图,context.messages 始终保持完整——
   // 会话存储和 /resume 恢复出来的都是完整历史。
   const compactionOptions = options.compaction ?? defaultCompactionOptions
+  const hooks = options.hooks
+  let stopContinuations = 0
+  const maxStopContinuations = options.maxStopContinuations ?? DEFAULT_MAX_STOP_CONTINUATIONS
 
   while (true) {
-    // 0. 消息过多时先压缩旧消息
-    await compactContext(model, context, signal, options, compactionOptions)
+    // 0. 消息过多时先压缩旧消息。钩子可以否决这一次压缩,历史保持原样。
+    if (hooks && signal?.aborted) {
+      yield { type: 'turn_end', stopReason: 'aborted' }
+      return
+    }
+    if (hooks && compactionPending(context, compactionOptions)) {
+      const preCompact = await hooks.run({
+        event: 'PreCompact',
+        messageCount: context.messages.length,
+      }, signal)
+      for (const notice of noticesFrom(preCompact)) yield notice
+      if (preCompact.aborted) {
+        yield { type: 'turn_end', stopReason: 'aborted' }
+        return
+      }
+      if (preCompact.blocked || preCompact.preventContinuation) {
+        options.logger?.info(
+          { reason: preCompact.reason, messageCount: context.messages.length },
+          '钩子跳过了上下文压缩',
+        )
+      } else {
+        await compactContext(model, context, signal, options, compactionOptions)
+      }
+    } else {
+      await compactContext(model, context, signal, options, compactionOptions)
+    }
 
     // 1. 流式调用 LLM,收集文本和 tool_calls
     let text = ''
@@ -152,6 +192,19 @@ export async function* runAgent(
     // API 可能返回 tool_use 但没有 tool_call delta,这种也算正常结束
     const reason = stopReason === 'tool_use' ? 'end_turn' : stopReason
     if (toolCalls.length === 0) {
+      const continued = yield* applyStopHook(context, text, hooks, signal, {
+        stopContinuations,
+        maxStopContinuations,
+        logger: options.logger,
+      })
+      if (continued === 'aborted') {
+        yield { type: 'turn_end', stopReason: 'aborted' }
+        return
+      }
+      if (continued === 'continue') {
+        stopContinuations += 1
+        continue
+      }
       yield { type: 'turn_end', stopReason: reason }
       return
     }
@@ -159,16 +212,49 @@ export async function* runAgent(
     // 5. 执行 tool_calls
     //    预检(参数校验)在执行前做:不合法的不执行,把错误留给模型纠正
     //    argsInvalid 同理——空对象会让工具拿到 undefined 参数乱写
+    //    钩子在校验之后、执行之前跑。它能拒绝,或给出一份新参数——新参数还要再校验一遍。
     const prepared = prepareToolCalls(toolCalls, toolMap)
+    const pre = await applyPreToolHooks(prepared, hooks, signal, options.logger)
+    for (const notice of pre.notices) yield notice
+    if (pre.aborted) {
+      // 钩子还没跑完就被打断。工具一个都没执行,但每个 tool_call 仍要有 tool_result。
+      const abortedResults = toolCalls.map((toolCall) => ({
+        tool_use_id: toolCall.id,
+        content: 'error:aborted',
+      }))
+      context.messages.push(buildToolResultMessage(abortedResults))
+      for (const toolCall of toolCalls) {
+        yield { type: 'tool_result', id: toolCall.id, name: toolCall.name, result: 'error:aborted' }
+      }
+      yield { type: 'turn_end', stopReason: 'aborted' }
+      return
+    }
+
+    // 钩子改写并实际执行的参数,写进历史的也得是这份。
+    // 否则下一轮模型看到的是自己原来的参数,结果却是改写后的。
+    const lastAssistant = context.messages[context.messages.length - 1]
+    if (lastAssistant) {
+      context.messages[context.messages.length - 1] = buildAssistantMessage(
+        text,
+        toolCalls.map((toolCall, index) => {
+          const item = prepared[index]
+          if (item?.inputReplaced && !item.error) {
+            return { id: toolCall.id, name: toolCall.name, args: item.args }
+          }
+          return { id: toolCall.id, name: toolCall.name, args: toolCall.args }
+        }),
+      )
+    }
 
     //    事件按原始顺序发,写进 context 的结果也按原始顺序:
     //    顺序错了下次恢复会话会 400,API 要求每个 tool_call 有配对的 tool_result
     const results: ToolResultEntry[] = []
-    for await (const event of executeToolCalls(prepared, signal, options.toolExecution)) {
+    const hookControl = { preventContinuation: pre.preventContinuation }
+    for await (const event of executeToolCalls(prepared, signal, options.toolExecution, hooks, hookControl)) {
       if (event.type === 'tool_result') {
         results.push({ tool_use_id: event.id, content: event.result })
       }
-      yield { type: 'tool_result', id: event.id, name: event.name, result: event.result }
+      yield event
     }
 
     // 6. 把 tool_result 放回 context
@@ -181,6 +267,11 @@ export async function* runAgent(
       yield { type: 'turn_end', stopReason: 'aborted' }
       return
     }
+    // 钩子说「做到这里就停」。结果已经配对写回,不再问模型。
+    if (hookControl.preventContinuation) {
+      yield { type: 'turn_end', stopReason: 'end_turn' }
+      return
+    }
   }
 }
 
@@ -190,10 +281,20 @@ type PreparedToolCall = {
   name: string
   // 校验后的参数,执行时用它而不是原始参数
   args: unknown
+  // 模型原始参数。校验失败时 args 会被换成空对象,钩子仍要看到模型到底传了什么。
+  modelArgs: unknown
+  // 参数 JSON 没解析出来。这种调用不交给钩子改写。
+  argsInvalid: boolean
   // 预检失败时没有对应的工具,也不执行
   tool?: AgentTool
   // 预检失败时的错误文本,非空则不执行
   error?: string
+  // 钩子给出的参数通过了校验,历史里要记这份
+  inputReplaced?: boolean
+  // 预检阶段被钩子拒绝。工具没跑,不再发 PostToolUseFailure。
+  blockedByHook?: boolean
+  // PreToolUse 附带的上下文,执行完后接到结果上
+  hookContext?: string
 }
 
 // tool_result 的内容
@@ -213,6 +314,8 @@ function prepareToolCalls(
         id: toolCall.id,
         name: toolCall.name,
         args: {},
+        modelArgs: toolCall.args,
+        argsInvalid: true,
         error: `error:tool"${toolCall.name}" arguments are not valid JSON,please resend complete arguments.`,
       })
       continue
@@ -222,6 +325,8 @@ function prepareToolCalls(
         id: toolCall.id,
         name: toolCall.name,
         args: {},
+        modelArgs: toolCall.args,
+        argsInvalid: false,
         error: `error:tool "${toolCall.name} not found`,
       })
       continue
@@ -229,10 +334,25 @@ function prepareToolCalls(
     // 校验并顺带做类型转换:模型传 "42" 当数字用会转成 42,转不了才算失败
     const validation = validateToolArguments(tool.parameters, toolCall.args, toolCall.name)
     if (!validation.ok) {
-      prepared.push({ id: toolCall.id, name: toolCall.name, args: {}, tool, error: validation.error })
+      prepared.push({
+        id: toolCall.id,
+        name: toolCall.name,
+        args: {},
+        modelArgs: toolCall.args,
+        argsInvalid: false,
+        tool,
+        error: validation.error,
+      })
       continue
     }
-    prepared.push({ id: toolCall.id, name: toolCall.name, args: validation.value, tool })
+    prepared.push({
+      id: toolCall.id,
+      name: toolCall.name,
+      args: validation.value,
+      modelArgs: toolCall.args,
+      argsInvalid: false,
+      tool,
+    })
   }
   return prepared
 }
@@ -324,34 +444,176 @@ async function* executeToolCalls(
   prepared: PreparedToolCall[],
   signal?: AbortSignal,
   mode: 'parallel' | 'sequential' = 'parallel',
-): AsyncGenerator<{ type: 'tool_result'; id: string; name: string; result: string }> {
+  hooks?: HookRunner,
+  hookControl: { preventContinuation: boolean } = { preventContinuation: false },
+): AsyncGenerator<AgentEvent> {
   const results: string[] = new Array(prepared.length)
+
+  const emitResult = async function* (index: number): AsyncGenerator<AgentEvent> {
+    const finalized = await applyPostToolHook(prepared[index], results[index], hooks, signal)
+    if (finalized.preventContinuation) hookControl.preventContinuation = true
+    for (const notice of finalized.notices) yield notice
+    yield {
+      type: 'tool_result',
+      id: prepared[index].id,
+      name: prepared[index].name,
+      result: finalized.result,
+    }
+  }
 
   if (mode === 'sequential') {
     for (let index = 0; index < prepared.length; index++) {
       results[index] = await runOneTool(prepared[index], signal)
-      yield {
-        type: 'tool_result',
-        id: prepared[index].id,
-        name: prepared[index].name,
-        result: results[index],
-      }
+      yield* emitResult(index)
     }
     return
   }
 
-  // 并行:段内并发,段与段之间等前一段跑完
+  // 并行:段内并发,段与段之间等前一段跑完。
+  // 钩子在段跑完之后按原顺序串行跑,避免改写结果时互相踩。
   for (const segment of splitIntoSegments(prepared)) {
     await Promise.all(segment.map(async (index) => {
       results[index] = await runOneTool(prepared[index], signal)
     }))
     for (const index of segment) {
+      yield* emitResult(index)
+    }
+  }
+}
+
+function noticesFrom(effect: HookEffect): AgentEvent[] {
+  const notices: AgentEvent[] = []
+  for (const message of effect.systemMessages) {
+    notices.push({ type: 'hook_notice', level: 'info', message })
+  }
+  for (const error of effect.errors) {
+    notices.push({ type: 'hook_notice', level: 'error', message: error })
+  }
+  return notices
+}
+
+// Stop 钩子拒绝时,把理由塞回上下文再问一次模型。
+// 返回 continue 表示调用方要再跑一轮;stop 表示可以结束;aborted 表示被打断。
+async function* applyStopHook(
+  context: Context,
+  assistantText: string,
+  hooks: HookRunner | undefined,
+  signal: AbortSignal | undefined,
+  options: { stopContinuations: number; maxStopContinuations: number; logger?: Logger },
+): AsyncGenerator<AgentEvent, 'continue' | 'stop' | 'aborted'> {
+  if (!hooks || signal?.aborted) return 'stop'
+  if (options.stopContinuations >= options.maxStopContinuations) {
+    // 只有前面真的被拉回来过才提示。上限配成 0 时直接结束,不当成钩子失败。
+    if (options.stopContinuations > 0) {
+      options.logger?.warn(
+        { maxStopContinuations: options.maxStopContinuations },
+        'Stop 钩子要求继续的次数已达上限,本回合结束',
+      )
       yield {
-        type: 'tool_result',
-        id: prepared[index].id,
-        name: prepared[index].name,
-        result: results[index],
+        type: 'hook_notice',
+        level: 'warn',
+        message: 'Stop 钩子要求继续的次数已达上限,本回合结束',
       }
     }
+    return 'stop'
+  }
+
+  const effect = await hooks.run({ event: 'Stop', prompt: assistantText }, signal)
+  for (const notice of noticesFrom(effect)) yield notice
+  if (effect.aborted) return 'aborted'
+  if (!effect.blocked) return 'stop'
+
+  const reason = effect.reason ?? 'Stop 钩子要求继续'
+  yield { type: 'hook_notice', level: 'warn', message: reason }
+  context.messages.push({
+    role: 'user',
+    content: appendHookContext(`Stop 钩子要求继续。\n${reason}`, effect.additionalContext),
+  })
+  return 'continue'
+}
+
+async function applyPreToolHooks(
+  prepared: PreparedToolCall[],
+  hooks: HookRunner | undefined,
+  signal: AbortSignal | undefined,
+  logger: Logger | undefined,
+): Promise<{ aborted: boolean; preventContinuation: boolean; notices: AgentEvent[] }> {
+  const notices: AgentEvent[] = []
+  if (!hooks) return { aborted: false, preventContinuation: false, notices }
+
+  let preventContinuation = false
+  for (const item of prepared) {
+    if (signal?.aborted) return { aborted: true, preventContinuation, notices }
+    // 没有工具,或参数 JSON 是坏的:钩子改写不了,沿用原来的错误。
+    if (!item.tool || item.argsInvalid) continue
+
+    const effect = await hooks.run({
+      event: 'PreToolUse',
+      toolName: item.name,
+      toolInput: item.error ? item.modelArgs : item.args,
+      toolUseId: item.id,
+    }, signal)
+    notices.push(...noticesFrom(effect))
+    if (effect.aborted) return { aborted: true, preventContinuation, notices }
+    if (effect.preventContinuation) preventContinuation = true
+    if (effect.additionalContext) item.hookContext = effect.additionalContext
+
+    if (effect.blocked) {
+      item.error = `error: blocked by hook: ${effect.reason ?? 'Blocked by hook'}`
+      item.blockedByHook = true
+      continue
+    }
+    if (!effect.updatedInput) continue
+
+    const validation = validateToolArguments(item.tool.parameters, effect.updatedInput, item.name)
+    if (!validation.ok) {
+      item.args = effect.updatedInput
+      item.error = validation.error
+      item.inputReplaced = false
+      logger?.warn({ tool: item.name, toolUseId: item.id }, '钩子改写的参数未通过校验,工具不执行')
+      continue
+    }
+    item.args = validation.value
+    item.error = undefined
+    item.inputReplaced = true
+  }
+
+  return { aborted: false, preventContinuation, notices }
+}
+
+async function applyPostToolHook(
+  item: PreparedToolCall,
+  result: string,
+  hooks: HookRunner | undefined,
+  signal: AbortSignal | undefined,
+): Promise<{ result: string; notices: AgentEvent[]; preventContinuation: boolean }> {
+  const withPreContext = appendHookContext(result, item.hookContext)
+  if (!hooks || signal?.aborted || item.blockedByHook || result === 'error:aborted') {
+    return { result: withPreContext, notices: [], preventContinuation: false }
+  }
+
+  const failed = Boolean(item.error) || result.startsWith('error:')
+  const effect = await hooks.run({
+    event: failed ? 'PostToolUseFailure' : 'PostToolUse',
+    toolName: item.name,
+    toolInput: item.error && !item.inputReplaced ? item.modelArgs : item.args,
+    toolOutput: result,
+    toolUseId: item.id,
+    error: failed ? (item.error ?? result) : undefined,
+  }, signal)
+  if (effect.aborted) {
+    return { result: withPreContext, notices: noticesFrom(effect), preventContinuation: false }
+  }
+
+  let output = effect.updatedOutput !== undefined ? effect.updatedOutput : result
+  if (effect.blocked && effect.reason) {
+    output = appendHookContext(output, effect.reason)
+  }
+  output = appendHookContext(output, item.hookContext)
+  output = appendHookContext(output, effect.additionalContext)
+  return {
+    result: output,
+    notices: noticesFrom(effect),
+    preventContinuation: effect.preventContinuation,
   }
 }

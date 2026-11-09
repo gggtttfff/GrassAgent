@@ -18,6 +18,7 @@
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
 - **路径沙箱** —— 文件读写和命令执行都限制在工作区内
+- **生命周期钩子** —— 会话、提示词、工具和压缩前后可以观察、拒绝或改写
 - **结构化日志** —— JSON 输出，密钥自动脱敏
 
 ## 目录结构
@@ -37,6 +38,8 @@ src/
   theme.ts       配色:markdown / 编辑器 / 列表的主题定义
   slashCommands.ts 斜杠命令：解析 + 分发
   sessionPicker.ts  会话选择器：列表 + 弹窗
+  hooks.ts       钩子运行时：命令 / 函数、拒绝、改写、超时
+  hookConfig.ts  钩子配置：读取并校验 hooks.json
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
   logger.ts      日志层：结构化 JSON 输出
@@ -91,6 +94,77 @@ npm start
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
 
+### 钩子
+
+钩子是回合上的扩展点。它不改 agent 循环本身，只在固定时刻看一眼即将发生的动作，然后允许、拒绝，或改写参数和结果。
+
+配置放在工作区的 `.grass/hooks.json`。文件不存在就等于没配。也可以用 `GRASSAGENT_HOOKS_PATH` 指到别的文件——指了但找不到，启动会失败。
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "^run_bash$",
+      "hooks": [
+        { "type": "command", "command": "node .grass/guard.mjs", "timeoutMs": 5000 }
+      ]
+    }
+  ]
+}
+```
+
+`matcher` 是正则，匹配这一次事件的文本：工具事件匹配工具名，`UserPromptSubmit` 和 `Stop` 匹配提示词或模型刚说的话。不写就每次都跑。想精确匹配工具名要自己加锚点，`edit` 会命中 `edit_batch`。
+
+命令从 **stdin** 读到一行 JSON（`hook_event_name`、`session_id`、`cwd`，工具事件还有 `tool_name` / `tool_input` / `tool_use_id`）。结果看退出码和 stdout：
+
+| 结果 | 含义 |
+| --- | --- |
+| 退出码 0，stdout 为空 | 允许 |
+| 退出码 0，stdout 不是 JSON | 整段文字当作额外上下文，塞给模型 |
+| 退出码 0，stdout 是 JSON | 按下面的字段决定 |
+| 退出码 2 | 拒绝。理由用 stderr，没有就用 stdout |
+| 其他退出码 | 钩子失败，**放行**，错误打到日志和界面 |
+
+JSON 里常用的字段：
+
+```json
+{
+  "continue": true,
+  "decision": "block",
+  "reason": "不许删仓库",
+  "systemMessage": "给用户看的一行字",
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "不许删仓库",
+    "updatedInput": { "command": "ls" },
+    "additionalContext": "这段会进模型上下文",
+    "updatedOutput": "只在 PostToolUse 里替换工具结果"
+  }
+}
+```
+
+`decision: "block"` 和 `permissionDecision: "deny"` 都是拒绝。拒绝是粘性的：同一个事件上，后面的钩子不能把前面的拒绝翻回来。`continue: false` 表示这步做完就结束回合，不要再问模型。
+
+现在会触发的事件：
+
+| 事件 | 时机 | 钩子能做什么 |
+| --- | --- | --- |
+| `SessionStart` | 会话加载完、界面起来之前 | 往系统提示词追加上下文；拒绝则进程直接退出 |
+| `SessionEnd` | 进程退出之前 | 做收尾。这里不能挂太慢的命令，退出会等它 |
+| `UserPromptSubmit` | 用户回车之后、发给模型之前 | 拦住这次输入，或往消息末尾追加上下文 |
+| `PreToolUse` | 参数校验之后、工具执行之前 | 拒绝这次调用，或改写参数。改写后的参数还要再过一遍校验 |
+| `PostToolUse` | 工具成功之后 | 改写回给模型的结果，或追加上下文 |
+| `PostToolUseFailure` | 工具失败之后 | 同上。被 `PreToolUse` 拒绝的调用不会再进这里 |
+| `Stop` | 模型没再调工具、回合即将结束 | 拒绝的话把理由塞回上下文，让模型继续。连续拉回有上限，默认 5 次 |
+| `PreCompact` | 真的要压缩上下文之前 | 拒绝则这一次不压缩。历史本来就不会被改写 |
+
+工具被拒绝或中途被 Ctrl+C 打断时，每个 `tool_call` 仍然会有一条 `tool_result`。漏掉的话，下次恢复会话会 400。
+
+失败默认放行：脚本崩了、超时了、JSON 写坏了，都不该把整个会话卡死。想拦截就必须退出码 2，或者在 JSON 里明确写 `block` / `deny`。
+
+目前只有 `type: "command"`。没有 HTTP、prompt、agent 这几种，也不支持 `"async": true`——写上去会在启动时被校验拒绝。
+
 ### 非交互模式
 
 stdin 不是终端时（管道输入、CI、IDE 插件调用），界面自动切成逐行模式：
@@ -128,6 +202,8 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS` | 压缩后尽量保留的最近 token | `20000` |
 | `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
+| `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
+| `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -235,7 +311,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal / hooks / hookConfig / agentHooks
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -302,6 +378,27 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
 不声明 `mutatesFiles` 的工具可以自由并发。声明了但操作的是「读-改-写」流程的（像 `edit`），必须声明，否则并发时会丢更新。
 
 工具压根不该并发（比如要独占某个资源），声明 `sequential: true`，它会单独跑，不和同一轮里的其他工具抢跑。
+
+### 加一个钩子
+
+不想写 JSON 的话，可以在进程里直接注册函数钩子。命令钩子和函数钩子走同一份结果：
+
+```typescript
+import { createHookRunner } from './hooks.ts'
+
+const hooks = createHookRunner([
+  {
+    event: 'PreToolUse',
+    matcher: /^run_bash$/,
+    handler: (input) => {
+      const command = (input.tool_input as { command?: string }).command ?? ''
+      if (command.includes('rm -rf')) return { decision: 'block', reason: '不许删仓库' }
+    },
+  },
+], { sessionId, cwd: workspace, defaultTimeoutMs: 10_000 })
+```
+
+把 `hooks` 传给 `runAgent` 的 `options.hooks`。`SessionStart` / `SessionEnd` / `UserPromptSubmit` 是命令行入口在回合外面触发的，只调用 `runAgent` 时不会自动跑这三个。
 
 ## License
 

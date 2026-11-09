@@ -291,6 +291,22 @@ export function buildModelContext(
 }
 
 /**
+ * 这一轮会不会真的去压缩。
+ *
+ * 判据和 compactContext 的前两道门槛相同:视图超过「窗口 - 预留」,
+ * 并且切点还能往前挪出一段可摘要的消息。
+ * PreCompact 钩子只在这时才跑。每轮都跑的话,拦截压缩的命令会在普通回合里空转。
+ */
+export function compactionPending(context: Context, compactionOptions: CompactionOptions): boolean {
+  const summarizedCount = context.compaction?.summarizedCount ?? 0
+  const viewTokens = estimateMessagesTokens(buildModelMessages(context, context.compaction))
+  const tokenBudget = compactionOptions.contextWindow - compactionOptions.reserveTokens
+  if (viewTokens <= tokenBudget) return false
+  const boundary = findTokenCut(context.messages, summarizedCount, compactionOptions.keepRecentTokens)
+  return boundary > summarizedCount
+}
+
+/**
  * 压缩旧消息,把结果写回 context.compaction。
  *
  * 只在发给模型的视图超过「窗口 - 预留」时才会真的压缩。
