@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { runAgent } from './agent.ts'
 import { Tui } from './tui.ts'
 import { builtinTools } from './tools.ts'
+import { createAskUserTool } from './askUser.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { createLoggerFromConfig } from './logger.ts'
 import { createTransport } from './transport.ts'
@@ -17,7 +18,10 @@ import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
-const SYSTEM_PROMPT = '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。'
+const SYSTEM_PROMPT =
+  '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。' +
+  '信息不足，或有多种做法必须由用户决定时，调用 ask_user 提问并等待回答。能从代码或命令里查到的不要问，一次只问一个问题。' +
+  '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。'
 
 async function main() {
   // 配置先加载并校验:启动阶段就报错，比第一次调 API 失败好排查
@@ -68,12 +72,20 @@ async function main() {
     messages: sessionStore.load(),
   }
 
-  // 工具的文件访问被限制在工作区内
-  const tools = await builtinTools({
+  // 工具的文件访问被限制在工作区内。
+  // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
+  const fileTools = await builtinTools({
     workspace: config.Workspace,
     commandTimeoutMs: config.CommandTimeoutMs,
   })
   const tui = new Tui()
+  const tools = [
+    ...fileTools,
+    createAskUserTool({
+      ask: (question, signal) => tui.ask(question, signal),
+      logger,
+    }),
+  ]
   // 进程收尾:停掉 TUI、关掉数据库。
   // tui.stop() 必须调——TUI 接管了终端原始模式,
   // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
@@ -198,62 +210,75 @@ async function main() {
     config.Workspace,
   )
 
-  // 每轮：用户输入 → 斜杠命令 or runAgent → 事件转发到 TUI → 持久化
-  tui.bindSubmit(async (text) => {
-    // 斜杠命令在本地执行,不发给模型
-    const commandResult = await commandRegistry.execute(text)
-    if (commandResult !== null) {
-      if (commandResult) tui.printNotice(commandResult)
-      return
-    }
+  // 每轮：用户输入 → 斜杠命令 or runAgent → 事件转发到 TUI → 持久化。
+  // 回合进行中到达的后续行先排队。提问会把其中一行当成回答，
+  // 没被取走的行在本轮结束后按顺序再开一轮，而不是并发挤进来。
+  const runInput = async (initialText: string): Promise<void> => {
+    let pending: string | undefined = initialText
+    while (pending !== undefined) {
+      const text = pending
+      pending = undefined
+      roundRunning = true
+      try {
+        // 斜杠命令在本地执行,不发给模型
+        const commandResult = await commandRegistry.execute(text)
+        if (commandResult !== null) {
+          if (commandResult) tui.printNotice(commandResult)
+        } else {
+          context.messages.push({ role: 'user', content: text })
 
-    roundRunning = true
-    try {
-      context.messages.push({ role: 'user', content: text })
+          tui.setBusy(true)
+          const ctrl = new AbortController()
+          tui.onAbort(() => ctrl.abort())
 
-      tui.setBusy(true)
-      const ctrl = new AbortController()
-      tui.onAbort(() => ctrl.abort())
+          for await (const ev of runAgent(model, context, tools, ctrl.signal, {
+            transport,
+            logger,
+            toolExecution: config.ToolExecution,
+            compaction: {
+              threshold: config.CompactThreshold,
+              keepRecent: config.CompactKeepRecent,
+            },
+          })) {
+            switch (ev.type) {
+              case 'assistant_text': tui.printText(ev.delta); break
+              case 'tool_call': tui.printToolCall(ev.name, ev.args); break
+              case 'tool_result': tui.printToolResult(ev.name, ev.result); break
+              case 'turn_end':
+                // 收尾:把流式文本换成排好版的 markdown
+                tui.finishTurn()
+                if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
+                if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
+                if (ev.stopReason === 'error') tui.printError('[执行出错]')
+                break
+            }
+          }
 
-      for await (const ev of runAgent(model, context, tools, ctrl.signal, {
-        transport,
-        logger,
-        toolExecution: config.ToolExecution,
-        compaction: {
-          threshold: config.CompactThreshold,
-          keepRecent: config.CompactKeepRecent,
-        },
-      })) {
-        switch (ev.type) {
-          case 'assistant_text': tui.printText(ev.delta); break
-          case 'tool_call': tui.printToolCall(ev.name, ev.args); break
-          case 'tool_result': tui.printToolResult(ev.name, ev.result); break
-          case 'turn_end':
-            // 收尾:把流式文本换成排好版的 markdown
-            tui.finishTurn()
-            if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
-            if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
-            if (ev.stopReason === 'error') tui.printError('[执行出错]')
-            break
+          await sessionStore.sync(context.messages)
         }
-      }
-
-      await sessionStore.sync(context.messages)
-    } catch (e) {
-      logger.error({ errorMessage: (e as Error).message }, '回合执行失败')
-      tui.printError((e as Error).message)
-    } finally {
-      roundRunning = false
-      tui.setBusy(false)
-      // 输入已经读完且回合跑完了,这才是能退的时候
-      if (inputClosed) {
-        shutdown()
-        process.exit(0)
+      } catch (e) {
+        logger.error({ errorMessage: (e as Error).message }, '回合执行失败')
+        tui.printError((e as Error).message)
+      } finally {
+        roundRunning = false
+        tui.setBusy(false)
+        // 下一行在让出事件循环之前就拿到，避免 EOF 回调看见「空闲」把进程退掉
+        pending = tui.takeNextHeldLine()
       }
     }
+
+    // 输入已经读完且排队的行都跑完了,这才是能退的时候
+    if (inputClosed) {
+      shutdown()
+      process.exit(0)
+    }
+  }
+
+  tui.bindSubmit((text) => {
+    void runInput(text)
   })
 
-  tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。')
+  tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。')
   tui.start()
 
   process.once('exit', shutdown)
