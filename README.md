@@ -123,8 +123,9 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_LOG_LEVEL` | 日志级别 | `info` |
 | `GRASSAGENT_LOG_FORMAT` | `json` 或 `pretty` | `json` |
 | `GRASSAGENT_TOOL_EXECUTION` | `parallel` 或 `sequential` | `parallel` |
-| `GRASSAGENT_COMPACT_THRESHOLD` | 上下文压缩触发阈值（消息条数） | `50` |
-| `GRASSAGENT_COMPACT_KEEP_RECENT` | 压缩时保留最近多少条消息 | `20` |
+| `GRASSAGENT_CONTEXT_WINDOW` | 上下文窗口（token），用来判断该不该压缩 | `128000` |
+| `GRASSAGENT_COMPACT_RESERVE_TOKENS` | 留给回复和摘要的 token，超过窗口减去它就开始压 | `16384` |
+| `GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS` | 压缩后尽量保留的最近 token | `20000` |
 | `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 
@@ -165,7 +166,7 @@ echo "读一下 README.md" | npm start
 
 管道输入时，回合进行中到达的下一行先排队。提问就用这一行当回答；没人问的话，本轮结束再按顺序开下一轮。输入已经结束（EOF）还在等回答时，工具返回「没有用户可以回答」，模型按现有信息继续，进程不会挂住。
 
-**上下文压缩。** 消息超过阈值时，先让模型把旧消息总结成摘要，之后发给模型的内容变成「摘要 + 最近若干条」。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，先让模型把旧消息总结成结构化摘要（目标、约束、进展、决定、下一步），之后发给模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
 
 压缩**只改发给模型的视图，不改历史**。`context.messages` 始终是完整的，摘要单独记在 `context.compaction` 里。这一点很关键，因为改历史会出两个问题：
 
@@ -173,7 +174,7 @@ echo "读一下 README.md" | npm start
 
 二是**新消息会存不进去**。会话存储按「新增条数」增量写，历史被砍之后切片就空了，后面说的话全部消失。
 
-阈值可以配：`GRASSAGENT_COMPACT_THRESHOLD`（默认 50）和 `GRASSAGENT_COMPACT_KEEP_RECENT`（默认 20）。
+窗口、预留和保留可以配：`GRASSAGENT_CONTEXT_WINDOW`（默认 128000）、`GRASSAGENT_COMPACT_RESERVE_TOKENS`（默认 16384）、`GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS`（默认 20000）。保留和预留加起来必须小于窗口。本地小模型要把这三个一起改小。
 
 **容错读取会话。** 消息在 SQLite 里按序列号存，读出来逐条校验结构，坏行跳过而不是丢弃整个会话。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏 tool_call / tool_result 的配对关系。
 

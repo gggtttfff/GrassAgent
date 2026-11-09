@@ -92,20 +92,24 @@ export const configSchema = z.object({
     error: 'ToolExecution 只能是 parallel 或 sequential',
   }).default('parallel'),
 
-  // 上下文压缩。未压缩的消息数超过 CompactThreshold 就把旧消息总结成摘要,
-  // 摘要 + 最近 CompactKeepRecent 条一起发给模型。
+  // 上下文压缩。估算 token 超过「窗口 - 预留」就把旧消息总结成摘要,
+  // 摘要 + 大约 CompactKeepRecentTokens 的最近消息一起发给模型。
   // 历史本身不会被删掉,只是发给模型的内容变短了。
-  CompactThreshold: numericOption({
-    minimum: 4, maximum: 10_000, defaultValue: 50, label: 'CompactThreshold',
+  // 默认值和 src/compaction.ts 的常量是同一组,那边不能被这里依赖。
+  ContextWindow: numericOption({
+    minimum: 4_096, maximum: 2_000_000, defaultValue: 128_000, label: 'ContextWindow',
   }),
-  CompactKeepRecent: numericOption({
-    minimum: 1, maximum: 5_000, defaultValue: 20, label: 'CompactKeepRecent',
+  CompactReserveTokens: numericOption({
+    minimum: 256, maximum: 1_000_000, defaultValue: 16_384, label: 'CompactReserveTokens',
+  }),
+  CompactKeepRecentTokens: numericOption({
+    minimum: 256, maximum: 1_000_000, defaultValue: 20_000, label: 'CompactKeepRecentTokens',
   }),
 }).check(z.refine(
-  (config) => config.CompactKeepRecent < config.CompactThreshold,
+  (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
-    path: ['CompactKeepRecent'],
-    message: 'CompactKeepRecent 必须小于 CompactThreshold,否则压缩后没有可摘要的旧消息',
+    path: ['CompactKeepRecentTokens'],
+    message: 'CompactKeepRecentTokens 与 CompactReserveTokens 之和必须小于 ContextWindow,否则压缩腾不出空间',
   },
 ))
 
@@ -140,8 +144,9 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SessionId: `${ENV_PREFIX}SESSION_ID`,
   CommandTimeoutMs: `${ENV_PREFIX}COMMAND_TIMEOUT_MS`,
   ToolExecution: `${ENV_PREFIX}TOOL_EXECUTION`,
-  CompactThreshold: `${ENV_PREFIX}COMPACT_THRESHOLD`,
-  CompactKeepRecent: `${ENV_PREFIX}COMPACT_KEEP_RECENT`,
+  ContextWindow: `${ENV_PREFIX}CONTEXT_WINDOW`,
+  CompactReserveTokens: `${ENV_PREFIX}COMPACT_RESERVE_TOKENS`,
+  CompactKeepRecentTokens: `${ENV_PREFIX}COMPACT_KEEP_RECENT_TOKENS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

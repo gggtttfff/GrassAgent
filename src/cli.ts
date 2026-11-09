@@ -236,8 +236,9 @@ async function main() {
             logger,
             toolExecution: config.ToolExecution,
             compaction: {
-              threshold: config.CompactThreshold,
-              keepRecent: config.CompactKeepRecent,
+              contextWindow: config.ContextWindow,
+              reserveTokens: config.CompactReserveTokens,
+              keepRecentTokens: config.CompactKeepRecentTokens,
             },
           })) {
             switch (ev.type) {
