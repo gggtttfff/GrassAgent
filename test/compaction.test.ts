@@ -4,8 +4,11 @@ import { createServer, type Server } from 'node:http'
 import {
   buildModelContext,
   buildModelMessages,
+  collectFileOperations,
   compactContext,
+  estimateMessageTokens,
   findSafeBoundary,
+  findTokenCut,
   hasOrphanToolResult,
 } from '../src/compaction.ts'
 import type { Context, Message } from '../src/messages.ts'
@@ -99,8 +102,8 @@ function plainMessages(count: number, prefix = 'msg'): Message[] {
   }))
 }
 
-// 压缩的默认参数
-const compactionOptions = { threshold: 20, keepRecent: 10 }
+// 测试用的小窗口。短消息大约 2 token 一条,30 条会超过 40 的预算。
+const compactionOptions = { contextWindow: 80, reserveTokens: 40, keepRecentTokens: 16 }
 
 test('hasOrphanToolResult 认出没有配对的 tool_result', () => {
   const orphan = [toolResultMessage('call_1')]
@@ -230,7 +233,114 @@ test('压缩失败时保留原状态,不用空摘要', async () => {
   }
 })
 
-test('消息数没到阈值就不压缩', async () => {
+test('估算 token 用字符数除以 4,向上取整', () => {
+  const message: Message = { role: 'user', content: 'x'.repeat(5) }
+  assert.equal(estimateMessageTokens(message), 2)
+})
+
+test('长消息会触发压缩,同样条数的短消息不会', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('长消息摘要'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const options = { contextWindow: 400, reserveTokens: 50, keepRecentTokens: 80 }
+    const shortContext: Context = { messages: plainMessages(5) }
+    await compactContext(model, shortContext, undefined, {}, options)
+    assert.equal(shortContext.compaction, undefined, '短消息不该因为条数够了就压缩')
+
+    const longContext: Context = {
+      messages: Array.from({ length: 5 }, () => ({ role: 'user' as const, content: 'x'.repeat(400) })),
+    }
+    await compactContext(model, longContext, undefined, {}, options)
+    assert.ok(longContext.compaction, '长消息应该按 token 触发压缩')
+    assert.equal(longContext.messages.length, 5)
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('token 切点落在 tool_result 上时会把 tool_use 一起留下', () => {
+  const tail: Message = { role: 'user', content: 'x'.repeat(40) }
+  const messages: Message[] = [
+    { role: 'user', content: 'old' },
+    toolUseMessage('call_1'),
+    toolResultMessage('call_1'),
+    tail,
+  ]
+  // 预算只比最后一条多 1,回走会踩到 tool_result,安全切点必须再往前
+  const boundary = findTokenCut(messages, 0, estimateMessageTokens(tail) + 1)
+  assert.equal(hasOrphanToolResult(messages.slice(boundary)), false)
+  assert.ok(boundary <= 1, `tool_use 应该留在保留区,实际切点 ${boundary}`)
+})
+
+test('文件路径从工具调用里抽出,不靠摘要正文', () => {
+  const messages: Message[] = [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'r', name: 'read_file', input: { path: 'src/a.ts' } },
+        { type: 'tool_use', id: 'w', name: 'edit', input: { path: 'src/b.ts' } },
+        { type: 'tool_use', id: 'w2', name: 'edit', input: { path: 'src/b.ts' } },
+      ],
+    },
+  ]
+  const files = collectFileOperations(messages)
+  assert.deepEqual(files.readFiles, ['src/a.ts'])
+  assert.deepEqual(files.modifiedFiles, ['src/b.ts'])
+})
+
+test('压缩视图附上读过和改过的路径', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('摘要正文'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const context: Context = {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'r', name: 'read_file', input: { path: 'src/a.ts' } },
+            { type: 'tool_use', id: 'w', name: 'write_file', input: { path: 'src/b.ts' } },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'r', content: 'a' },
+            { type: 'tool_result', tool_use_id: 'w', content: 'wrote' },
+          ],
+        },
+        ...plainMessages(20, 'tail'),
+      ],
+    }
+
+    await compactContext(
+      model,
+      context,
+      undefined,
+      {},
+      { contextWindow: 80, reserveTokens: 50, keepRecentTokens: 12 },
+    )
+
+    assert.ok(context.compaction)
+    assert.deepEqual(context.compaction.readFiles, ['src/a.ts'])
+    assert.deepEqual(context.compaction.modifiedFiles, ['src/b.ts'])
+    const view = buildModelMessages(context, context.compaction)
+    const summaryText = String(view[0].content)
+    assert.ok(summaryText.includes('<read-files>'))
+    assert.ok(summaryText.includes('src/a.ts'))
+    assert.ok(summaryText.includes('src/b.ts'))
+    assert.ok(!context.compaction.summary.includes('src/a.ts'), '路径不要写进摘要正文,下一轮合并时会重复')
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('估算 token 没到阈值就不压缩', async () => {
   const mock = await startMockServer([])
 
   try {
@@ -296,7 +406,7 @@ test('第二次压缩会把上一次的摘要一起总结进去', async () => {
       compaction: { summarizedCount: 30, summary: '之前的摘要' },
     }
 
-    await compactContext(model, context, undefined, {}, { threshold: 5, keepRecent: 5 })
+    await compactContext(model, context, undefined, {}, { contextWindow: 40, reserveTokens: 24, keepRecentTokens: 8 })
 
     assert.ok(context.compaction)
     // 覆盖范围往前推进了
@@ -311,64 +421,18 @@ test('第二次压缩会把上一次的摘要一起总结进去', async () => {
       requestText.includes('之前的摘要'),
       `摘要请求里应该带上旧摘要,实际: ${requestText.slice(0, 300)}`,
     )
+    assert.ok(requestText.includes('previous-summary'), '旧摘要要单独成段,避免和新增对话混在一起')
+    assert.ok(requestText.includes('只按指定格式输出'), '摘要请求不该接着回答对话')
   } finally {
     await stopMockServer(mock.server)
   }
 })
 
-test('小模型用 JSON 表示要压缩时,只留下摘要正文', async () => {
-  const mock = await startMockServer([
-    { body: body([textFrame('{"compact":true,"summary":"留下的决策"}'), finishFrame('stop')]) },
-  ])
-
-  try {
-    const model: Model = { apiKey: 'k', model: 'small', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
-    const context: Context = { messages: plainMessages(30) }
-
-    await compactContext(model, context, undefined, {}, compactionOptions)
-
-    assert.equal(context.compaction?.summary, '留下的决策')
-    assert.ok((context.compaction?.summarizedCount ?? 0) > 0)
-    const view = buildModelMessages(context, context.compaction)
-    assert.ok(String(view[0].content).includes('留下的决策'))
-    assert.equal(String(view[0].content).includes('compact'), false)
-  } finally {
-    await stopMockServer(mock.server)
-  }
-})
-
-test('小模型判断先不压缩时不写空摘要,短时间内也不再问', async () => {
-  const mock = await startMockServer([
-    { body: body([textFrame('{"compact":false,"summary":""}'), finishFrame('stop')]) },
-  ])
-
-  try {
-    const model: Model = { apiKey: 'k', model: 'small', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
-    const context: Context = {
-      messages: plainMessages(30),
-      compaction: { summarizedCount: 5, summary: '已有摘要' },
-    }
-
-    await compactContext(model, context, undefined, {}, compactionOptions)
-    await compactContext(model, context, undefined, {}, compactionOptions)
-
-    assert.equal(mock.receivedRequests.length, 1, '判断过先不压之后不该马上再问')
-    assert.equal(context.compaction?.summarizedCount, 5, '不压缩就不该推进切点')
-    assert.equal(context.compaction?.summary, '已有摘要', '不压缩不该清掉已有摘要')
-    assert.ok((context.compaction?.deferUntilLength ?? 0) > context.messages.length)
-    // 没有新摘要时视图仍用原来的摘要,而不是空的
-    const view = buildModelMessages(context, context.compaction)
-    assert.ok(String(view[0].content).includes('已有摘要'))
-  } finally {
-    await stopMockServer(mock.server)
-  }
-})
-
-test('只有「先不压」记录时,发给模型的仍是完整历史', () => {
+test('还没有摘要时,发给模型的仍是完整历史', () => {
   const messages = plainMessages(4)
   const view = buildModelMessages(
     { messages },
-    { summarizedCount: 0, summary: '', deferUntilLength: 20 },
+    { summarizedCount: 0, summary: '' },
   )
   assert.deepEqual(view, messages)
 })

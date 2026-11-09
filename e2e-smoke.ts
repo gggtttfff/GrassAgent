@@ -331,13 +331,13 @@ console.log('\n用例 4: Ctrl+C 打断后,每个 tool_call 都有 tool_result')
 }
 
 // ========== 用例 5: 上下文压缩 ==========
-console.log('\n用例 5: 消息超过阈值后压缩旧消息')
+console.log('\n用例 5: 上下文超过预留后压缩旧消息')
 {
   queue.length = 0
   receivedRequests = []
 
   // 压缩会额外发一轮请求,所以需要两个响应:先压缩摘要,再正常回复。
-  // agent 循环一进来就会检查消息数,所以第一个响应就是摘要请求的响应。
+  // 这些消息很短,默认的大窗口压不着。这里把窗口收小,专门验证压缩路径。
   queue.push(() => ({ status: 200, body: body([textFrame('这是历史对话摘要'), finishFrame('stop')]) }))
   queue.push(() => ({ status: 200, body: body([textFrame('压缩后继续'), finishFrame('stop')]) }))
 
@@ -346,7 +346,9 @@ console.log('\n用例 5: 消息超过阈值后压缩旧消息')
   }
 
   let text = ''
-  for await (const ev of runAgent(model, context, tools)) {
+  for await (const ev of runAgent(model, context, tools, undefined, {
+    compaction: { contextWindow: 150, reserveTokens: 80, keepRecentTokens: 40 },
+  })) {
     if (ev.type === 'assistant_text') text += ev.delta
   }
 

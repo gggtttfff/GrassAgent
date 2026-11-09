@@ -79,35 +79,43 @@ test('布尔型环境变量接受多种写法', () => {
 
 test('压缩阈值有默认值', () => {
   const config = validateConfig({ ApiKey: 'k' })
-  assert.equal(config.CompactThreshold, 50)
-  assert.equal(config.CompactKeepRecent, 20)
+  assert.equal(config.ContextWindow, 128_000)
+  assert.equal(config.CompactReserveTokens, 16_384)
+  assert.equal(config.CompactKeepRecentTokens, 20_000)
 })
 
 test('压缩阈值可以配', () => {
   const config = validateConfig({
     ApiKey: 'k',
-    CompactThreshold: '30',
-    CompactKeepRecent: '10',
+    ContextWindow: '32000',
+    CompactReserveTokens: '4096',
+    CompactKeepRecentTokens: '8000',
   })
-  assert.equal(config.CompactThreshold, 30)
-  assert.equal(config.CompactKeepRecent, 10)
+  assert.equal(config.ContextWindow, 32_000)
+  assert.equal(config.CompactReserveTokens, 4096)
+  assert.equal(config.CompactKeepRecentTokens, 8000)
 })
 
-test('保留条数不小于阈值时报错', () => {
-  // 保留的条数比阈值还多,就永远没有可摘要的旧消息
+test('保留区和预留加起来塞满窗口时报错', () => {
   assert.throws(
-    () => validateConfig({ ApiKey: 'k', CompactThreshold: '10', CompactKeepRecent: '20' }),
+    () => validateConfig({
+      ApiKey: 'k',
+      ContextWindow: '8192',
+      CompactReserveTokens: '4096',
+      CompactKeepRecentTokens: '8000',
+    }),
     (error: unknown) => {
       assert.ok(error instanceof ConfigError)
-      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_COMPACT_KEEP_RECENT')))
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS')))
       return true
     },
   )
 })
 
 test('压缩阈值过小时被拒绝', () => {
-  assert.throws(() => validateConfig({ ApiKey: 'k', CompactThreshold: '1' }), ConfigError)
-  assert.throws(() => validateConfig({ ApiKey: 'k', CompactKeepRecent: '0' }), ConfigError)
+  assert.throws(() => validateConfig({ ApiKey: 'k', ContextWindow: '1000' }), ConfigError)
+  assert.throws(() => validateConfig({ ApiKey: 'k', CompactReserveTokens: '1' }), ConfigError)
+  assert.throws(() => validateConfig({ ApiKey: 'k', CompactKeepRecentTokens: '1' }), ConfigError)
 })
 
 test('系统环境变量优先于 .env 文件', () => {
@@ -171,6 +179,23 @@ test('loadConfig 能从环境变量加载完整配置', async () => {
   assert.equal(config.Model, 'env-model')
   assert.equal(config.MaxTokens, 4096)
   assert.equal(config.Workspace, '/tmp/ws')
+})
+
+test('钩子超时有默认值,空路径视为没配', () => {
+  const config = validateConfig({ ApiKey: 'k', HooksPath: '' })
+  assert.equal(config.HookTimeoutMs, 10_000)
+  assert.equal(config.HooksPath, undefined)
+})
+
+test('钩子超时不是整数时被拒绝', () => {
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', HookTimeoutMs: '10.5' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_HOOK_TIMEOUT_MS')))
+      return true
+    },
+  )
 })
 
 test('loadConfig 缺 API Key 时抛 ConfigError', async () => {

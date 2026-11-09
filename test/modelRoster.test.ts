@@ -100,7 +100,7 @@ test('压缩走小模型,对话走主力模型', async () => {
       [],
       undefined,
       {
-        compaction: { threshold: 4, keepRecent: 2 },
+        compaction: { contextWindow: 12, reserveTokens: 6, keepRecentTokens: 2 },
         compactionModel: { apiKey: 'k', model: 'small-model', baseUrl },
       },
     )) {

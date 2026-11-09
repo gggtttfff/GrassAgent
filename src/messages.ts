@@ -44,15 +44,14 @@ export interface Message {
  * 历史本身始终完整——它是会话存储的内容,也是 /resume 恢复出来的内容。
  */
 export interface CompactionState {
-  /** 已经被摘要覆盖的消息条数。0 表示还没有摘要,只是记下「先不压」 */
+  /** 已经被摘要覆盖的消息条数 */
   summarizedCount: number
-  /** 摘要正文。空字符串表示当前没有可展示的摘要 */
+  /** 摘要正文。文件清单不放在这里,避免下一轮合并摘要时把路径重复写进正文。 */
   summary: string
-  /**
-   * 小模型判断先不压缩时,消息条数涨到这里再重新问。
-   * 不记这一笔的话,超阈值之后每一轮都会再问一次,结论却多半一样。
-   */
-  deferUntilLength?: number
+  /** 被摘要覆盖的历史里读过的文件,跨次压缩累加 */
+  readFiles?: string[]
+  /** 被摘要覆盖的历史里改过的文件,跨次压缩累加 */
+  modifiedFiles?: string[]
 }
 
 /** 上下文:系统提示词 + 消息列表 + 压缩状态 */

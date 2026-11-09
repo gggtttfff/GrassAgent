@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -75,6 +77,11 @@ async function runCliWithInput(
   })
 
   return { exitCode, output }
+}
+
+function quoteShell(value: string): string {
+  if (process.platform === 'win32') return `"${value.replace(/"/g, '""')}"`
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 test('非交互模式能跑完整个回合并正常退出', async () => {
@@ -179,6 +186,51 @@ test('/sessions 列出会话', async () => {
     assert.ok(!output.includes('回复'), '命令不该发给模型')
   } finally {
     await mock.close()
+  }
+})
+
+test('UserPromptSubmit 可以拦住输入,退出时会跑 SessionEnd', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-hooks-'))
+  const scriptPath = path.join(directory, 'hook.mjs')
+  const hooksPath = path.join(directory, 'hooks.json')
+  const markerPath = path.join(directory, 'ended.txt')
+  const command = `${quoteShell(process.execPath)} ${quoteShell(scriptPath)}`
+  await writeFile(scriptPath, `
+    import { writeFileSync } from 'node:fs'
+    let raw = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', (chunk) => { raw += chunk })
+    process.stdin.on('end', () => {
+      const input = JSON.parse(raw || '{}')
+      if (input.hook_event_name === 'UserPromptSubmit') {
+        process.stderr.write('已被测试钩子拦截')
+        process.exit(2)
+      }
+      if (input.hook_event_name === 'SessionEnd') {
+        writeFileSync(process.env.GRASS_TEST_MARKER, 'ended')
+      }
+    })
+  `)
+  await writeFile(hooksPath, JSON.stringify({
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeoutMs: 5000 }] }],
+    SessionEnd: [{ hooks: [{ type: 'command', command, timeoutMs: 5000 }] }],
+  }))
+
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('这条不该发给模型\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_HOOKS_PATH: hooksPath,
+      GRASS_TEST_MARKER: markerPath,
+    })
+    assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('已被测试钩子拦截'), `应显示钩子拒绝原因,实际: ${output.slice(-400)}`)
+    assert.ok(!output.includes('回复'), '被拦截的输入不该发给模型')
+    assert.equal(await readFile(markerPath, 'utf8'), 'ended')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
   }
 })
 
