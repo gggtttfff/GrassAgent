@@ -17,6 +17,9 @@ import { withFileMutationQueue } from './mutationQueue.ts'
 import {
   buildModelContext,
   compactContext,
+  DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
+  DEFAULT_COMPACT_RESERVE_TOKENS,
+  DEFAULT_CONTEXT_WINDOW,
   type CompactionOptions,
 } from './compaction.ts'
 import type { Transport } from './transport.ts'
@@ -49,15 +52,12 @@ export type AgentEvent =
   | { type: 'tool_result'; id: string; name: string; result: string }
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
 
-// compaction 触发阈值:消息数超过这个值就压缩旧消息
-const DEFAULT_COMPACT_THRESHOLD = 50
-// compaction 保留最近这么多条消息
-const DEFAULT_KEEP_RECENT = 20
-
 // 压缩的默认配置。runAgent 的参数可以覆盖。
+// 数字和配置层的默认值是同一组,定义在 compaction.ts。
 const defaultCompactionOptions: CompactionOptions = {
-  threshold: DEFAULT_COMPACT_THRESHOLD,
-  keepRecent: DEFAULT_KEEP_RECENT,
+  contextWindow: DEFAULT_CONTEXT_WINDOW,
+  reserveTokens: DEFAULT_COMPACT_RESERVE_TOKENS,
+  keepRecentTokens: DEFAULT_COMPACT_KEEP_RECENT_TOKENS,
 }
 
 // 运行 agent 循环,没有步数上限——模型说停就停。

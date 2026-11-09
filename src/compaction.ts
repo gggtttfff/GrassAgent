@@ -16,6 +16,10 @@
 //
 // 切点还有个约束:不能落在工具调用和它的结果之间。
 // findSafeBoundary 负责找一条安全的切线。
+//
+// 触发和保留按估算 token,不按消息条数。一条工具输出可以比几十条短消息更占窗口。
+// 估算用字符数 / 4,和 pi 一样:不引分词器,偏保守(实际 token 通常更少)。
+// 摘要用固定结构,文件路径不靠模型回忆——从被压掉的 tool_use 里抽出来附在摘要后面。
 
 import type { Context, CompactionState, Message } from './messages.ts'
 import type { Model } from './protocol.ts'
@@ -23,20 +27,76 @@ import { stream, type StreamOptions } from './llm.ts'
 import type { Transport } from './transport.ts'
 import type { Logger } from './logger.ts'
 
-/** 压缩配置 */
+// 这些默认值和 src/config.ts 里的 schema 默认值是同一组。
+// config 不能反向依赖这里,所以数字写了两处。改的时候两处一起改。
+export const DEFAULT_CONTEXT_WINDOW = 128_000
+export const DEFAULT_COMPACT_RESERVE_TOKENS = 16_384
+export const DEFAULT_COMPACT_KEEP_RECENT_TOKENS = 20_000
+
+/** 压缩配置。触发线是窗口减去预留,保留区按 token 从尾部回切。 */
 export interface CompactionOptions {
-  /** 未压缩的消息数超过这个值就触发压缩 */
-  threshold: number
-  /** 压缩时保留最近这么多条消息 */
-  keepRecent: number
+  /** 模型上下文窗口(token)。只用来决定什么时候该压,不是 API 参数。 */
+  contextWindow: number
+  /** 窗口里留给回复和摘要的 token。超过 window - reserve 就开始压。 */
+  reserveTokens: number
+  /** 压缩后尽量留下的最近 token 数。 */
+  keepRecentTokens: number
 }
 
 /** 摘要消息的前缀。模型靠它认出「这是压缩过的上下文」 */
 const SUMMARY_PREFIX = '[context summary]'
 
-// 摘要用的提示词。要点是保留「决策」和「待办」,不是复述对话。
+// 摘要请求自己就是一次性的。系统提示词把模型钉在「只输出摘要」上,
+// 否则它会接着回答对话里的问题,摘要里就混进新的回复。
+const SUMMARY_SYSTEM_PROMPT =
+  '你是上下文摘要助手。阅读一段用户和助手的对话,只按指定格式输出结构化摘要。不要继续对话,不要回答对话里的问题。'
+
+const SUMMARY_FORMAT = `严格使用这个格式:
+
+## 目标
+[用户要完成什么。一件事写一条,可以有多条]
+
+## 约束与偏好
+- [用户提过的限制、偏好、要求]
+- [没有就写「（无）」]
+
+## 进展
+### 已完成
+- [x] [已经做完的事]
+
+### 进行中
+- [ ] [正在做的事]
+
+### 受阻
+- [卡住的问题。没有就写「（无）」]
+
+## 关键决定
+- **[决定]**: [简短理由]
+
+## 下一步
+1. [接下来按顺序该做什么]
+
+## 关键上下文
+- [接着干活必须知道的数据、例子、报错原文]
+- [没有就写「（无）」]
+
+每一节都短。保留准确的文件路径、函数名和报错原文。不要自己编文件清单,路径由系统另外附上。`
+
 const SUMMARY_PROMPT =
-  '请将以下对话总结为简洁的上下文摘要,保留关键决策,已做的工作和待办事项。'
+  `上面的对话需要总结成上下文检查点,另一段模型会靠它接着干活。\n\n${SUMMARY_FORMAT}`
+
+const UPDATE_SUMMARY_PROMPT =
+  `上面是新的对话,标签里是已有摘要。把新信息合并进摘要。规则:
+- 保留已有摘要里的信息
+- 补上新的进展、决定和上下文
+- 做完的事从「进行中」挪到「已完成」
+- 按当前状态改「下一步」
+- 不再相关的可以删
+
+${SUMMARY_FORMAT}`
+
+const READ_TOOL_NAMES = new Set(['read_file'])
+const MODIFY_TOOL_NAMES = new Set(['write_file', 'edit', 'edit_batch'])
 
 /**
  * 保留区里有没有落单的 tool_result。
@@ -79,6 +139,106 @@ export function findSafeBoundary(messages: Message[], targetIndex: number): numb
   return index
 }
 
+function jsonLength(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0
+  } catch {
+    return 0
+  }
+}
+
+function messageChars(message: Message): number {
+  if (typeof message.content === 'string') return message.content.length
+  let chars = 0
+  for (const block of message.content) {
+    if (block.type === 'text') chars += block.text.length
+    else if (block.type === 'tool_use') chars += block.name.length + jsonLength(block.input)
+    else chars += block.content.length
+  }
+  return chars
+}
+
+/**
+ * 估算一条消息的 token。
+ *
+ * 字符数 / 4 再向上取整。中文实际更密,取整是为了早一点压,而不是把窗口撑满再发现。
+ */
+export function estimateMessageTokens(message: Message): number {
+  return Math.ceil(messageChars(message) / 4)
+}
+
+/** 估算一组消息的 token,逐条取整后再相加,和单条估算的口径一致。 */
+export function estimateMessagesTokens(messages: Message[]): number {
+  let total = 0
+  for (const message of messages) total += estimateMessageTokens(message)
+  return total
+}
+
+/**
+ * 从尾部回走,留下大约 keepRecentTokens。
+ *
+ * 返回值是保留区的起点。整段都放得下就返回 startIndex,表示没有新东西可切。
+ * 切到 tool_result 上时再交给 findSafeBoundary 往前挪,避免把配对劈开。
+ * 往前挪会多留几条,保留区可以略大于预算,但不能为了卡预算把工具结果拆出去。
+ */
+export function findTokenCut(messages: Message[], startIndex: number, keepRecentTokens: number): number {
+  let accumulated = 0
+  for (let index = messages.length - 1; index >= startIndex; index--) {
+    accumulated += estimateMessageTokens(messages[index])
+    if (accumulated >= keepRecentTokens) return findSafeBoundary(messages, index)
+  }
+  return startIndex
+}
+
+function toolPath(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined
+  const pathValue = (input as { path?: unknown }).path
+  return typeof pathValue === 'string' && pathValue ? pathValue : undefined
+}
+
+function uniquePaths(paths: string[]): string[] {
+  const seen = new Set<string>()
+  const unique: string[] = []
+  for (const filePath of paths) {
+    if (seen.has(filePath)) continue
+    seen.add(filePath)
+    unique.push(filePath)
+  }
+  return unique
+}
+
+/**
+ * 从工具调用里抽出读过和改过的路径。
+ *
+ * 不让摘要模型自己回忆路径:它会漏,漏了下一轮就不知道哪些文件已经看过。
+ */
+export function collectFileOperations(messages: Message[]): { readFiles: string[]; modifiedFiles: string[] } {
+  const readFiles: string[] = []
+  const modifiedFiles: string[] = []
+  for (const message of messages) {
+    if (typeof message.content === 'string') continue
+    for (const block of message.content) {
+      if (block.type !== 'tool_use') continue
+      const filePath = toolPath(block.input)
+      if (!filePath) continue
+      if (READ_TOOL_NAMES.has(block.name)) readFiles.push(filePath)
+      else if (MODIFY_TOOL_NAMES.has(block.name)) modifiedFiles.push(filePath)
+    }
+  }
+  return { readFiles: uniquePaths(readFiles), modifiedFiles: uniquePaths(modifiedFiles) }
+}
+
+function mergePaths(previous: string[] | undefined, current: string[]): string[] {
+  return uniquePaths([...(previous ?? []), ...current])
+}
+
+function formatFileLists(readFiles: string[], modifiedFiles: string[]): string {
+  const sections: string[] = []
+  if (readFiles.length > 0) sections.push(`<read-files>\n${readFiles.join('\n')}\n</read-files>`)
+  if (modifiedFiles.length > 0) sections.push(`<modified-files>\n${modifiedFiles.join('\n')}\n</modified-files>`)
+  return sections.join('\n\n')
+}
+
 // 把一条消息拍平成纯文本,给模型总结用。
 function flattenMessage(message: Message): string {
   if (typeof message.content === 'string') {
@@ -107,8 +267,10 @@ export function buildModelMessages(
   compaction: CompactionState | null | undefined,
 ): Message[] {
   if (!compaction) return context.messages
+  const fileLists = formatFileLists(compaction.readFiles ?? [], compaction.modifiedFiles ?? [])
+  const summary = fileLists ? `${compaction.summary}\n\n${fileLists}` : compaction.summary
   return [
-    { role: 'user', content: `${SUMMARY_PREFIX}\n${compaction.summary}` },
+    { role: 'user', content: `${SUMMARY_PREFIX}\n${summary}` },
     ...context.messages.slice(compaction.summarizedCount),
   ]
 }
@@ -131,7 +293,7 @@ export function buildModelContext(
 /**
  * 压缩旧消息,把结果写回 context.compaction。
  *
- * 只在「还没被摘要覆盖的部分」变长时才会真的压缩。
+ * 只在发给模型的视图超过「窗口 - 预留」时才会真的压缩。
  * 已经摘要过的历史不会再发一遍,否则模型会看到同一段对话的多个版本。
  *
  * 压缩失败时不动任何消息——
@@ -149,29 +311,33 @@ export async function compactContext(
 
   const compaction = context.compaction
   const summarizedCount = compaction?.summarizedCount ?? 0
-  const liveCount = context.messages.length - summarizedCount
-  if (liveCount < compactionOptions.threshold) return
+  // 看的是即将发给模型的视图,不是完整历史。已经压掉的部分不该再把阈值撑满。
+  const viewTokens = estimateMessagesTokens(buildModelMessages(context, compaction))
+  const tokenBudget = compactionOptions.contextWindow - compactionOptions.reserveTokens
+  if (viewTokens <= tokenBudget) return
 
-  // 切点:保留最近 keepRecent 条,再保证不劈开工具调用和结果
-  const targetBoundary = context.messages.length - compactionOptions.keepRecent
-  const boundary = findSafeBoundary(context.messages, targetBoundary)
+  // 从尾部留下大约 keepRecentTokens,再保证不劈开工具调用和结果
+  const boundary = findTokenCut(context.messages, summarizedCount, compactionOptions.keepRecentTokens)
   // 切点没往前进就没有新东西可摘要,别空转
   if (boundary <= summarizedCount) return
 
   const newMessages = context.messages.slice(summarizedCount, boundary)
+  const fileOperations = collectFileOperations(newMessages)
+  const readFiles = mergePaths(compaction?.readFiles, fileOperations.readFiles)
+  const modifiedFiles = mergePaths(compaction?.modifiedFiles, fileOperations.modifiedFiles)
 
-  // 上一次的摘要要带上:这轮总结的是「旧摘要 + 新增消息」,
+  // 上一次的摘要要带上:这轮是把新消息合并进旧摘要,
   // 只总结新增的部分会把之前压缩掉的历史弄丢。
   const previousSummary = compaction?.summary
-  const conversationText = [
-    ...(previousSummary ? [`[之前的摘要]\n${previousSummary}`] : []),
-    ...newMessages.map(flattenMessage),
-  ].join('\n')
+  const conversationText = newMessages.map(flattenMessage).join('\n')
+  const prompt = previousSummary
+    ? `<conversation>\n${conversationText}\n</conversation>\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\n${UPDATE_SUMMARY_PROMPT}`
+    : `<conversation>\n${conversationText}\n</conversation>\n\n${SUMMARY_PROMPT}`
 
   // 用一轮额外的调用做总结,不走工具
   const summaryContext: Context = {
-    systemPrompt: SUMMARY_PROMPT,
-    messages: [{ role: 'user', content: conversationText }],
+    systemPrompt: SUMMARY_SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: prompt }],
   }
 
   let summary = ''
@@ -192,7 +358,7 @@ export async function compactContext(
       {
         summarizedCount,
         boundary,
-        liveCount,
+        viewTokens,
         reason: failed ? '请求失败' : '摘要为空',
       },
       '上下文压缩失败,保留原始消息',
@@ -201,9 +367,9 @@ export async function compactContext(
   }
 
   options.logger?.info(
-    { summarizedCount, boundary, liveCount, summaryLength: summary.length },
+    { summarizedCount, boundary, viewTokens, summaryLength: summary.length },
     '上下文已压缩',
   )
 
-  context.compaction = { summarizedCount: boundary, summary }
+  context.compaction = { summarizedCount: boundary, summary, readFiles, modifiedFiles }
 }
