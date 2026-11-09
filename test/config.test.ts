@@ -181,6 +181,16 @@ test('loadConfig 能从环境变量加载完整配置', async () => {
   assert.equal(config.Workspace, '/tmp/ws')
 })
 
+test('默认会识别项目里的规则和提示词', () => {
+  const config = validateConfig({ ApiKey: 'k' })
+  assert.equal(config.LoadProjectInstructions, true)
+})
+
+test('LoadProjectInstructions 可以用 0 关掉', () => {
+  const config = validateConfig({ ApiKey: 'k', LoadProjectInstructions: '0' })
+  assert.equal(config.LoadProjectInstructions, false)
+})
+
 test('钩子超时有默认值,空路径视为没配', () => {
   const config = validateConfig({ ApiKey: 'k', HooksPath: '' })
   assert.equal(config.HookTimeoutMs, 10_000)

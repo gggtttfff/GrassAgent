@@ -10,7 +10,9 @@
 
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
 - **终端界面** —— 差分渲染 + markdown 排版，流式输出不闪屏
-- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume`，本地执行，带命令补全
+- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume` `/export` `/import` `/instructions`，本地执行，带命令补全
+- **想来就来，想走就走** —— 会话导出成一个 JSON 包，换一台机器再导回来。包里没有 API Key
+- **认得仓库里已有的约定** —— 启动时识别 opencode、cursor、claude、kiro 的规则和提示词。始终生效的规则进上下文，提示词只列目录，点名再用
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息，历史本身不丢
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
 - **向用户提问** —— 模型调用 `ask_user` 后停下等你回答，答完再继续
@@ -38,6 +40,8 @@ src/
   theme.ts       配色:markdown / 编辑器 / 列表的主题定义
   slashCommands.ts 斜杠命令：解析 + 分发
   sessionPicker.ts  会话选择器：列表 + 弹窗
+  sessionBundle.ts 会话包：把 SQLite 里的对话收成 JSON，再导回来
+  projectInstructions.ts 识别 opencode / cursor / claude / kiro 的规则和提示词
   hooks.ts       钩子运行时：命令 / 函数、拒绝、改写、超时
   hookConfig.ts  钩子配置：读取并校验 hooks.json
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
@@ -91,8 +95,48 @@ npm start
 | `/new` | 开一个新会话 |
 | `/sessions` | 列出所有会话 |
 | `/resume` | 切换到别的会话 |
+| `/export` | 把会话导出成文件。不带路径时写到 `.grass/grassagent-bundle.json` |
+| `/import` | 从文件导回会话。同 ID 默认跳过，`--replace` 才覆盖 |
+| `/instructions` | 列出识别到的规则和提示词 |
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
+
+### 导入导出
+
+会话存在本机的 SQLite 里。换机器、换目录之前，把对话收成一个文件带走：
+
+```bash
+/export
+/export ~/backups/grass.json
+/export ~/backups/one.json --session <会话ID>
+/import ~/backups/grass.json
+/import ~/backups/grass.json --replace
+```
+
+文件是 `grassagent-bundle` 版本 1 的 JSON。里面只有会话 ID、时间和消息。API Key 留在原来的 `.env`，钩子留在项目的 `.grass/hooks.json`。导入只把消息写进会话库，不执行包里的文字。
+
+`tool_call` 和 `tool_result` 配不上对的会话会被拒绝，避免导进来之后下次请求直接 400。同 ID 已经存在时默认跳过，免得把这台机器上还在用的对话盖掉。嵌套超过 256 层的 JSON 会在解析前拒绝，避免一份极深的工具参数在保存或下一次请求时把进程打穿。
+
+相对路径锚定工作区，`~` 展开到用户主目录。这是用户自己的命令，所以允许把文件写到工作区外面。
+
+### 项目里已有的规则和提示词
+
+启动时扫描工作区，认出这些文件：
+
+| 工具 | 规则 | 提示词 |
+| --- | --- | --- |
+| opencode | `AGENTS.md`，以及 `opencode.json` / `opencode.jsonc` 里 `instructions` 指向的本地文件 | `.opencode/commands/`、`.opencode/agents/`、`.opencode/skills/`，还有配置里的 `command` / `agents` |
+| cursor | `.cursor/rules/**/*.mdc`、根目录 `.cursorrules`、`AGENTS.md` | `.cursor/commands/`、`.cursor/skills/` |
+| claude | `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md`、`.claude/rules/` | `.claude/commands/`、`.claude/agents/`、`.claude/skills/`、`.claude/output-styles/` |
+| kiro | `.kiro/steering/`、`AGENTS.md` | `.kiro/agents/`、`.kiro/skills/` |
+
+始终生效的规则（例如根目录 `AGENTS.md`、`alwaysApply: true`、没有 `paths` 的 Claude 规则、Kiro `inclusion: always`）会放进系统提示词。按文件匹配、按描述判断、点名才用的规则只留一行索引，模型改到相关文件时用 `read_file` 再读。提示词同样只进索引：用户点名，或任务和描述对上时才读正文，不会当成当前任务自动执行。
+
+单份规则超过 12000 字，或始终生效的规则合计超过 24000 字，就不再整篇塞进上下文，索引里会写明原因。
+
+不抓取配置里的 `https://` 地址，不读工作区外面的文件。指向区外的软链会跳过。`node_modules`、`.git` 这类目录不扫描。某个文件坏了，或者 JSON 嵌套过深，只记日志，启动继续。不想要这套识别时设 `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS=0`。
+
+用户主目录里的全局规则（`~/.claude`、`~/.config/opencode`、`~/.kiro`）不在这次的扫描范围里，它们不属于当前项目。
 
 ### 钩子
 
@@ -204,6 +248,7 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 | `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
 | `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
+| `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS` | 是否识别 opencode、cursor、claude、kiro 的规则和提示词 | `1` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -311,7 +356,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal / hooks / hookConfig / agentHooks
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / sessionBundle / projectInstructions / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal / hooks / hookConfig / agentHooks
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑

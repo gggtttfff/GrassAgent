@@ -21,6 +21,7 @@
 // 估算用字符数 / 4,和 pi 一样:不引分词器,偏保守(实际 token 通常更少)。
 // 摘要用固定结构,文件路径不靠模型回忆——从被压掉的 tool_use 里抽出来附在摘要后面。
 
+import { JsonSafetyError, stringifyJson } from './jsonSafety.ts'
 import type { Context, CompactionState, Message } from './messages.ts'
 import type { Model } from './protocol.ts'
 import { stream, type StreamOptions } from './llm.ts'
@@ -141,7 +142,8 @@ export function findSafeBoundary(messages: Message[], targetIndex: number): numb
 
 function jsonLength(value: unknown): number {
   try {
-    return JSON.stringify(value)?.length ?? 0
+    // 不要直接 JSON.stringify。过深的参数会在递归里把栈打穿,catch 也接不住干净。
+    return stringifyJson(value)?.length ?? 0
   } catch {
     return 0
   }
@@ -249,12 +251,22 @@ function flattenMessage(message: Message): string {
     if (block.type === 'text') {
       parts.push(block.text)
     } else if (block.type === 'tool_use') {
-      parts.push(`[调用工具 ${block.name}] ${JSON.stringify(block.input)}`)
+      parts.push(`[调用工具 ${block.name}] ${flattenToolInput(block.input)}`)
     } else {
       parts.push(`[工具结果] ${block.content}`)
     }
   }
   return `${message.role}:${parts.join('\n')}`
+}
+
+function flattenToolInput(input: unknown): string {
+  try {
+    return stringifyJson(input)
+  } catch (error) {
+    // 摘要只是给人看的文本。过深的参数省略掉,不要在压缩时把栈打穿。
+    if (error instanceof JsonSafetyError) return '[参数嵌套过深,已省略]'
+    throw error
+  }
 }
 
 /**

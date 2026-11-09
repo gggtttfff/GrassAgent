@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { JsonSafetyError } from '../src/jsonSafety.ts'
 import {
   contextToOpenAIMessages,
   toolDefinitionsToOpenAI,
@@ -148,4 +149,15 @@ test('注销 provider 后不再被解析到', () => {
 
   unregisterProvider('test-temporary')
   assert.equal(resolveProvider(baseModel).id, 'openai')
+})
+
+test('工具参数嵌套过深时拒绝转成请求,而不是递归序列化', () => {
+  let input: unknown = { ok: true }
+  for (let index = 0; index < 300; index++) input = { nested: input }
+  assert.throws(() => contextToOpenAIMessages({
+    messages: [{
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input }],
+    }],
+  }), JsonSafetyError)
 })

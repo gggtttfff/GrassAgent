@@ -28,6 +28,7 @@ import {
   type SlashCommand,
   type TUI,
 } from '@earendil-works/pi-tui'
+import { JsonSafetyError, stringifyJson } from './jsonSafety.ts'
 import { NonInteractiveTerminal, canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import { SessionPicker, type SessionChoice } from './sessionPicker.ts'
 import type { UserReply } from './askUser.ts'
@@ -43,6 +44,15 @@ import {
 
 // 输入框上下留白
 const EDITOR_PADDING_X = 1
+
+function formatToolArgs(args: unknown): string {
+  try {
+    return stringifyJson(args)
+  } catch (error) {
+    if (error instanceof JsonSafetyError) return '[参数嵌套过深]'
+    return String(args)
+  }
+}
 
 export class Tui {
   private readonly tui: TUI
@@ -222,7 +232,7 @@ export class Tui {
   printToolCall(name: string, args: unknown): void {
     // 工具调用和工具结果不在同一个流式块里,先把流式块收尾
     this.finishTurn()
-    const line = new Text(`${toolName(name)} ${mutedText(JSON.stringify(args))}`, EDITOR_PADDING_X, 0)
+    const line = new Text(`${toolName(name)} ${mutedText(formatToolArgs(args))}`, EDITOR_PADDING_X, 0)
     this.transcript.addChild(line)
     this.tui.requestRender()
   }

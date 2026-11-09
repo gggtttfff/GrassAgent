@@ -18,9 +18,12 @@ config.ts  pathGuard.ts
 logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
 hookConfig.ts → hooks.ts
+projectInstructions.ts → pathGuard.ts
+sessionBundle.ts → messages.ts
+jsonSafety.ts
 ```
 
-`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。
+`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
 
 `theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
@@ -127,6 +130,16 @@ hookConfig.ts → hooks.ts
 
 **37. `ask_user` 的回答是 tool_result，不能再开一轮用户消息。** 它必须 `sequential: true`，独占输入。非交互模式下，回合进行中到达的整行要先入队，而且要在处理当前行的第一个 `await` 之前就占住输入——晚了的话管道里已经缓冲的下一行会冲进编辑器，回车被丢掉。EOF 时正在等的提问必须立刻结束，否则回合不收尾，进程也不退。
 
+**38. 导入的会话包只当数据。** 不执行包里的文本，不写钩子，不把 API Key 放进包。`tool_call` / `tool_result` 配不上对就整段拒绝，否则下次请求 400。同 ID 默认跳过，只有 `--replace` 才覆盖。
+
+**39. 识别其他工具的规则失败不能挡住启动。** 单个文件读失败、JSON 坏了、软链越界，都跳过并记日志。远程 URL 不抓取。工作区外的路径不读。`node_modules` 和 `.git` 不扫。
+
+**40. 提示词和按文件生效的规则不要整篇塞进系统提示词。** 只有「始终生效」的规则进系统提示词，单文件 12000 字、合计 24000 字封顶。其余列成索引，让模型用 `read_file` 按需读。提示词没被点名、也和描述对不上时不要执行。
+
+**41. 导出会话前先 sync，导入覆盖当前会话后立刻 load。** 不 sync，最后一轮还在内存里，带走的是旧对话。导入之后再拿旧的 `context.messages` 去 sync，会对账失败，把刚导进来的内容盖掉。
+
+**42. 不可信 JSON 先量深度再解析。** `JSON.parse` 能吃下几万层嵌套，但之后的 `JSON.stringify`（落盘、导出、压缩、发给模型）是递归的，大约几千层就会把调用栈打穿。文本和对象都在固定栈上检查，超过 256 层直接拒绝，字符串里的括号不算。规则发现和坏的会话行仍然跳过；会话包、钩子文件把原因交给用户。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -145,6 +158,9 @@ hookConfig.ts → hooks.ts
 - 命令钩子用 shell 执行。命令来自用户自己的配置文件，不是模型输出；模型给的参数只走 stdin 的 JSON
 - 界面上先打印的 tool_call 仍是模型原始参数。钩子改写成功时，写进历史的是实际执行的那份
 - Stop 钩子默认最多把一个回合拉回 5 次
+- 按文件生效的规则不会在读到匹配文件时自动注入，只在系统提示词里留索引
+- 不读用户主目录里的全局规则，也不抓取 opencode 配置里的远程 URL
+- 会话包是明文 JSON，对话里如果曾经出现过密钥，导出时不会再扫一遍剔掉
 
 ## 测试
 
@@ -166,7 +182,9 @@ hookConfig.ts → hooks.ts
 
 ## 斜杠命令
 
-`/clear`、`/new`、`/sessions`、`/resume` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+`/clear`、`/new`、`/sessions`、`/resume`、`/export`、`/import`、`/instructions` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+
+`/export` 把会话收成 `grassagent-bundle` JSON。默认写到工作区 `.grass/grassagent-bundle.json`，这个文件已在 `.gitignore` 里。`/import` 默认同 ID 跳过，`--replace` 覆盖。`/instructions` 只列出路径和生效方式，不把提示词再打印一遍。
 
 `/resume` 不带参数时弹会话选择器（`SelectList` + overlay），回车切换、Esc 取消。非交互模式没键盘，改成列出所有会话 ID 让人自己挑。
 

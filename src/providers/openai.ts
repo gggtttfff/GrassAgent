@@ -6,6 +6,7 @@
 // tool_call 的参数是分片增量拼接的 partial JSON,只能在流结束时统一解析。
 // 解析中途执行会拿到半个 JSON。
 
+import { parseJson, stringifyJson } from '../jsonSafety.ts'
 import type { Context } from '../messages.ts'
 import {
   type Model,
@@ -60,7 +61,7 @@ export function contextToOpenAIMessages(context: Context): object[] {
           toolCalls.push({
             id: block.id,
             type: 'function',
-            function: { name: block.name, arguments: JSON.stringify(block.input) },
+            function: { name: block.name, arguments: stringifyJson(block.input) },
           })
         }
       }
@@ -100,7 +101,7 @@ function handleSSELine(
 ): { textDelta: string | null; stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | null } {
   let chunk: OpenAIChunk
   try {
-    chunk = JSON.parse(data) as OpenAIChunk
+    chunk = parseJson(data) as OpenAIChunk
   } catch {
     return { textDelta: null, stopReason: null }
   }
@@ -150,7 +151,9 @@ function flushToolCalls(
     let argsInvalid = false
     if (toolCall.argsBuf) {
       try {
-        args = JSON.parse(toolCall.argsBuf)
+        // 语法错误和嵌套过深都标成无效,不要把对象留下来。
+        // 留下来的话,保存会话和发给模型时 JSON.stringify 会递归爆栈。
+        args = parseJson(toolCall.argsBuf)
       } catch {
         argsInvalid = true
       }
@@ -175,11 +178,6 @@ export const openAIProvider: Provider = {
 
   async *stream(model: Model, context: Context, options: StreamOptions): AsyncGenerator<StreamEvent> {
     const url = `${model.baseUrl ?? 'https://api.openai.com/v1'}/chat/completions`
-    const messages = contextToOpenAIMessages(context)
-
-    const body: Record<string, unknown> = { model: model.model, stream: true, messages }
-    if (model.maxTokens) body.max_tokens = model.maxTokens
-    if (options.tools?.length) body.tools = toolDefinitionsToOpenAI(options.tools)
 
     // 传输层负责超时/重试/并发,provider 层只关心拿到响应流
     const transport = options.transport ?? createTransport({
@@ -191,9 +189,13 @@ export const openAIProvider: Provider = {
       logger: options.logger,
     })
 
-    // 发请求
+    // 发请求。消息转换也放在这里:参数嵌套过深时要变成这一回合的错误,而不是把生成器打崩。
     let response: Response
     try {
+      const messages = contextToOpenAIMessages(context)
+      const body: Record<string, unknown> = { model: model.model, stream: true, messages }
+      if (model.maxTokens) body.max_tokens = model.maxTokens
+      if (options.tools?.length) body.tools = toolDefinitionsToOpenAI(options.tools)
       response = await transport.request(
         url,
         {

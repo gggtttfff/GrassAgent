@@ -427,3 +427,13 @@ test('第二次压缩会把上一次的摘要一起总结进去', async () => {
     await stopMockServer(mock.server)
   }
 })
+
+test('估算 token 时遇到嵌套过深的工具参数不会爆栈', () => {
+  let input: unknown = { ok: true }
+  for (let index = 0; index < 300; index++) input = { nested: input }
+  const message: Message = {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input }],
+  }
+  assert.equal(Number.isFinite(estimateMessageTokens(message)), true)
+})

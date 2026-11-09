@@ -146,3 +146,41 @@ export function normalizeMessage(value: unknown): Message | undefined {
     }),
   }
 }
+
+function toolUseIds(message: Message): string[] {
+  if (!Array.isArray(message.content)) return []
+  return message.content.filter((block) => block.type === 'tool_use').map((block) => block.id)
+}
+
+function toolResultIds(message: Message): string[] {
+  if (!Array.isArray(message.content)) return []
+  return message.content
+    .filter((block) => block.type === 'tool_result')
+    .map((block) => block.tool_use_id)
+}
+
+/**
+ * 每个 tool_use 都要有配对的 tool_result,中间不能插入别的消息。
+ * 配不上对的会话发回 API 会 400,导入这种会话等于把坏数据写进库。
+ */
+export function messagesArePaired(messages: Message[]): boolean {
+  const pending = new Set<string>()
+  for (const message of messages) {
+    const uses = toolUseIds(message)
+    const results = toolResultIds(message)
+    // 同一条消息里又发起又回收,配对关系说不清
+    if (uses.length > 0 && results.length > 0) return false
+    for (const id of results) {
+      if (!pending.has(id)) return false
+      pending.delete(id)
+    }
+    // 还有没回收的工具调用时,普通文本会把配对劈开
+    if (uses.length === 0 && results.length === 0 && pending.size > 0) return false
+    if (uses.length > 0 && pending.size > 0) return false
+    for (const id of uses) {
+      if (pending.has(id)) return false
+      pending.add(id)
+    }
+  }
+  return pending.size === 0
+}

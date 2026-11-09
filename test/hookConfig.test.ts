@@ -83,6 +83,21 @@ test('不支持的钩子类型会被拒绝', async () => {
   })
 })
 
+test('嵌套过深的钩子文件在解析前拒绝', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'grass-hook-config-'))
+  const filePath = join(directory, 'hooks.json')
+  await writeFile(filePath, '['.repeat(400) + ']'.repeat(400))
+  try {
+    await assert.rejects(loadHooksFile(filePath, { optional: false }), (error: unknown) => {
+      assert.ok(error instanceof HookConfigError)
+      assert.match((error as Error).message, /嵌套/)
+      return true
+    })
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('async 字段会被拒绝', async () => {
   await withFile({
     SessionStart: [{ hooks: [{ type: 'command', command: 'node x.mjs', async: true }] }],
