@@ -14,6 +14,7 @@
 
 import { createInterface } from 'node:readline'
 import { stripTerminalSequences, type ProgramStatus, type Terminal } from '@earendil-works/pi-tui'
+import { LineQueue } from './lineQueue.ts'
 
 // 终端尺寸。非 TTY 时拿不到真实值,给个默认值让渲染逻辑能算宽度。
 const DEFAULT_COLUMNS = 80
@@ -25,6 +26,9 @@ export class NonInteractiveTerminal implements Terminal {
   private stopped = false
   // 末尾不完整的 ANSI 序列,留到下次 write 一起处理
   private pendingSequence = ''
+  // 回合进行中为 true：整行入队，不送进已经关掉提交的编辑器
+  private holdLines = false
+  private readonly lineQueue = new LineQueue()
 
   /**
    * stdin 读完(EOF)时的回调。
@@ -36,6 +40,26 @@ export class NonInteractiveTerminal implements Terminal {
    * 由上层决定什么时候退:回合结束、确实没活了再退。
    */
   onInputClosed?: () => void
+
+  /**
+   * 回合开始时占住后续输入。
+   *
+   * 必须在处理当前行的第一个 await 之前打开。
+   * 晚了的话，管道里已经缓冲好的下一行会在让出事件循环时冲进编辑器。
+   */
+  setHoldLines(hold: boolean): void {
+    this.holdLines = hold
+  }
+
+  /** 取出已经入队的一行。没有就返回 undefined，不等待。 */
+  shiftLine(): string | undefined {
+    return this.lineQueue.shift()
+  }
+
+  /** 取一行回答。队列空着就等到下一行、输入结束或 abort。 */
+  takeLine(signal?: AbortSignal): Promise<string | null> {
+    return this.lineQueue.take(signal)
+  }
 
   get columns(): number {
     return process.stdout.columns ?? DEFAULT_COLUMNS
@@ -105,6 +129,11 @@ export class NonInteractiveTerminal implements Terminal {
     this.lineReader = createInterface({ input: process.stdin, terminal: false })
     this.lineReader.on('line', (line) => {
       if (this.stopped) return
+      // 回合进行中编辑器不接受提交。整行先留住，交给 ask_user 或下一轮输入。
+      if (this.holdLines) {
+        this.lineQueue.push(line)
+        return
+      }
       // 编辑器把输入当按键序列处理,不是当整行文本。
       // 一次发一整行的话,Editor 的 decodePrintableKey 只能取到第一个字符。
       // 所以逐字符发,回车单独发——回车是提交键,不能混在文本里。
@@ -124,6 +153,8 @@ export class NonInteractiveTerminal implements Terminal {
   stop(): void {
     if (this.stopped) return
     this.stopped = true
+    // 输入结束了还在等回答的话，必须立刻放开，否则回合不结束，进程也不退
+    this.lineQueue.close()
     // 把残留的半个序列也清掉,不能留在输出里
     if (this.pendingSequence) {
       process.stdout.write(stripTerminalSequences(this.pendingSequence))

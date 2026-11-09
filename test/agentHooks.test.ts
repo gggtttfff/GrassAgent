@@ -330,11 +330,13 @@ test('PreCompact 拒绝时不压缩', async () => {
       },
     ], { sessionId: 's', cwd: process.cwd(), defaultTimeoutMs: 1000 })
     const messages: Message[] = []
-    for (let index = 0; index < 6; index++) messages.push({ role: 'user', content: `旧消息 ${index}` })
+    for (let index = 0; index < 6; index++) {
+      messages.push({ role: 'user', content: `旧消息 ${index} ${'内容'.repeat(20)}` })
+    }
     const context: Context = { messages }
     const events = await collect(runAgent(modelAt(mock.port), context, [], undefined, {
       hooks,
-      compaction: { threshold: 4, keepRecent: 1 },
+      compaction: { contextWindow: 40, reserveTokens: 24, keepRecentTokens: 8 },
     }))
     assert.equal(compactChecks, 1)
     assert.equal(context.compaction, undefined)

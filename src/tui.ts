@@ -30,6 +30,7 @@ import {
 } from '@earendil-works/pi-tui'
 import { NonInteractiveTerminal, canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import { SessionPicker, type SessionChoice } from './sessionPicker.ts'
+import type { UserReply } from './askUser.ts'
 import {
   accentText,
   editorTheme,
@@ -46,6 +47,7 @@ const EDITOR_PADDING_X = 1
 export class Tui {
   private readonly tui: TUI
   private readonly editor: Editor
+  private readonly terminal: ProcessTerminal | NonInteractiveTerminal
   private readonly transcript = new Container()
 
   private onAbortCb: (() => void) | null = null
@@ -65,14 +67,14 @@ export class Tui {
     // 交互式终端用 ProcessTerminal(接管原始模式,按键响应快);
     // 非交互环境(管道、CI)用逐行模式,不然"你好\n" 会被当成一串按键。
     const interactive = canUseInteractiveTerminal()
-    const terminal = interactive ? new ProcessTerminal() : new NonInteractiveTerminal()
-    this.tui = new TuiMainScreen(terminal)
+    this.terminal = interactive ? new ProcessTerminal() : new NonInteractiveTerminal()
+    this.tui = new TuiMainScreen(this.terminal)
     this.editor = new Editor(this.tui, editorTheme, { paddingX: EDITOR_PADDING_X })
 
     // 非交互模式:stdin 读完了,但回合可能还在跑。
     // 把信号交给上层,由上层决定什么时候退。
-    if (terminal instanceof NonInteractiveTerminal) {
-      terminal.onInputClosed = () => this.onInputClosedCb?.()
+    if (this.terminal instanceof NonInteractiveTerminal) {
+      this.terminal.onInputClosed = () => this.onInputClosedCb?.()
     }
 
     this.tui.addChild(this.transcript)
@@ -272,7 +274,100 @@ export class Tui {
       const trimmed = text.trim()
       if (!trimmed) return
       this.editor.addToHistory(trimmed)
+      // 先占住后续行，再把当前行交给上层。
+      // 上层马上会 await，管道里已经缓冲的下一行会在那之前到达。
+      this.holdIncomingLines()
       handler(trimmed)
     }
+  }
+
+  /**
+   * 向用户提一个问题，并等一次回答。
+   *
+   * 交互模式临时打开输入框，但保持 busy——这时 Ctrl+C 仍是打断回合，不是退出进程。
+   * 这次提交只作为回答返回，不会再走 bindSubmit，否则会嵌进一个新回合。
+   * 非交互模式从行队列里取。输入已经结束就告诉调用方没有用户。
+   */
+  ask(question: string, signal?: AbortSignal): Promise<UserReply> {
+    this.finishTurn()
+    this.transcript.addChild(new Text(accentText(`? ${question}`), EDITOR_PADDING_X, 0))
+    this.tui.requestRender()
+
+    if (signal?.aborted) return Promise.resolve({ status: 'aborted' })
+
+    if (this.terminal instanceof NonInteractiveTerminal) {
+      return this.askFromLineQueue(this.terminal, signal)
+    }
+    return this.askFromEditor(signal)
+  }
+
+  /**
+   * 取出回合进行中到达的下一行非空输入。
+   * 没有的话放开占线，之后的行重新走编辑器。
+   */
+  takeNextHeldLine(): string | undefined {
+    if (!(this.terminal instanceof NonInteractiveTerminal)) return undefined
+    while (true) {
+      const line = this.terminal.shiftLine()
+      if (line === undefined) {
+        this.terminal.setHoldLines(false)
+        return undefined
+      }
+      const trimmed = line.trim()
+      if (trimmed) return trimmed
+    }
+  }
+
+  private holdIncomingLines(): void {
+    if (this.terminal instanceof NonInteractiveTerminal) {
+      this.terminal.setHoldLines(true)
+    }
+  }
+
+  private async askFromLineQueue(
+    terminal: NonInteractiveTerminal,
+    signal?: AbortSignal,
+  ): Promise<UserReply> {
+    while (true) {
+      if (signal?.aborted) return { status: 'aborted' }
+      const line = await terminal.takeLine(signal)
+      if (signal?.aborted) return { status: 'aborted' }
+      if (line === null) return { status: 'unavailable' }
+      const trimmed = line.trim()
+      // 空行和普通提交一样忽略，继续等一句真的回答
+      if (trimmed) return { status: 'answered', answer: trimmed }
+    }
+  }
+
+  private askFromEditor(signal?: AbortSignal): Promise<UserReply> {
+    const previousSubmit = this.editor.onSubmit
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (reply: UserReply): void => {
+        if (settled) return
+        settled = true
+        signal?.removeEventListener('abort', onAbort)
+        this.editor.onSubmit = previousSubmit
+        // 回合还没结束，输入框继续锁着，避免回答之后立刻又提交出一轮
+        this.editor.disableSubmit = true
+        resolve(reply)
+      }
+      const onAbort = (): void => finish({ status: 'aborted' })
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) {
+          finish({ status: 'aborted' })
+          return
+        }
+      }
+      this.editor.onSubmit = (text) => {
+        const trimmed = text.trim()
+        if (!trimmed) return
+        this.editor.addToHistory(trimmed)
+        finish({ status: 'answered', answer: trimmed })
+      }
+      this.editor.disableSubmit = false
+      this.tui.requestRender()
+    })
   }
 }

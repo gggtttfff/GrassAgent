@@ -229,6 +229,120 @@ test('UserPromptSubmit 可以拦住输入,退出时会跑 SessionEnd', async () 
   }
 })
 
+test('模型提问时，下一行是回答，不会另开一轮', async () => {
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      requests.push(Buffer.concat(chunks).toString('utf-8'))
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      if (requests.length === 1) {
+        response.end(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
+            'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      response.end(
+        'data: {"choices":[{"delta":{"content":"已按你的选择继续"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    // 空行要被跳过，真正的回答才回给模型
+    const { exitCode, output } = await runCliWithInput('帮我选\n\n用 typescript\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('? 用哪种语言'), `应显示问题,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('已按你的选择继续'), `回答之后应继续回合,实际: ${output.slice(-400)}`)
+    assert.equal(requests.length, 2, `回答不该再开一轮用户消息,实际请求数 ${requests.length}`)
+    const followUp = JSON.parse(requests[1]) as {
+      messages: Array<{ role: string; content?: string | null }>
+    }
+    const toolMessage = followUp.messages.find((message) => message.role === 'tool')
+    assert.equal(toolMessage?.content, '用 typescript')
+    const userMessages = followUp.messages.filter((message) => message.role === 'user')
+    assert.equal(userMessages.length, 1)
+    assert.equal(userMessages[0].content, '帮我选')
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
+test('没有人回答时回合仍能结束并退出', async () => {
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    request.on('data', () => {})
+    request.on('end', () => {
+      requests.push('hit')
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      if (requests.length === 1) {
+        response.end(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
+            'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      response.end(
+        'data: {"choices":[{"delta":{"content":"按现有信息继续"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('帮我选\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `没人回答也不能挂死,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('按现有信息继续'), `模型应在无回答后继续,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('用户无法回答提问'), '无用户可答时要记日志')
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
+test('管道里的下一行在本轮结束后继续，而不是被丢掉', async () => {
+  let requests = 0
+  const server = createServer((request, response) => {
+    request.on('data', () => {})
+    request.on('end', () => {
+      requests += 1
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      response.end(
+        'data: {"choices":[{"delta":{"content":"回复完毕"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('第一句\n第二句\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `应跑完两轮再退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.equal(requests, 2, '第二行应再开一轮')
+    assert.equal(output.split('回复完毕').length - 1, 2)
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
 test('普通输入照常发给模型', async () => {
   const mock = await startMockServer()
   try {
