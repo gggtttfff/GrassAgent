@@ -17,7 +17,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import * as path from 'node:path'
 import { mkdirSync } from 'node:fs'
-import { normalizeMessage, type Message } from './messages.ts'
+import { messagesArePaired, normalizeMessage, type Message } from './messages.ts'
 
 // 抑制 node:sqlite 的实验性警告,详见下方函数的说明。
 suppressSqliteWarning()
@@ -144,9 +144,106 @@ export class SessionStore {
    * 读取当前会话的历史消息,按 seq 升序。
    */
   load(): Message[] {
+    const messages = this.readMessages(this.currentSessionId)
+    this.persistedCount = messages.length
+    this.persistedContents = messages.map((message) => JSON.stringify(message))
+    return messages
+  }
+
+  /**
+   * 读出一个会话的完整快照,不切换当前会话。
+   * 导出时用它,避免为了打包把用户正在看的会话切走。
+   */
+  readSession(sessionId: string): SessionSnapshot | undefined {
+    if (this.closed) throw new Error('会话存储已关闭')
+    const row = this.database
+      .prepare(
+        'SELECT id, created_at AS createdAt, updated_at AS updatedAt FROM sessions WHERE id = ?',
+      )
+      .get(sessionId) as { id: string; createdAt: number; updatedAt: number } | undefined
+    if (!row) return undefined
+    return {
+      id: row.id,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      messages: this.readMessages(sessionId),
+    }
+  }
+
+  /** 全部会话的快照,按更新时间倒序。导出整库时用。 */
+  listSnapshots(): SessionSnapshot[] {
+    if (this.closed) throw new Error('会话存储已关闭')
+    return this.listSessions().flatMap((sessionId) => {
+      const snapshot = this.readSession(sessionId)
+      return snapshot ? [snapshot] : []
+    })
+  }
+
+  /**
+   * 把一份外部会话写进库。
+   *
+   * merge:同 id 已存在就跳过,不覆盖这台机器上还在用的对话。
+   * replace:同 id 覆盖消息。created_at 保留更早的那个,导入不会把旧会话刷到列表最前。
+   * 配不上对的消息拒绝写入,否则下次请求会 400。
+   */
+  importSession(session: SessionSnapshot, mode: 'merge' | 'replace'): 'imported' | 'replaced' | 'skipped' {
+    if (this.closed) throw new Error('会话存储已关闭')
+    if (!messagesArePaired(session.messages)) {
+      throw new Error(`会话 ${session.id} 的 tool_call 和 tool_result 配不上对`)
+    }
+
+    const existing = this.database
+      .prepare('SELECT created_at AS createdAt FROM sessions WHERE id = ?')
+      .get(session.id) as { createdAt: number } | undefined
+    if (existing && mode === 'merge') return 'skipped'
+
+    const createdAt = existing ? Math.min(existing.createdAt, session.createdAt) : session.createdAt
+    const insertSession = this.database.prepare(
+      'INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?) ' +
+        'ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at, updated_at = excluded.updated_at',
+    )
+    const clear = this.database.prepare('DELETE FROM messages WHERE session_id = ?')
+    const insertMessage = this.database.prepare(
+      'INSERT INTO messages (session_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?)',
+    )
+
+    this.database.exec('BEGIN')
+    try {
+      insertSession.run(session.id, createdAt, session.updatedAt)
+      clear.run(session.id)
+      let sequence = 0
+      for (const message of session.messages) {
+        insertMessage.run(
+          session.id,
+          sequence,
+          message.role,
+          JSON.stringify(message),
+          session.updatedAt,
+        )
+        sequence++
+      }
+      this.database.exec('COMMIT')
+    } catch (error) {
+      this.database.exec('ROLLBACK')
+      throw error
+    }
+
+    // 覆盖的是当前会话时,内存里的「已落盘内容」已经过时。
+    // 标成刚写入的内容。调用方若还拿旧列表 sync,会对不上并走替换;
+    // 正确做法是立刻 load,让内存和库一致。
+    if (session.id === this.currentSessionId) {
+      this.persistedCount = session.messages.length
+      this.persistedContents = session.messages.map((message) => JSON.stringify(message))
+    }
+
+    return existing ? 'replaced' : 'imported'
+  }
+
+  // 按 seq 读消息。坏行跳过,不丢整个会话——和以前 load 的容错一样。
+  private readMessages(sessionId: string): Message[] {
     const rows = this.database
       .prepare('SELECT content FROM messages WHERE session_id = ? ORDER BY seq ASC')
-      .all(this.currentSessionId) as Array<{ content: string }>
+      .all(sessionId) as Array<{ content: string }>
 
     const messages: Message[] = []
     for (const row of rows) {
@@ -157,9 +254,6 @@ export class SessionStore {
         // 坏行跳过,不丢整个会话
       }
     }
-
-    this.persistedCount = messages.length
-    this.persistedContents = messages.map((message) => JSON.stringify(message))
     return messages
   }
 
@@ -365,6 +459,17 @@ export class SessionStore {
       messageCount: row.messageCount,
     }))
   }
+}
+
+/**
+ * 一个会话的可携带快照。
+ * 文件包里的字段和这里一致,存储层不认识文件格式。
+ */
+export interface SessionSnapshot {
+  id: string
+  createdAt: number
+  updatedAt: number
+  messages: Message[]
 }
 
 /** 一个会话的概要信息 */

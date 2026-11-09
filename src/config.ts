@@ -115,6 +115,10 @@ export const configSchema = z.object({
   HookTimeoutMs: numericOption({
     minimum: 100, maximum: 600_000, defaultValue: 10_000, label: 'HookTimeoutMs',
   }),
+
+  // 启动时是否识别项目里 opencode、cursor、claude、kiro 的规则和提示词。
+  // 关掉之后系统提示词里只有 Grass 自己的那一段。
+  LoadProjectInstructions: booleanOption(true, 'LoadProjectInstructions'),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
@@ -159,6 +163,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   CompactKeepRecentTokens: `${ENV_PREFIX}COMPACT_KEEP_RECENT_TOKENS`,
   HooksPath: `${ENV_PREFIX}HOOKS_PATH`,
   HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
+  LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

@@ -318,6 +318,54 @@ test('消息内容里的换行和特殊字符能正确存储', () => {
   }
 })
 
+test('导入默认不覆盖已有会话,replace 才会换掉', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 'keep' })
+  try {
+    store.sync([userMessage('本地')])
+    const incoming = {
+      id: 'keep',
+      createdAt: 10,
+      updatedAt: 20,
+      messages: [userMessage('外来')],
+    }
+    assert.equal(store.importSession(incoming, 'merge'), 'skipped')
+    assert.equal(store.load()[0].content, '本地')
+
+    assert.equal(store.importSession(incoming, 'replace'), 'replaced')
+    assert.equal(store.load()[0].content, '外来')
+
+    assert.equal(store.importSession({
+      id: 'other',
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [userMessage('另一段')],
+    }, 'merge'), 'imported')
+    assert.equal(store.readSession('other')?.messages[0].content, '另一段')
+    // 读别的会话不能把当前会话切走
+    assert.equal(store.sessionId, 'keep')
+  } finally {
+    store.close()
+  }
+})
+
+test('配不上对的会话拒绝写入', () => {
+  const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
+  try {
+    assert.throws(() => store.importSession({
+      id: 'broken',
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [{
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input: {} }],
+      }],
+    }, 'merge'), /配不上对/)
+    assert.equal(store.readSession('broken'), undefined)
+  } finally {
+    store.close()
+  }
+})
+
 test('工具调用消息能完整存储', () => {
   const store = new SessionStore({ databasePath: ':memory:', sessionId: 's1' })
   try {

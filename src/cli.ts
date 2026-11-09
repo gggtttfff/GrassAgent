@@ -17,6 +17,22 @@ import { buildSessionChoices } from './sessionPicker.ts'
 import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import { appendHookContext, createHookRunner, type HookRunner } from './hooks.ts'
 import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './hookConfig.ts'
+import {
+  appendProjectInstructions,
+  discoverProjectInstructions,
+  formatInstructionReport,
+  summarizeInstructions,
+} from './projectInstructions.ts'
+import {
+  BundleError,
+  defaultBundlePath,
+  parseExportArgument,
+  parseImportArgument,
+  readBundleFile,
+  resolveBundlePath,
+  writeBundleFile,
+} from './sessionBundle.ts'
+import { messagesArePaired } from './messages.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
@@ -68,9 +84,29 @@ async function main() {
   })
   logger.info({ sessionId, databasePath: config.SessionDatabasePath }, '会话存储已打开')
 
-  // 初始化 context：system prompt 用专用字段，messages 从会话库加载
+  // 初始化 context：system prompt 用专用字段，messages 从会话库加载。
+  // 项目里其他工具的规则接着拼在后面。识别失败不挡启动,否则一个坏文件会让整个程序起不来。
+  let instructionReport = '项目规则识别已关闭'
+  let instructionNotice = ''
+  let systemPrompt = SYSTEM_PROMPT
+  if (config.LoadProjectInstructions) {
+    try {
+      const catalog = await discoverProjectInstructions(config.Workspace, {
+        warn: (object, message) => logger.warn(object, message),
+        info: (object, message) => logger.info(object, message),
+      })
+      systemPrompt = appendProjectInstructions(SYSTEM_PROMPT, catalog.promptSection)
+      instructionReport = formatInstructionReport(catalog.instructions)
+      if (catalog.instructions.length > 0) instructionNotice = summarizeInstructions(catalog.instructions)
+    } catch (error) {
+      instructionReport = '识别项目规则失败,本次不加载外部规则'
+      instructionNotice = instructionReport
+      logger.error({ errorMessage: (error as Error).message }, '识别项目规则失败,继续启动')
+    }
+  }
+
   const context: Context = {
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt,
     messages: sessionStore.load(),
   }
 
@@ -247,6 +283,86 @@ async function main() {
     },
   })
 
+  commandRegistry.register({
+    name: 'export',
+    description: '把会话导出成可带走的文件',
+    argumentHint: '[路径] [--session 会话ID]',
+    execute: async (argument) => {
+      const parsed = parseExportArgument(argument)
+      if (parsed.error) return parsed.error
+      // 先落盘,否则最后一轮还在内存里,带走的是旧对话
+      await sessionStore.sync(context.messages)
+      const filePath = parsed.filePath
+        ? resolveBundlePath(parsed.filePath, config.Workspace)
+        : defaultBundlePath(config.Workspace)
+      if (path.resolve(filePath) === path.resolve(config.SessionDatabasePath)) {
+        return '不能把导出发到会话数据库上,换一个路径'
+      }
+      const snapshots = parsed.sessionId
+        ? [sessionStore.readSession(parsed.sessionId)].flatMap((snapshot) => snapshot ? [snapshot] : [])
+        : sessionStore.listSnapshots()
+      if (parsed.sessionId && snapshots.length === 0) return `找不到会话 ${parsed.sessionId}`
+      const unpaired = snapshots.filter((snapshot) => !messagesArePaired(snapshot.messages))
+      try {
+        await writeBundleFile(filePath, snapshots)
+      } catch (error) {
+        if (error instanceof BundleError) return `导出失败:${error.message}`
+        throw error
+      }
+      logger.info({ filePath, sessionCount: snapshots.length }, '会话已导出')
+      const warning = unpaired.length > 0
+        ? `\n有 ${unpaired.length} 个会话的 tool_call 配不上对,文件已写出,但导回时会被拒绝`
+        : ''
+      return `已导出 ${snapshots.length} 个会话到 ${filePath}${warning}`
+    },
+  })
+
+  commandRegistry.register({
+    name: 'import',
+    description: '从文件导回会话',
+    argumentHint: '<路径> [--replace]',
+    execute: async (argument) => {
+      const parsed = parseImportArgument(argument)
+      if (parsed.error || !parsed.filePath) return parsed.error ?? 'import 需要文件路径'
+      await sessionStore.sync(context.messages)
+      const filePath = resolveBundlePath(parsed.filePath, config.Workspace)
+      let sessions
+      try {
+        sessions = await readBundleFile(filePath)
+      } catch (error) {
+        if (error instanceof BundleError) return `导入失败:${error.message}`
+        throw error
+      }
+      const mode = parsed.replace ? 'replace' : 'merge'
+      let imported = 0
+      let replaced = 0
+      let skipped = 0
+      let currentTouched = false
+      for (const session of sessions) {
+        const outcome = sessionStore.importSession(session, mode)
+        if (outcome === 'imported') imported++
+        else if (outcome === 'replaced') replaced++
+        else skipped++
+        if (session.id === sessionStore.sessionId && outcome !== 'skipped') currentTouched = true
+      }
+      // 覆盖了当前会话就必须从库里重新载入。
+      // 再拿旧的 context.messages 去 sync,会把刚导进来的内容盖掉。
+      if (currentTouched) {
+        context.messages = sessionStore.load()
+        context.compaction = undefined
+        tui.clearTranscript()
+      }
+      logger.info({ filePath, imported, replaced, skipped, mode }, '会话已导入')
+      return `导入完成:新增 ${imported},覆盖 ${replaced},跳过 ${skipped}`
+    },
+  })
+
+  commandRegistry.register({
+    name: 'instructions',
+    description: '列出识别到的规则和提示词',
+    execute: () => instructionReport,
+  })
+
   // 切换会话:存盘当前会话,切过去,载入目标会话的历史
   const switchToSession = async (targetSessionId: string): Promise<string> => {
     if (targetSessionId === sessionStore.sessionId) return '已经在该会话中'
@@ -357,6 +473,7 @@ async function main() {
   })
 
   tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。')
+  if (instructionNotice) tui.printNotice(instructionNotice)
   for (const message of sessionNotices) tui.printNotice(message)
   tui.start()
 

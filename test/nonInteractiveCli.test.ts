@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -340,6 +340,88 @@ test('管道里的下一行在本轮结束后继续，而不是被丢掉', async
       server.closeAllConnections()
       server.close(() => resolve())
     })
+  }
+})
+
+test('会话可以导出再导进另一个库', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-port-'))
+  const mock = await startMockServer()
+  try {
+    const exported = await runCliWithInput('/export pack.json\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'source.db'),
+      GRASSAGENT_SESSION_ID: 'come-and-go',
+      GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS: '0',
+    })
+    assert.equal(exported.exitCode, 0, exported.output.slice(-400))
+    assert.ok(exported.output.includes('已导出'), exported.output.slice(-400))
+    const bundle = JSON.parse(await readFile(path.join(directory, 'pack.json'), 'utf8')) as {
+      sessions: Array<{ id: string }>
+    }
+    assert.equal(bundle.sessions[0]?.id, 'come-and-go')
+
+    const imported = await runCliWithInput('/import pack.json\n/sessions\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'target.db'),
+      GRASSAGENT_SESSION_ID: 'stay-here',
+      GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS: '0',
+    })
+    assert.equal(imported.exitCode, 0, imported.output.slice(-500))
+    assert.ok(imported.output.includes('新增 1'), imported.output.slice(-500))
+    assert.ok(imported.output.includes('come-and-go'), imported.output.slice(-500))
+    assert.ok(!imported.output.includes('回复'), '导入导出不该发给模型')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('始终生效的项目规则会发给模型,提示词不会', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-rules-cli-'))
+  await writeFile(path.join(directory, 'AGENTS.md'), 'UNIQUE_RULE 先写测试')
+  await mkdir(path.join(directory, '.opencode', 'commands'), { recursive: true })
+  await writeFile(path.join(directory, '.opencode', 'commands', 'test.md'), 'UNIQUE_PROMPT 跑全部测试')
+
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      requests.push(Buffer.concat(chunks).toString('utf8'))
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      response.end(
+        'data: {"choices":[{"delta":{"content":"看过了"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('/instructions\n看一下\n', {
+      ...mockEnvironment(port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('AGENTS.md'), output.slice(-500))
+    assert.ok(output.includes('/test'), output.slice(-500))
+    assert.equal(requests.length, 1)
+    const body = JSON.parse(requests[0] ?? '{}') as {
+      messages: Array<{ role: string; content?: string }>
+    }
+    const system = body.messages.find((message) => message.role === 'system')?.content ?? ''
+    assert.ok(system.includes('UNIQUE_RULE 先写测试'), '始终生效的规则要进系统提示词')
+    assert.equal(system.includes('UNIQUE_PROMPT 跑全部测试'), false)
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+    await rm(directory, { recursive: true, force: true })
   }
 })
 
