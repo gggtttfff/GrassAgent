@@ -20,9 +20,10 @@ sessionStore.ts
 hookConfig.ts → hooks.ts
 projectInstructions.ts → pathGuard.ts
 sessionBundle.ts → messages.ts
+jsonSafety.ts
 ```
 
-`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。
+`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
 
 `theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
@@ -136,6 +137,8 @@ sessionBundle.ts → messages.ts
 **40. 提示词和按文件生效的规则不要整篇塞进系统提示词。** 只有「始终生效」的规则进系统提示词，单文件 12000 字、合计 24000 字封顶。其余列成索引，让模型用 `read_file` 按需读。提示词没被点名、也和描述对不上时不要执行。
 
 **41. 导出会话前先 sync，导入覆盖当前会话后立刻 load。** 不 sync，最后一轮还在内存里，带走的是旧对话。导入之后再拿旧的 `context.messages` 去 sync，会对账失败，把刚导进来的内容盖掉。
+
+**42. 不可信 JSON 先量深度再解析。** `JSON.parse` 能吃下几万层嵌套，但之后的 `JSON.stringify`（落盘、导出、压缩、发给模型）是递归的，大约几千层就会把调用栈打穿。文本和对象都在固定栈上检查，超过 256 层直接拒绝，字符串里的括号不算。规则发现和坏的会话行仍然跳过；会话包、钩子文件把原因交给用户。
 
 ## 已知取舍
 

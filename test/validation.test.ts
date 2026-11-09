@@ -139,6 +139,14 @@ test('数组元素的多余字段被拒绝', () => {
   }
 })
 
+test('嵌套过深的参数在拷贝和校验前拒绝', () => {
+  let value: unknown = { ok: true }
+  for (let index = 0; index < 300; index++) value = { nested: value }
+  const result = validateToolArguments({ type: 'object' }, value, 'read_file')
+  assert.equal(result.ok, false)
+  if (!result.ok) assert.match(result.error, /嵌套过深/)
+})
+
 test('数组元素缺字段时报错路径指到具体元素', () => {
   const result = validateToolArguments(arraySchema, { path: 'a.ts', edits: [{ old_string: 'x' }] }, 'test_tool')
   assert.equal(result.ok, false)

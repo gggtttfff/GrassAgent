@@ -8,6 +8,7 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import { z } from 'zod'
+import { JsonSafetyError, parseJson } from './jsonSafety.ts'
 import { HOOK_EVENTS, type HookDefinition, type HookEventName } from './hooks.ts'
 
 export class HookConfigError extends Error {
@@ -74,8 +75,10 @@ export async function loadHooksFile(filePath: string, options: { optional: boole
 
   let parsed: unknown
   try {
-    parsed = JSON.parse(content)
+    // 超深的文件能解析成功,但后面的校验和序列化会递归爆栈。先量深度。
+    parsed = parseJson(content)
   } catch (error) {
+    if (error instanceof JsonSafetyError) throw new HookConfigError(`${filePath} ${error.message}`)
     throw new HookConfigError(`${filePath} 不是合法 JSON: ${(error as Error).message}`)
   }
 

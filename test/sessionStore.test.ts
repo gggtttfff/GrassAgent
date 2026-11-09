@@ -1,8 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
 import * as path from 'node:path'
 import * as os from 'node:os'
+import { JsonSafetyError } from '../src/jsonSafety.ts'
 import { SessionStore, generateSessionId } from '../src/sessionStore.ts'
 import type { Message } from '../src/messages.ts'
 
@@ -392,5 +394,41 @@ test('工具调用消息能完整存储', () => {
     assert.equal(resultBlocks[0].type, 'tool_result')
   } finally {
     store.close()
+  }
+})
+
+test('嵌套过深的消息拒绝写入,库里已有的深行读的时候跳过', () => {
+  const databasePath = createDatabasePath()
+  const store = new SessionStore({ databasePath, sessionId: 's1' })
+  try {
+    store.sync([userMessage('还在')])
+    let content: unknown = '叶子'
+    for (let index = 0; index < 300; index++) content = { nested: content }
+    assert.throws(() => store.importSession({
+      id: 'deep',
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [{ role: 'user', content: content as string }],
+    }, 'merge'), JsonSafetyError)
+    assert.equal(store.readSession('deep'), undefined)
+    assert.equal(store.load()[0].content, '还在')
+  } finally {
+    store.close()
+  }
+
+  const database = new DatabaseSync(databasePath)
+  const deepRow = `{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"read_file","input":${'{"nested":'.repeat(300)}{"ok":true}${'}'.repeat(300)}}]}`
+  database.prepare(
+    'INSERT INTO messages (session_id, seq, role, content, created_at) VALUES (?, ?, ?, ?, ?)',
+  ).run('s1', 1, 'assistant', deepRow, Date.now())
+  database.close()
+
+  const reopened = new SessionStore({ databasePath, sessionId: 's1' })
+  try {
+    const loaded = reopened.load()
+    assert.equal(loaded.length, 1)
+    assert.equal(loaded[0].content, '还在')
+  } finally {
+    reopened.close()
   }
 })

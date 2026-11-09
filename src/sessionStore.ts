@@ -17,6 +17,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import * as path from 'node:path'
 import { mkdirSync } from 'node:fs'
+import { parseJson, stringifyJson } from './jsonSafety.ts'
 import { messagesArePaired, normalizeMessage, type Message } from './messages.ts'
 
 // 抑制 node:sqlite 的实验性警告,详见下方函数的说明。
@@ -146,7 +147,7 @@ export class SessionStore {
   load(): Message[] {
     const messages = this.readMessages(this.currentSessionId)
     this.persistedCount = messages.length
-    this.persistedContents = messages.map((message) => JSON.stringify(message))
+    this.persistedContents = messages.map((message) => stringifyJson(message))
     return messages
   }
 
@@ -217,7 +218,7 @@ export class SessionStore {
           session.id,
           sequence,
           message.role,
-          JSON.stringify(message),
+          stringifyJson(message),
           session.updatedAt,
         )
         sequence++
@@ -233,7 +234,7 @@ export class SessionStore {
     // 正确做法是立刻 load,让内存和库一致。
     if (session.id === this.currentSessionId) {
       this.persistedCount = session.messages.length
-      this.persistedContents = session.messages.map((message) => JSON.stringify(message))
+      this.persistedContents = session.messages.map((message) => stringifyJson(message))
     }
 
     return existing ? 'replaced' : 'imported'
@@ -248,10 +249,11 @@ export class SessionStore {
     const messages: Message[] = []
     for (const row of rows) {
       try {
-        const normalized = normalizeMessage(JSON.parse(row.content) as unknown)
+        const normalized = normalizeMessage(parseJson(row.content))
         if (normalized) messages.push(normalized)
       } catch {
-        // 坏行跳过,不丢整个会话
+        // 坏行、以及嵌套深到无法再序列化的行,都跳过。
+        // 留下来的话,下一次保存或发给模型时 JSON.stringify 会把栈打穿。
       }
     }
     return messages
@@ -299,7 +301,7 @@ export class SessionStore {
           this.currentSessionId,
           seq,
           message.role,
-          JSON.stringify(message),
+          stringifyJson(message),
           now,
         )
         seq++
@@ -313,7 +315,7 @@ export class SessionStore {
 
     this.persistedCount = messages.length
     for (const message of newMessages) {
-      this.persistedContents.push(JSON.stringify(message))
+      this.persistedContents.push(stringifyJson(message))
     }
     return newMessages.length
   }
@@ -328,7 +330,7 @@ export class SessionStore {
     // 比已存的还短:历史被砍短了(/clear)
     if (messages.length < this.persistedCount) return true
     for (let index = 0; index < this.persistedCount; index++) {
-      if (JSON.stringify(messages[index]) !== this.persistedContents[index]) {
+      if (stringifyJson(messages[index]) !== this.persistedContents[index]) {
         return true
       }
     }
@@ -358,7 +360,7 @@ export class SessionStore {
           this.currentSessionId,
           seq,
           message.role,
-          JSON.stringify(message),
+          stringifyJson(message),
           now,
         )
         seq++
@@ -371,7 +373,7 @@ export class SessionStore {
     }
 
     this.persistedCount = messages.length
-    this.persistedContents = messages.map((message) => JSON.stringify(message))
+    this.persistedContents = messages.map((message) => stringifyJson(message))
     return messages.length
   }
 

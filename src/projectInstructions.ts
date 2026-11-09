@@ -10,6 +10,7 @@ import { promises as fs } from 'node:fs'
 import { glob } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { JsonSafetyError, parseJson } from './jsonSafety.ts'
 import { createPathGuard, type PathGuard } from './pathGuard.ts'
 
 export type InstructionTool = 'opencode' | 'cursor' | 'claude' | 'kiro'
@@ -363,9 +364,12 @@ async function collectKiroAgentJson(
     if (text === undefined) return
     let parsed: unknown
     try {
-      parsed = JSON.parse(text)
+      parsed = parseJson(text)
     } catch (error) {
-      logger.warn({ path: filePath, errorMessage: errorMessage(error) }, 'Kiro 代理配置不是合法 JSON,已跳过')
+      logger.warn(
+        { path: filePath, errorMessage: errorMessage(error) },
+        error instanceof JsonSafetyError ? `${error.message},已跳过` : 'Kiro 代理配置不是合法 JSON,已跳过',
+      )
       return
     }
     if (!parsed || typeof parsed !== 'object') return
@@ -417,9 +421,13 @@ async function readOpenCodeConfig(
 ): Promise<void> {
   let parsed: unknown
   try {
-    parsed = JSON.parse(stripJsonComments(text))
+    // 先去掉注释再量深度。注释里的括号不能算进嵌套,否则一份正常配置会被误伤。
+    parsed = parseJson(stripJsonComments(text))
   } catch (error) {
-    logger.warn({ path: filePath, errorMessage: errorMessage(error) }, 'OpenCode 配置不是合法 JSON,已跳过')
+    logger.warn(
+      { path: filePath, errorMessage: errorMessage(error) },
+      error instanceof JsonSafetyError ? `${error.message},已跳过` : 'OpenCode 配置不是合法 JSON,已跳过',
+    )
     return
   }
   if (!parsed || typeof parsed !== 'object') return

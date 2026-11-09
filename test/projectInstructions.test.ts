@@ -221,6 +221,36 @@ test('单文件过长或合计过长时只留索引', async () => {
   }
 })
 
+test('注释里的括号不算深度,真正嵌套过深的配置只记日志', async () => {
+  const workspace = await makeWorkspace()
+  const log = captureLog()
+  try {
+    await fs.writeFile(path.join(workspace, 'AGENTS.md'), '根规则还在。')
+    await fs.writeFile(path.join(workspace, 'opencode.jsonc'), [
+      `/* ${'{'.repeat(400)} */`,
+      '{ "command": { "keep": { "description": "留下", "template": "注释里的括号不算" } } }',
+    ].join('\n'))
+    await fs.writeFile(
+      path.join(workspace, 'opencode.json'),
+      `{"instructions":${'['.repeat(400)}"AGENTS.md"${']'.repeat(400)}}`,
+    )
+    await fs.mkdir(path.join(workspace, '.kiro', 'agents'), { recursive: true })
+    await fs.writeFile(
+      path.join(workspace, '.kiro', 'agents', 'deep.json'),
+      '['.repeat(400) + '1' + ']'.repeat(400),
+    )
+
+    const catalog = await discoverProjectInstructions(workspace, log)
+    assert.match(catalog.promptSection, /根规则还在/)
+    const kept = catalog.instructions.find((item) => item.title === '/keep')
+    assert.equal(kept?.relativePath, 'opencode.jsonc')
+    assert.equal(log.warnings.some((warning) => warning.includes('嵌套')), true)
+    assert.equal(catalog.instructions.some((item) => item.relativePath.endsWith('deep.json')), false)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('空目录不会编出一段规则', async () => {
   const workspace = await makeWorkspace()
   try {

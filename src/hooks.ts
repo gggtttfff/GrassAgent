@@ -17,6 +17,7 @@
 // 脚本崩了不该把整个会话卡死。只有它明确拒绝(退出码 2 或 decision=block)才拦截。
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { JsonSafetyError, parseJson, stringifyJson } from './jsonSafety.ts'
 import type { Logger } from './logger.ts'
 
 /** 当前回合里真实存在的时机。没有子代理、权限弹窗这些还没做的事件。 */
@@ -383,6 +384,13 @@ async function runCommandHook(
   const timeoutMs = hook.timeoutMs ?? options.defaultTimeoutMs
   const command = hook.command
   if (!command) return { error: '钩子没有命令' }
+  let payload: string
+  try {
+    payload = stringifyJson(input)
+  } catch (error) {
+    if (error instanceof JsonSafetyError) return { error: error.message }
+    throw error
+  }
 
   let child: ChildProcess
   try {
@@ -416,7 +424,7 @@ async function runCommandHook(
 
   // 命令提前退出时 stdin 会 EPIPE。这不是钩子失败,吞掉即可。
   child.stdin?.on('error', () => {})
-  child.stdin?.write(JSON.stringify(input) + '\n')
+  child.stdin?.write(payload + '\n')
   child.stdin?.end()
 
   let timedOut = false
@@ -471,8 +479,9 @@ function parseCommandStdout(stdout: string, event: HookEventName): HookOutcome {
 
   let parsed: unknown
   try {
-    parsed = JSON.parse(trimmed)
+    parsed = parseJson(trimmed)
   } catch (error) {
+    if (error instanceof JsonSafetyError) return { error: error.message }
     return { error: `钩子输出不是合法 JSON: ${(error as Error).message}` }
   }
   const output = parseHookOutput(parsed, event)

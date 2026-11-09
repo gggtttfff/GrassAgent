@@ -129,3 +129,28 @@ test('相对路径锚定工作区,~ 展开到主目录', () => {
   assert.equal(resolveBundlePath('~/pack.json', workspace), path.join(os.homedir(), 'pack.json'))
   assert.equal(defaultBundlePath(workspace), path.join(workspace, '.grass', 'grassagent-bundle.json'))
 })
+
+test('嵌套过深的会话包在解析前拒绝,深对象也不会拿去序列化', () => {
+  const hostile = `{"format":"${BUNDLE_FORMAT}","version":1,"exportedAt":"2025-07-18T00:00:00.000Z","sessions":${'['.repeat(300)}${']'.repeat(300)}}`
+  assert.throws(() => parseBundle(hostile), (error: unknown) => {
+    assert.ok(error instanceof BundleError)
+    assert.match((error as Error).message, /嵌套/)
+    return true
+  })
+
+  let input: unknown = { ok: true }
+  for (let index = 0; index < 300; index++) input = { nested: input }
+  assert.throws(() => serializeBundle([{
+    id: 'deep',
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [{
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input }],
+    }],
+  }]), (error: unknown) => {
+    assert.ok(error instanceof BundleError)
+    assert.match((error as Error).message, /拒绝序列化/)
+    return true
+  })
+})

@@ -8,6 +8,7 @@
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { assertJsonValue, JsonSafetyError, parseJson } from './jsonSafety.ts'
 import { messagesArePaired, normalizeMessage, type Message } from './messages.ts'
 import type { SessionSnapshot } from './sessionStore.ts'
 
@@ -113,6 +114,16 @@ export function parseImportArgument(argument: string): {
 }
 
 export function serializeBundle(sessions: readonly SessionSnapshot[], exportedAt = new Date().toISOString()): string {
+  for (const session of sessions) {
+    for (const message of session.messages) {
+      try {
+        assertJsonValue(message)
+      } catch (error) {
+        if (error instanceof JsonSafetyError) throw new BundleError(`会话 ${session.id} ${error.message}`)
+        throw error
+      }
+    }
+  }
   const bundle = {
     format: BUNDLE_FORMAT,
     version: BUNDLE_VERSION,
@@ -124,14 +135,19 @@ export function serializeBundle(sessions: readonly SessionSnapshot[], exportedAt
       messages: session.messages,
     })),
   }
-  return `${JSON.stringify(bundle, null, 2)}\n`
+  try {
+    return `${JSON.stringify(bundle, null, 2)}\n`
+  } catch (error) {
+    throw new BundleError(`会话包无法序列化:${(error as Error).message}`)
+  }
 }
 
 export function parseBundle(text: string): PortableSession[] {
   let parsed: unknown
   try {
-    parsed = JSON.parse(text)
-  } catch {
+    parsed = parseJson(text)
+  } catch (error) {
+    if (error instanceof JsonSafetyError) throw new BundleError(error.message)
     throw new BundleError('文件不是合法 JSON')
   }
   if (!parsed || typeof parsed !== 'object') throw new BundleError('文件内容不是对象')
