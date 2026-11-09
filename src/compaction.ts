@@ -137,6 +137,21 @@ export function buildModelContext(
  * 压缩失败时不动任何消息——
  * 宁可多发点上下文,也不能用空摘要把会话毁掉。
  */
+/**
+ * 这一轮会不会真的去压缩。
+ *
+ * PreCompact 钩子只在「确实要压缩」时才跑。每轮都跑的话,
+ * 用户写来拦截压缩的命令会在普通回合里空转。
+ */
+export function compactionPending(context: Context, compactionOptions: CompactionOptions): boolean {
+  const summarizedCount = context.compaction?.summarizedCount ?? 0
+  const liveCount = context.messages.length - summarizedCount
+  if (liveCount < compactionOptions.threshold) return false
+  const targetBoundary = context.messages.length - compactionOptions.keepRecent
+  const boundary = findSafeBoundary(context.messages, targetBoundary)
+  return boundary > summarizedCount
+}
+
 export async function compactContext(
   model: Model,
   context: Context,

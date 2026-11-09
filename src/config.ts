@@ -101,6 +101,16 @@ export const configSchema = z.object({
   CompactKeepRecent: numericOption({
     minimum: 1, maximum: 5_000, defaultValue: 20, label: 'CompactKeepRecent',
   }),
+
+  // 钩子配置文件。留空则用工作区下的 .grass/hooks.json,文件不存在就等于没配钩子。
+  HooksPath: z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: 'HooksPath 不能为空' }).optional(),
+  ),
+  // 命令钩子的默认超时。单个钩子可以在 JSON 里用 timeoutMs 覆盖。
+  HookTimeoutMs: numericOption({
+    minimum: 100, maximum: 600_000, defaultValue: 10_000, label: 'HookTimeoutMs',
+  }),
 }).check(z.refine(
   (config) => config.CompactKeepRecent < config.CompactThreshold,
   {
@@ -142,6 +152,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   ToolExecution: `${ENV_PREFIX}TOOL_EXECUTION`,
   CompactThreshold: `${ENV_PREFIX}COMPACT_THRESHOLD`,
   CompactKeepRecent: `${ENV_PREFIX}COMPACT_KEEP_RECENT`,
+  HooksPath: `${ENV_PREFIX}HOOKS_PATH`,
+  HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

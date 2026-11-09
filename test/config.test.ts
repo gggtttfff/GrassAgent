@@ -173,6 +173,23 @@ test('loadConfig 能从环境变量加载完整配置', async () => {
   assert.equal(config.Workspace, '/tmp/ws')
 })
 
+test('钩子超时有默认值,空路径视为没配', () => {
+  const config = validateConfig({ ApiKey: 'k', HooksPath: '' })
+  assert.equal(config.HookTimeoutMs, 10_000)
+  assert.equal(config.HooksPath, undefined)
+})
+
+test('钩子超时不是整数时被拒绝', () => {
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', HookTimeoutMs: '10.5' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_HOOK_TIMEOUT_MS')))
+      return true
+    },
+  )
+})
+
 test('loadConfig 缺 API Key 时抛 ConfigError', async () => {
   await assert.rejects(
     loadConfig({

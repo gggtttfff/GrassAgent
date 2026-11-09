@@ -14,6 +14,8 @@ import { SessionStore, generateSessionId } from './sessionStore.ts'
 import { SlashCommandRegistry } from './slashCommands.ts'
 import { buildSessionChoices } from './sessionPicker.ts'
 import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
+import { appendHookContext, createHookRunner, type HookRunner } from './hooks.ts'
+import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './hookConfig.ts'
 import type { Model, Context } from './llm.ts'
 
 /** 固定 system prompt */
@@ -73,16 +75,69 @@ async function main() {
     workspace: config.Workspace,
     commandTimeoutMs: config.CommandTimeoutMs,
   })
+
+  // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
+  const hooksPath = config.HooksPath ?? defaultHooksFilePath(config.Workspace)
+  let hookRunner: HookRunner
+  try {
+    const definitions = await loadHooksFile(hooksPath, { optional: config.HooksPath === undefined })
+    hookRunner = createHookRunner(definitions, {
+      sessionId,
+      cwd: config.Workspace,
+      defaultTimeoutMs: config.HookTimeoutMs,
+      logger,
+    })
+    if (definitions.length > 0) {
+      logger.info({ hooksPath, hookCount: definitions.length }, '钩子已加载')
+    }
+  } catch (error) {
+    if (error instanceof HookConfigError) {
+      console.error(`[grassagent] ${error.message}`)
+      for (const issue of error.issues) console.error(issue)
+      sessionStore.close()
+      process.exit(1)
+    }
+    throw error
+  }
+
+  const sessionStart = await hookRunner.run({ event: 'SessionStart' })
+  if (sessionStart.blocked || sessionStart.preventContinuation) {
+    console.error(`[grassagent] 会话被钩子拒绝: ${sessionStart.reason ?? 'Blocked by hook'}`)
+    for (const message of sessionStart.systemMessages) console.error(`[grassagent] ${message}`)
+    sessionStore.close()
+    process.exit(1)
+  }
+  for (const errorMessage of sessionStart.errors) console.error(`[grassagent] ${errorMessage}`)
+  if (sessionStart.additionalContext) {
+    context.systemPrompt = appendHookContext(context.systemPrompt ?? '', sessionStart.additionalContext)
+  }
+  // 会话真正起来之后,退出时才跑 SessionEnd。启动被拒绝不算一次会话。
+  let sessionStarted = true
+  const sessionNotices = sessionStart.systemMessages
+
   const tui = new Tui()
-  // 进程收尾:停掉 TUI、关掉数据库。
+  // 进程收尾:先跑 SessionEnd,再停掉 TUI、关掉数据库。
   // tui.stop() 必须调——TUI 接管了终端原始模式,
   // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
-  const shutdown = (): void => {
-    // 先把最后一帧渲染出来——渲染是异步调度的,
-    // 不 flush 就退出的话,输出会缺最后一截
+  // process 的 exit 事件里不能 await,所以钩子只走显式退出路径。
+  let cleanedUp = false
+  const cleanupSync = (): void => {
+    if (cleanedUp) return
+    cleanedUp = true
     tui.flush()
     tui.stop()
     sessionStore.close()
+  }
+  const shutdown = async (): Promise<void> => {
+    if (sessionStarted) {
+      sessionStarted = false
+      try {
+        await hookRunner.run({ event: 'SessionEnd' })
+      } catch (error) {
+        logger.error({ errorMessage: (error as Error).message }, 'SessionEnd 钩子失败')
+      }
+    }
+    cleanupSync()
   }
 
   // 回合是否在跑。非交互模式(管道输入)下,stdin 读完了不代表能退出——
@@ -94,9 +149,13 @@ async function main() {
     inputClosed = true
     // 空闲时(没有回合在跑)直接退
     if (!roundRunning) {
-      shutdown()
-      process.exit(0)
+      void shutdown().finally(() => process.exit(0))
     }
+  })
+
+  // 空闲时的 Ctrl+C 也走同一条收尾,SessionEnd 才有机会跑。
+  tui.onExit(() => {
+    void shutdown().finally(() => process.exit(0))
   })
 
   // ---- 斜杠命令 ----
@@ -208,12 +267,26 @@ async function main() {
     }
 
     roundRunning = true
+    tui.setBusy(true)
+    const ctrl = new AbortController()
+    tui.onAbort(() => ctrl.abort())
     try {
-      context.messages.push({ role: 'user', content: text })
+      const promptEffect = await hookRunner.run({ event: 'UserPromptSubmit', prompt: text }, ctrl.signal)
+      for (const message of promptEffect.systemMessages) tui.printNotice(message)
+      for (const errorMessage of promptEffect.errors) tui.printError(errorMessage)
+      if (promptEffect.aborted || ctrl.signal.aborted) {
+        tui.printNotice('[已打断]')
+        return
+      }
+      if (promptEffect.blocked || promptEffect.preventContinuation) {
+        tui.printNotice(promptEffect.reason ?? '已被钩子拦截')
+        return
+      }
 
-      tui.setBusy(true)
-      const ctrl = new AbortController()
-      tui.onAbort(() => ctrl.abort())
+      context.messages.push({
+        role: 'user',
+        content: appendHookContext(text, promptEffect.additionalContext),
+      })
 
       for await (const ev of runAgent(model, context, tools, ctrl.signal, {
         transport,
@@ -223,11 +296,16 @@ async function main() {
           threshold: config.CompactThreshold,
           keepRecent: config.CompactKeepRecent,
         },
+        hooks: hookRunner,
       })) {
         switch (ev.type) {
           case 'assistant_text': tui.printText(ev.delta); break
           case 'tool_call': tui.printToolCall(ev.name, ev.args); break
           case 'tool_result': tui.printToolResult(ev.name, ev.result); break
+          case 'hook_notice':
+            if (ev.level === 'error') tui.printError(ev.message)
+            else tui.printNotice(ev.message)
+            break
           case 'turn_end':
             // 收尾:把流式文本换成排好版的 markdown
             tui.finishTurn()
@@ -247,21 +325,21 @@ async function main() {
       tui.setBusy(false)
       // 输入已经读完且回合跑完了,这才是能退的时候
       if (inputClosed) {
-        shutdown()
+        await shutdown()
         process.exit(0)
       }
     }
   })
 
   tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。')
+  for (const message of sessionNotices) tui.printNotice(message)
   tui.start()
 
-  process.once('exit', shutdown)
+  process.once('exit', cleanupSync)
   process.once('SIGINT', () => {
     // TUI 在 raw 模式下自己拦 Ctrl+C,能走到这里说明不是打断当前回合,
     // 是用户想退出进程。
-    shutdown()
-    process.exit(130)
+    void shutdown().finally(() => process.exit(130))
   })
 }
 

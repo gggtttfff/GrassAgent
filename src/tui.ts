@@ -51,6 +51,8 @@ export class Tui {
   private onAbortCb: (() => void) | null = null
   // 非交互模式下 stdin 读完的回调
   private onInputClosedCb: (() => void) | null = null
+  // 空闲时 Ctrl+C 退出。交给 cli,这样退出前还能跑 SessionEnd 钩子。
+  private onExitCb: (() => void) | null = null
 
   // 当前回合的流式文本组件。流式结束后用它换成 Markdown 组件。
   private streamingText: Text | null = null
@@ -88,6 +90,8 @@ export class Tui {
         if (!matchesKey(data, 'ctrl+c')) return undefined
         if (this.busy) {
           this.onAbortCb?.()
+        } else if (this.onExitCb) {
+          this.onExitCb()
         } else {
           this.stop()
           process.exit(0)
@@ -126,6 +130,11 @@ export class Tui {
   /** 注册 Ctrl+C 打断回调 */
   onAbort(cb: () => void): void {
     this.onAbortCb = cb
+  }
+
+  /** 注册空闲时退出回调。不注册则保持原来的直接退出。 */
+  onExit(cb: () => void): void {
+    this.onExitCb = cb
   }
 
   /**
