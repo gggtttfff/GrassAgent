@@ -155,6 +155,9 @@ export const configSchema = z.object({
   }),
   SandboxNetworkAllowlist: z.string().default(''),
   SandboxKeep: booleanOption(false, 'SandboxKeep'),
+  // 控制面的调用方凭据。创建和挂回沙盒要带上它。
+  // 控制面暴露到网络时必须配,不然谁都能创建沙盒、挂回别人的沙盒。
+  SandboxControlToken: optionalText('SandboxControlToken'),
 
   // SSH 后端。控制面通过 SSH 连到远程主机,起一个 daemon 并开隧道转发调用。
   // 主机、用户、端口描述的是远程开发机,不是控制面自己。
@@ -181,13 +184,20 @@ export const configSchema = z.object({
     message: 'CompactKeepRecentTokens 与 CompactReserveTokens 之和必须小于 ContextWindow,否则压缩腾不出空间',
   },
 )).check(z.refine(
-  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxControlUrl),
+  // SSH 后端可以在本进程里起控制面,不一定要独立部署的控制面地址。
+  (config) => config.ExecutionWorld !== 'remote'
+    || config.SandboxBackend === 'ssh'
+    || Boolean(config.SandboxControlUrl),
   {
     path: ['SandboxControlUrl'],
     message: '远程执行世界必须配置控制面地址',
   },
 )).check(z.refine(
-  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxId) || Boolean(config.SandboxImage),
+  // SSH 后端不用镜像:它把 daemon 源码传到远程跑。
+  (config) => config.ExecutionWorld !== 'remote'
+    || config.SandboxBackend === 'ssh'
+    || Boolean(config.SandboxId)
+    || Boolean(config.SandboxImage),
   {
     path: ['SandboxImage'],
     message: '远程执行世界必须配置镜像,或提供已有的 SandboxId 挂回',
@@ -255,6 +265,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxDiskMb: `${ENV_PREFIX}SANDBOX_DISK_MB`,
   SandboxNetworkAllowlist: `${ENV_PREFIX}SANDBOX_NETWORK_ALLOWLIST`,
   SandboxKeep: `${ENV_PREFIX}SANDBOX_KEEP`,
+  SandboxControlToken: `${ENV_PREFIX}SANDBOX_CONTROL_TOKEN`,
   SandboxBackend: `${ENV_PREFIX}SANDBOX_BACKEND`,
   SandboxSshHost: `${ENV_PREFIX}SANDBOX_SSH_HOST`,
   SandboxSshUser: `${ENV_PREFIX}SANDBOX_SSH_USER`,

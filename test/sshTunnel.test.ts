@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { connect } from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { Writable } from 'node:stream'
@@ -10,7 +12,7 @@ import {
   createHostVerifier,
   keyFingerprint,
   loadKnownHosts,
-  parseHttpResponse,
+  openSshTunnel,
 } from '../src/sandbox/sshTunnel.ts'
 import { resolveSshConfig, expandHome } from '../src/sandbox/sshConfig.ts'
 import { createLogger } from '../src/logger.ts'
@@ -110,25 +112,6 @@ test('首次连接接受主机并记下指纹,指纹变了拒绝', async () => {
   }
 })
 
-test('HTTP 响应解析拆出状态、头和体', () => {
-  const raw = [
-    'HTTP/1.1 200 OK',
-    'content-type: application/json',
-    'content-length: 13',
-    '',
-    '{"ok":true,"v":1}',
-  ].join('\r\n')
-  const parsed = parseHttpResponse(raw)
-  assert.equal(parsed.status, 200)
-  assert.equal(parsed.headers['content-type'], 'application/json')
-  assert.equal(parsed.body, '{"ok":true,"v":1}')
-})
-
-test('HTTP 响应残缺时不当成成功', () => {
-  const parsed = parseHttpResponse('garbage')
-  assert.equal(parsed.status, 502)
-})
-
 // ---- 真 SSH 服务 ----
 
 type TestHost = {
@@ -158,8 +141,11 @@ function publicSshBlob(publicKey: string): Buffer {
  */
 async function startSshServer(options: {
   onExec?: (command: string) => string
+  /** 隧道要转到的目标端口。给了就实现 tcpip 转发。 */
+  tcpipTargetPort?: number
 } = {}): Promise<TestHost> {
   const hostKeyPair = utils.generateKeyPairSync('ed25519')
+  const sockets: Array<{ destroy: () => void }> = []
   const server = new Server({ hostKeys: [hostKeyPair.private] }, (client) => {
     // 客户端拒绝主机密钥时会发 DISCONNECT,服务端这边会抛。
     // 不挂监听器的话它会变成未处理异常,把测试进程带崩。
@@ -172,6 +158,20 @@ async function startSshServer(options: {
       ctx.reject()
     })
     client.on('ready', () => {
+      // 隧道的 forwardOut 在这边是 tcpip 请求。接到目标端口上,双向直通。
+      client.on('tcpip', (acceptTcpip, rejectTcpip, info) => {
+        const targetPort = options.tcpipTargetPort ?? info.destPort
+        const channel = acceptTcpip()
+        const socket = connect(targetPort, info.destIP)
+        const track = (): void => { sockets.push(socket) }
+        socket.on('connect', () => {
+          track()
+          socket.pipe(channel).pipe(socket)
+        })
+        socket.on('error', () => channel.destroy())
+        channel.on('close', () => socket.destroy())
+        channel.on('error', () => socket.destroy())
+      })
       client.on('session', (acceptSession) => {
         const session = acceptSession()
         session.on('exec', (acceptExec, _reject, info) => {
@@ -192,7 +192,10 @@ async function startSshServer(options: {
     port: address.port,
     hostKey: publicSshBlob(hostKeyPair.public),
     close: () => new Promise<void>((resolve) => {
+      // 连接还在时 close 不回调,先掐掉。
+      for (const socket of sockets) socket.destroy()
       server.close(() => resolve())
+      setTimeout(resolve, 2000).unref?.()
     }),
   }
 }
@@ -285,4 +288,71 @@ test('SSH 客户端的连接配置能带上主机校验', () => {
   assert.equal(typeof verifier, 'function')
   // 换成未知的钥匙会被拒
   assert.equal(verifier(Buffer.from('unknown')), true)
+})
+
+test('隧道把 HTTP 原样送到远端,不解析不改写', { timeout: 30_000 }, async () => {
+  // 远端:一个只会回固定 JSON 的 HTTP 服务
+  const remoteServer = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        ok: true,
+        gotPath: request.url,
+        gotMethod: request.method,
+        gotAuth: request.headers.authorization ?? '',
+        gotBody: Buffer.concat(chunks).toString('utf-8'),
+      }))
+    })
+  })
+  await new Promise<void>((resolve) => remoteServer.listen(0, '127.0.0.1', () => resolve()))
+  const remotePort = (remoteServer.address() as { port: number }).port
+
+  const host = await startSshServer({ tcpipTargetPort: remotePort })
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-tunnel-'))
+  try {
+    const keyPath = path.join(directory, 'id_ed25519')
+    await writeFile(keyPath, utils.generateKeyPairSync('ed25519').private, {
+      encoding: 'utf-8',
+      mode: 0o600,
+    })
+    const config = resolveSshConfig({
+      host: '127.0.0.1',
+      port: host.port,
+      username: 'dev',
+      privateKeyPath: keyPath,
+      knownHostsPath: path.join(directory, 'known_hosts'),
+    })
+    const client = await connectSsh(config, { logger: silentLogger })
+    const tunnel = await openSshTunnel(client, {
+      dstHost: '127.0.0.1',
+      dstPort: remotePort,
+      logger: silentLogger,
+    })
+
+    const response = await fetch(`http://127.0.0.1:${tunnel.localPort}/call`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer tunnel-token',
+      },
+      body: JSON.stringify({ version: 1, kind: 'health' }),
+    })
+    const body = await response.json() as Record<string, unknown>
+
+    // 路径、方法、头、体都要原样到达——隧道不该动内容
+    assert.equal(response.status, 200)
+    assert.equal(body.gotPath, '/call')
+    assert.equal(body.gotMethod, 'POST')
+    assert.equal(body.gotAuth, 'Bearer tunnel-token')
+    assert.equal(body.gotBody, '{"version":1,"kind":"health"}')
+
+    await tunnel.close()
+    client.end()
+  } finally {
+    await new Promise<void>((resolve) => remoteServer.close(() => resolve()))
+    await host.close()
+    await rm(directory, { recursive: true, force: true })
+  }
 })

@@ -140,6 +140,14 @@ jsonSafety.ts
 
 **42. 不可信 JSON 先量深度再解析。** `JSON.parse` 能吃下几万层嵌套，但之后的 `JSON.stringify`（落盘、导出、压缩、发给模型）是递归的，大约几千层就会把调用栈打穿。文本和对象都在固定栈上检查，超过 256 层直接拒绝，字符串里的括号不算。规则发现和坏的会话行仍然跳过；会话包、钩子文件把原因交给用户。
 
+**43. SSH 隧道必须是透明 TCP 转发，不能解析内容。** daemon 说的是 HTTP。中间包一层 JSON 信封再塞进通道，daemon 根本不认识，会一直等到超时。`openSshTunnel` 用 `node:net` 起 TCP 服务，`socket.pipe(channel).pipe(socket)` 直通，让字节原样过去。
+
+**44. 往远程部署走 SFTP，不走 shell 重定向。** `cat > file` 要等通道关闭才收尾，而 ssh2 的服务端 Session 通道在 `CHANNEL_CLOSE` 时不推 EOF（`lib/utils.js` 里 `channel.server && constructor.name === 'Session'` 直接 return），靠它会永远挂着。目录用 SFTP `mkdir`、文件用 `writeFile`、权限用 `chmod`，语义清楚也不依赖对端 shell 语法。
+
+**45. 控制面的创建和挂回必须校验调用方令牌。** `POST /v1/sandboxes` 和 `/attach` 拿不到沙盒自己的令牌（挂回时还没有沙盒），所以靠 `controlToken` 挡。不挡的话，知道 `sandboxId` 的人就能挂回别人的沙盒——attach 会重新签发沙盒令牌。控制面只监听回环时不配也能用，暴露到网络前必须配。
+
+**46. 远程命令的输出要等 close，不能靠 exit 收尾。** `exit-status` 只带退出码，收到它时 stdout 可能还没到齐；直接用它会拿到空字符串。`runRemote` 用 `exit` 记退出码、`close` 收尾，再加超时兜底。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -157,6 +165,9 @@ jsonSafety.ts
 - 钩子只有命令和进程内函数两种。没有 HTTP / prompt / agent 钩子，也不支持 async
 - 命令钩子用 shell 执行。命令来自用户自己的配置文件，不是模型输出；模型给的参数只走 stdin 的 JSON
 - 界面上先打印的 tool_call 仍是模型原始参数。钩子改写成功时，写进历史的是实际执行的那份
+- SSH 后端不支持挂回（`attach` 返回 null）：远程目录跟着 daemon 一起删了，没有可留下的卷
+- SSH 后端要求远程有 Node 24.3+（daemon 靠 type stripping 直接跑 `.ts`），不给远程装任何第三方依赖
+- SSH 后端的远程工作区路径来自配置，不自动创建。路径不存在时 daemon 起不来
 - Stop 钩子默认最多把一个回合拉回 5 次
 - 按文件生效的规则不会在读到匹配文件时自动注入，只在系统提示词里留索引
 - 不读用户主目录里的全局规则，也不抓取 opencode 配置里的远程 URL

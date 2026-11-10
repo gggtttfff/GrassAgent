@@ -7,7 +7,7 @@ import { validateConfig } from '../src/config.ts'
 import { builtinTools } from '../src/tools.ts'
 import { createInProcessBackend } from '../src/sandbox/inProcessBackend.ts'
 import { createControlPlane, type TimerFn } from '../src/sandbox/control.ts'
-import { listenControl } from '../src/sandbox/controlServer.ts'
+import { listenControl } from '../src/sandbox/controlHttp.ts'
 import { openExecutionWorld, sandboxCreateBody } from '../src/sandbox/openWorld.ts'
 import { createDockerBackend, containerEnvLines, dockerRunArguments } from '../src/sandbox/dockerBackend.ts'
 import { writeSecretFile } from '../src/sandbox/secrets.ts'
@@ -94,6 +94,84 @@ test('协议版本不符时拆掉半成品,凭据引用缺失时不会创建沙�
     )
     assert.equal(provisioned, 0)
   } finally {
+    await rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('控制面配了调用方令牌后,创建和挂回都要校验它', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-auth-'))
+  const plane = createControlPlane({
+    backend: createInProcessBackend({ stateDir }),
+    timer: idleTimer,
+    controlToken: 'caller-token-123456',
+  })
+  try {
+
+    // 令牌不对就创建不了
+    await assert.rejects(
+      () => plane.create({
+        image: 'test-image',
+        ttlMs: 60_000,
+        cpu: 1,
+        memoryMb: 128,
+        diskMb: 1,
+      }, 'wrong-token'),
+      /令牌被拒绝/,
+    )
+
+    // 没带令牌也不行
+    await assert.rejects(
+      () => plane.create({
+        image: 'test-image',
+        ttlMs: 60_000,
+        cpu: 1,
+        memoryMb: 128,
+        diskMb: 1,
+      }),
+      /令牌被拒绝/,
+    )
+
+    // 令牌对了才能创建
+    const handle = await plane.create({
+      image: 'test-image',
+      ttlMs: 60_000,
+      cpu: 1,
+      memoryMb: 128,
+      diskMb: 1,
+    }, 'caller-token-123456')
+    assert.ok(handle.sandboxId)
+
+    // 挂回也要校验。挂回会重新签发沙盒令牌,不能让外人拿到。
+    await assert.rejects(
+      () => plane.attach(handle.sandboxId, 60_000, 'session-1', 'wrong-token'),
+      /令牌被拒绝/,
+    )
+  } finally {
+    // 必须关掉:in-process 后端起了真的 daemon HTTP 服务,不关进程退不出去
+    await plane.close()
+    await rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('控制面没配调用方令牌时不校验,本进程场景不受影响', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-noauth-'))
+  const plane = createControlPlane({
+    backend: createInProcessBackend({ stateDir }),
+    timer: idleTimer,
+  })
+  try {
+    // 不带令牌也能创建——控制面只监听回环,外人连不上
+    const handle = await plane.create({
+      image: 'test-image',
+      ttlMs: 60_000,
+      cpu: 1,
+      memoryMb: 128,
+      diskMb: 1,
+    })
+    assert.ok(handle.sandboxId)
+  } finally {
+    // 必须关掉:in-process 后端起了真的 daemon HTTP 服务,不关进程退不出去
+    await plane.close()
     await rm(stateDir, { recursive: true, force: true })
   }
 })

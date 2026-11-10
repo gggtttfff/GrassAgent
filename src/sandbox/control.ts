@@ -58,10 +58,10 @@ export function defaultIdleTimer(callback: () => void, delayMs: number): TimerHa
 }
 
 export type ControlPlane = {
-  /** 作者：Pieory 创建日期：2025-07-18 */
-  create(input: CreateSandboxInput): Promise<SandboxHandle>
-  /** 作者：Pieory 创建日期：2025-07-18 */
-  attach(sandboxId: string, ttlMs: number, sessionId?: string): Promise<SandboxHandle>
+  /** 创建沙盒。callerToken 是调用方凭据,配了 controlToken 就必须对上。作者：Pieory 创建日期：2025-07-18 */
+  create(input: CreateSandboxInput, callerToken?: string): Promise<SandboxHandle>
+  /** 挂回沙盒。同样要校验调用方凭据。作者：Pieory 创建日期：2025-07-18 */
+  attach(sandboxId: string, ttlMs: number, sessionId?: string, callerToken?: string): Promise<SandboxHandle>
   /** 作者：Pieory 创建日期：2025-07-18 */
   call(sandboxId: string, token: string, call: SandboxCall): Promise<SandboxResult>
   /** 会话结束时停掉容器。keep 为假时连目录一起删。作者：Pieory 创建日期：2025-07-18 */
@@ -73,23 +73,49 @@ export type ControlPlane = {
 /**
  * 作者：Pieory 创建日期：2025-07-18
  */
+/**
+ * 创建控制面。
+ *
+ * controlToken 是调用方的凭据。创建沙盒和挂回沙盒都要带它——
+ * 这两个接口不校验沙盒自己的令牌(挂回时甚至还没有沙盒),
+ * 不挡住的话,知道 sandboxId 的人就能挂回别人的沙盒。
+ *
+ * 没给 controlToken 时不校验,只适合控制面在本进程里、
+ * 外人根本连不上的场景。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
 export function createControlPlane(options: {
   backend: SandboxBackend
   credentialsFile?: string
   timer?: TimerFn
   logger?: Logger
+  /** 调用方凭据。创建和挂回要校验它。 */
+  controlToken?: string
 }): ControlPlane {
   const timer = options.timer ?? defaultIdleTimer
   const live = new Map<string, LiveSandbox>()
   const secrets: string[] = []
 
+  /** 调用方的令牌对不对。配了 controlToken 才校验。 */
+  const callerAllowed = (provided: string): boolean => {
+    if (!options.controlToken) return true
+    return tokenMatches(provided, options.controlToken)
+  }
+
   const plane: ControlPlane = {
-    async create(input) {
+    async create(input, callerToken) {
+      if (!callerAllowed(callerToken ?? '')) {
+        throw new Error('调用方令牌被拒绝')
+      }
       const credential = await rememberSecret(input.credentialRef, options.credentialsFile, secrets)
       const request = provisionRequest(createSandboxId(), createToken(), input, credential)
       return startTracked(options, timer, live, request, input.ttlMs, secrets)
     },
-    async attach(sandboxId, ttlMs, sessionId) {
+    async attach(sandboxId, ttlMs, sessionId, callerToken) {
+      if (!callerAllowed(callerToken ?? '')) {
+        throw new Error('调用方令牌被拒绝')
+      }
       let sandbox: RunningSandbox | null
       try {
         sandbox = await options.backend.attach(sandboxId)

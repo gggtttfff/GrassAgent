@@ -6,7 +6,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { Writable } from 'node:stream'
 import ssh2 from 'ssh2'
-import { shellQuote } from '../src/sandbox/sshDeploy.ts'
+import { shellQuote, pathLevels } from '../src/sandbox/sshDeploy.ts'
 import { connectSsh } from '../src/sandbox/sshTunnel.ts'
 import { resolveSshConfig } from '../src/sandbox/sshConfig.ts'
 import { deployRemoteDaemon } from '../src/sandbox/sshDeploy.ts'
@@ -74,10 +74,14 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
           // 返回假值它会再回一个 OP_UNSUPPORTED。
           sftp.on('MKDIR', (reqid, target) => {
             try {
-              mkdirSync(target, { recursive: true })
+              // 故意不用递归:真实的 SFTP mkdir 不建父目录。
+              // 用 recursive 会把「实现没逐级建目录」的 bug 盖住。
+              mkdirSync(target)
               sftp.status(reqid, 0)
-            } catch {
-              sftp.status(reqid, 4) // 4 = 目录已存在
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code
+              // 4 = 已存在(正常),2 = 父目录不存在(说明实现漏了逐级创建)
+              sftp.status(reqid, code === 'EEXIST' ? 4 : 2)
             }
             return true
           })
@@ -201,6 +205,15 @@ test('shell 引号挡住路径里的空格和单引号', () => {
   assert.equal(shellQuote('/tmp/with space'), `'/tmp/with space'`)
   // 单引号要转义,不然命令会被截断
   assert.equal(shellQuote("/tmp/it's"), `'/tmp/it'\\''s'`)
+})
+
+test('路径拆成逐级前缀,SFTP mkdir 才能从根往下建', () => {
+  assert.deepEqual(
+    pathLevels('/tmp/grass-x/src/sandbox/daemon.ts'),
+    ['/tmp', '/tmp/grass-x', '/tmp/grass-x/src', '/tmp/grass-x/src/sandbox', '/tmp/grass-x/src/sandbox/daemon.ts'],
+  )
+  // 末尾的斜杠和重复斜杠不该产生空段
+  assert.deepEqual(pathLevels('/a//b/'), ['/a', '/a/b'])
 })
 
 test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000 }, async () => {

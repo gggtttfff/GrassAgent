@@ -7,7 +7,7 @@
 // 传的是 daemon 及其依赖的源码,不是整个仓库。远程不装任何第三方依赖:
 // 这套代码只用 Node 内置模块。
 
-import type { Client } from 'ssh2'
+import type { Client, SFTPWrapper } from 'ssh2'
 import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -233,29 +233,66 @@ export function runRemote(
  * 走 SFTP 的 mkdir,不用 shell 的 `mkdir -p`——后者在远程不一定有,
  * 而且参数要过 shell 就有注入面。
  *
+ * SFTP 的 mkdir 不递归,父目录不存在会直接失败。所以从根往下逐级建:
+ * 已经存在的跳过,缺的补上。一个会话里建完整条路径,省得反复握手。
+ *
  * 作者：Pieory 创建日期：2025-07-18
  */
-export function mkdirRemote(
+export async function mkdirRemote(
   client: Client,
   remotePath: string,
   logger?: Logger,
 ): Promise<void> {
+  const sftp = await openSftp(client)
+  try {
+    for (const level of pathLevels(remotePath)) {
+      await sftpMkdir(sftp, level)
+    }
+    logger?.debug({ remotePath }, '远程目录已就绪')
+  } finally {
+    sftp.end()
+  }
+}
+
+/**
+ * 把绝对路径拆成逐级的前缀。
+ *
+ * /a/b/c -> ['/a', '/a/b', '/a/b/c']
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+export function pathLevels(absolutePath: string): string[] {
+  const segments = absolutePath.split('/').filter((segment) => segment.length > 0)
+  const levels: string[] = []
+  let current = ''
+  for (const segment of segments) {
+    current += `/${segment}`
+    levels.push(current)
+  }
+  return levels
+}
+
+function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.mkdir(remotePath, (mkdirError) => {
+      // 已存在是正常情况——逐级建的时候父目录多半已经在了。
+      if (!mkdirError || isAlreadyExists(mkdirError)) {
+        resolve()
+        return
+      }
+      reject(new Error(`远程建目录失败 ${remotePath}: ${mkdirError.message}`))
+    })
+  })
+}
+
+function openSftp(client: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     client.sftp((error, sftp) => {
       if (error) {
         reject(error)
         return
       }
-      sftp.mkdir(remotePath, (mkdirError) => {
-        sftp.end()
-        // 已存在是正常情况——多层路径会重复建同一个父目录。
-        if (mkdirError && !isAlreadyExists(mkdirError)) {
-          reject(new Error(`远程建目录失败 ${remotePath}: ${mkdirError.message}`))
-          return
-        }
-        logger?.debug({ remotePath }, '远程目录已就绪')
-        resolve()
-      })
+      resolve(sftp)
     })
   })
 }

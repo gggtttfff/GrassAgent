@@ -240,3 +240,57 @@ test('loadConfig 缺 API Key 时抛 ConfigError', async () => {
     ConfigError,
   )
 })
+
+test('SSH 后端不需要控制面地址和镜像', () => {
+  // 控制面在本进程里起,镜像也不用——daemon 源码直接传到远程跑
+  const config = validateConfig({
+    ApiKey: 'k',
+    ExecutionWorld: 'remote',
+    SandboxBackend: 'ssh',
+    SandboxSshHost: 'dev.example.com',
+    SandboxSshUser: 'dev',
+  })
+  assert.equal(config.SandboxBackend, 'ssh')
+  assert.equal(config.SandboxSshHost, 'dev.example.com')
+  assert.equal(config.SandboxSshPort, 22)
+})
+
+test('SSH 后端缺主机或用户时被拒绝', () => {
+  assert.throws(
+    () => validateConfig({
+      ApiKey: 'k',
+      ExecutionWorld: 'remote',
+      SandboxBackend: 'ssh',
+      SandboxSshUser: 'dev',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_SANDBOX_SSH_HOST')))
+      return true
+    },
+  )
+  assert.throws(
+    () => validateConfig({
+      ApiKey: 'k',
+      ExecutionWorld: 'remote',
+      SandboxBackend: 'ssh',
+      SandboxSshHost: 'dev.example.com',
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_SANDBOX_SSH_USER')))
+      return true
+    },
+  )
+})
+
+test('docker 后端的远程世界仍然要求控制面地址', () => {
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', ExecutionWorld: 'remote' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_SANDBOX_CONTROL_URL')))
+      return true
+    },
+  )
+})

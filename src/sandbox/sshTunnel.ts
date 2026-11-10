@@ -7,10 +7,10 @@
 // ssh2 是 CommonJS 包。ESM 下只能用默认导入拿具名导出,
 // 否则 "Named export 'Client' not found"。
 import ssh2 from 'ssh2'
-import type { Client as SshClient, ClientChannel, ConnectConfig } from 'ssh2'
+import type { Client as SshClient, ConnectConfig } from 'ssh2'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, type Socket } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import type { Logger } from '../logger.ts'
 import { readPrivateKey, type SshConnectionConfig } from './sshConfig.ts'
@@ -79,10 +79,10 @@ export async function connectSsh(
 }
 
 /**
- * 开一条隧道:本机起 HTTP server,收到的请求转给远程的 dstPort。
+ * 开一条隧道:本机回环上起一个 TCP 服务,连接进来就接到远程的 dstPort。
  *
- * 用 server 而不是直接 forwardOut,是因为控制面现有的调用是 HTTP 请求。
- * 让本机端也变成 HTTP,控制面那一层就不用改。
+ * 做的是透明 TCP 转发,不解析内容。daemon 说的是 HTTP,
+ * 中间再包一层信封它就不认识了——让字节原样过去。
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
@@ -94,9 +94,34 @@ export async function openSshTunnel(
     logger?: Logger
   },
 ): Promise<SshTunnel> {
-  const server = createServer((request, response) => {
-    void forwardRequest(client, request, response, options)
+  const sockets = new Set<Socket>()
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    socket.on('error', () => socket.destroy())
+    client.forwardOut('127.0.0.1', 0, options.dstHost, options.dstPort, (error, channel) => {
+      if (error) {
+        options.logger?.error({
+          errorMessage: error.message,
+          dstPort: options.dstPort,
+        }, 'SSH 隧道打不开通道')
+        socket.destroy()
+        return
+      }
+      // 双向直通。任一端关闭就把另一端也关掉,别留半条连接。
+      socket.pipe(channel).pipe(socket)
+      socket.on('close', () => channel.destroy())
+      channel.on('close', () => socket.destroy())
+      channel.on('error', (channelError: Error) => {
+        options.logger?.error({
+          errorMessage: channelError.message,
+          dstPort: options.dstPort,
+        }, 'SSH 隧道通道出错')
+        socket.destroy()
+      })
+    })
   })
+
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(0, '127.0.0.1', () => resolve())
@@ -105,132 +130,12 @@ export async function openSshTunnel(
   return {
     localPort: address.port,
     close: async () => {
+      for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => {
         server.close(() => resolve())
       })
     },
   }
-}
-
-/**
- * 把一个 HTTP 请求搬到 SSH 通道上,再把响应搬回来。
- *
- * 请求体先收齐再发——SSH 通道是字节流,边收边发会让 daemon 读到半个请求。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-async function forwardRequest(
-  client: SshClient,
-  request: import('node:http').IncomingMessage,
-  response: import('node:http').ServerResponse,
-  options: { dstHost: string; dstPort: number; logger?: Logger },
-): Promise<void> {
-  try {
-    const body = await readRequestBody(request)
-    const channel = await forwardChannel(client, options.dstHost, options.dstPort)
-    const payload = JSON.stringify({
-      method: request.method ?? 'GET',
-      path: request.url ?? '/',
-      headers: request.headers,
-      body,
-    })
-    channel.write(payload)
-    channel.end()
-
-    const raw = await readChannel(channel)
-    const parsed = parseHttpResponse(raw)
-    response.writeHead(parsed.status, parsed.headers)
-    response.end(parsed.body)
-  } catch (error) {
-    options.logger?.error({
-      errorMessage: (error as Error).message,
-      dstPort: options.dstPort,
-    }, 'SSH 隧道转发失败')
-    if (!response.writableEnded) {
-      response.writeHead(502, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ ok: false, code: 'unavailable', error: 'sandbox unavailable' }))
-    }
-  }
-}
-
-type ForwardChannel = ClientChannel & {
-  stderr?: Buffer
-}
-
-/**
- * 开一条到远程端口的转发通道。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-function forwardChannel(
-  client: SshClient,
-  dstHost: string,
-  dstPort: number,
-): Promise<ForwardChannel> {
-  return new Promise((resolve, reject) => {
-    client.forwardOut('127.0.0.1', 0, dstHost, dstPort, (error, stream) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      resolve(stream as ForwardChannel)
-    })
-  })
-}
-
-async function readRequestBody(request: import('node:http').IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = []
-  for await (const chunk of request) chunks.push(chunk as Buffer)
-  return Buffer.concat(chunks).toString('utf-8')
-}
-
-/**
- * 收通道上的全部字节。
- *
- * 通道可能被远端提前关掉,这时候已经收到的字节要照样交付——
- * daemon 的错误响应也是走这条路回来的。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-function readChannel(channel: ForwardChannel): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    channel.on('data', (chunk: Buffer) => chunks.push(chunk))
-    channel.on('error', reject)
-    channel.on('close', () => resolve(Buffer.concat(chunks).toString('utf-8')))
-  })
-}
-
-type ParsedHttpResponse = {
-  status: number
-  headers: Record<string, string>
-  body: string
-}
-
-/**
- * 解析隧道回来的 HTTP 响应。
- *
- * 通道里是原始 HTTP 字节流,得自己分出状态行、头和体。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-export function parseHttpResponse(raw: string): ParsedHttpResponse {
-  const separator = raw.indexOf('\r\n\r\n')
-  if (separator < 0) {
-    return { status: 502, headers: {}, body: raw }
-  }
-  const head = raw.slice(0, separator)
-  const body = raw.slice(separator + 4)
-  const lines = head.split('\r\n')
-  const statusLine = lines[0] ?? ''
-  const status = Number(statusLine.split(' ')[1] ?? 0) || 502
-  const headers: Record<string, string> = {}
-  for (const line of lines.slice(1)) {
-    const colon = line.indexOf(':')
-    if (colon <= 0) continue
-    headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim()
-  }
-  return { status, headers, body }
 }
 
 /**
