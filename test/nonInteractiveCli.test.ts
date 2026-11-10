@@ -95,6 +95,8 @@ test('非交互模式能跑完整个回合并正常退出', async () => {
       GRASSAGENT_BASE_URL: `http://127.0.0.1:${mock.port}/v1`,
       GRASSAGENT_SESSION_DATABASE_PATH: ':memory:',
       GRASSAGENT_LOG_FORMAT: 'json',
+      // 测试要跑在自己的临时目录上,不能被仓库 .env 里的远程世界带走
+      GRASSAGENT_EXECUTION_WORLD: 'local',
     })
 
     assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode}`)
@@ -117,6 +119,7 @@ test('非交互模式的输出没有 ANSI 控制序列', async () => {
       GRASSAGENT_BASE_URL: `http://127.0.0.1:${mock.port}/v1`,
       GRASSAGENT_SESSION_DATABASE_PATH: ':memory:',
       GRASSAGENT_LOG_FORMAT: 'json',
+      GRASSAGENT_EXECUTION_WORLD: 'local',
     })
 
     // stdout 不是 TTY 时,渲染层产出的 ANSI 序列要清掉——
@@ -144,6 +147,8 @@ const mockEnvironment = (port: number): Record<string, string> => ({
   GRASSAGENT_BASE_URL: `http://127.0.0.1:${port}/v1`,
   GRASSAGENT_SESSION_DATABASE_PATH: ':memory:',
   GRASSAGENT_LOG_FORMAT: 'json',
+  // 测试要跑在自己的临时目录上,不能被仓库 .env 里的远程世界带走
+  GRASSAGENT_EXECUTION_WORLD: 'local',
 })
 
 test('斜杠命令在本地执行,不发给模型', async () => {
@@ -478,6 +483,32 @@ test('非交互模式加载技能要审批,没人能点头就拒绝', async () =
     assert.equal(exitCode, 0, output.slice(-400))
     assert.equal(output.includes('这段正文不该被加载'), false, '没人点头就不该给出正文')
     assert.ok(output.includes('加载被拒了'), output.slice(-400))
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('/skills 列出技能,reload 重新扫描', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-skills-'))
+  await mkdir(path.join(directory, '.grass', 'skills', 'demo'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'skills', 'demo', 'SKILL.md'),
+    ['---', 'name: demo', 'description: 演示技能', '---', '正文。'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/skills\n/skills reload\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('demo'), output.slice(-500))
+    assert.ok(output.includes('演示技能'), output.slice(-500))
+    assert.ok(output.includes('技能已重新扫描'), output.slice(-500))
+    assert.ok(!output.includes('回复'), '命令不该发给模型')
   } finally {
     await mock.close()
     await rm(directory, { recursive: true, force: true })

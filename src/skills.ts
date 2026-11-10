@@ -421,7 +421,27 @@ export function describeSkippedSkills(skills: readonly Skill[]): string[] {
     .map((skill) => `技能 ${skill.name} 已跳过:${skill.skippedReason}`)
 }
 
-/** 只允许用户手敲的技能。 */
+/** 技能清单的文字。给 /skills 用。 */
+export function formatSkillList(skills: readonly Skill[]): string {
+  if (skills.length === 0) return '项目里没有找到技能'
+  const lines: string[] = [`共 ${skills.length} 个技能:`]
+  for (const skill of skills) {
+    const state = skill.disabledReason
+      ? '已禁用'
+      : skill.skippedReason
+        ? '已跳过'
+        : skill.commandOnly
+          ? '仅命令'
+          : '可用'
+    const detail = skill.disabledReason ?? skill.skippedReason ?? skill.description
+    lines.push(`- ${skill.name}(${state},来源:${skill.origin.label}): ${detail}`)
+    lines.push(`  ${skill.relativePath}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * 只允许用户手敲的技能。 */
 export function commandOnlySkills(skills: readonly Skill[]): Skill[] {
   return skills.filter((skill) => isUsableSkill(skill) && skill.commandOnly)
 }

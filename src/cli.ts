@@ -9,7 +9,7 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runAgent } from './agent.ts'
 import { Tui } from './tui.ts'
-import { builtinTools } from './tools.ts'
+import { builtinTools, replaceLoadSkillTool } from './tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { createAskUserTool } from './askUser.ts'
@@ -30,7 +30,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
+import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -103,13 +103,16 @@ async function main() {
   let instructionReport = '项目规则识别已关闭'
   let instructionNotice = ''
   let systemPrompt = SYSTEM_PROMPT
+  // 规则段单独存着:重载技能时要重建系统提示词,规则不能跟着丢
+  let instructionSection = ''
   if (config.LoadProjectInstructions) {
     try {
       const catalog = await discoverProjectInstructions(config.Workspace, {
         warn: (object, message) => logger.warn(object, message),
         info: (object, message) => logger.info(object, message),
       })
-      systemPrompt = appendPromptSection(SYSTEM_PROMPT, catalog.promptSection)
+      instructionSection = catalog.promptSection
+      systemPrompt = appendPromptSection(SYSTEM_PROMPT, instructionSection)
       instructionReport = formatInstructionReport(catalog.instructions)
       if (catalog.instructions.length > 0) instructionNotice = summarizeInstructions(catalog.instructions)
     } catch (error) {
@@ -146,31 +149,37 @@ async function main() {
   let skillCatalog: SkillCatalog | undefined
   let skillReport = '技能加载已关闭'
   const skillNotices: string[] = []
+
+  const scanSkills = async (): Promise<SkillCatalog> => {
+    const skillOrigin = describeSkillOrigin(config, world)
+    const skillFiles = skillOrigin.kind === 'remote'
+      ? createWorldSkillFiles(world)
+      : await createLocalSkillFiles(config.Workspace)
+    // 缓存只在本地用:远程的目录每次都是新克隆的,缓存没有意义
+    const skillCache = skillOrigin.kind === 'remote'
+      ? undefined
+      : createSkillCache({ workspace: config.Workspace, relativePath: SKILL_CACHE_RELATIVE_PATH })
+    return discoverSkills({
+      files: skillFiles,
+      origin: skillOrigin,
+      cache: skillCache,
+      logger: {
+        warn: (object, message) => logger.warn(object, message),
+        info: (object, message) => logger.info(object, message),
+      },
+    })
+  }
+
   if (config.LoadSkills) {
     try {
-      const skillOrigin = describeSkillOrigin(config, world)
-      const skillFiles = skillOrigin.kind === 'remote'
-        ? createWorldSkillFiles(world)
-        : await createLocalSkillFiles(config.Workspace)
-      // 缓存只在本地用:远程的目录每次都是新克隆的,缓存没有意义
-      const skillCache = skillOrigin.kind === 'remote'
-        ? undefined
-        : createSkillCache({ workspace: config.Workspace, relativePath: SKILL_CACHE_RELATIVE_PATH })
-      skillCatalog = await discoverSkills({
-        files: skillFiles,
-        origin: skillOrigin,
-        cache: skillCache,
-        logger: {
-          warn: (object, message) => logger.warn(object, message),
-          info: (object, message) => logger.info(object, message),
-        },
-      })
-      systemPrompt = appendPromptSection(systemPrompt, skillCatalog.promptSection)
-      skills = createSkillRegistry(skillCatalog.skills)
-      skillReport = summarizeSkills(skillCatalog.skills)
+      const scanned = await scanSkills()
+      skillCatalog = scanned
+      systemPrompt = appendPromptSection(systemPrompt, scanned.promptSection)
+      skills = createSkillRegistry(scanned.skills)
+      skillReport = summarizeSkills(scanned.skills)
       // 同名冲突这类问题要让用户看见,不然技能凭空消失,没人知道为什么
-      skillNotices.push(...describeDisabledSkills(skillCatalog.skills))
-      skillNotices.push(...describeSkippedSkills(skillCatalog.skills))
+      skillNotices.push(...describeDisabledSkills(scanned.skills))
+      skillNotices.push(...describeSkippedSkills(scanned.skills))
     } catch (error) {
       skillReport = '识别技能失败,本次不加载技能'
       logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
@@ -448,24 +457,64 @@ async function main() {
     execute: () => `${instructionReport}\n${skillReport}`,
   })
 
-  // 只允许用户手敲的技能注册成斜杠命令。
-  // 它们不进模型索引,模型也调不到——用户敲了就把正文显示出来,要不要发给模型由用户决定。
-  for (const skill of commandOnlySkills(skillCatalog?.skills ?? [])) {
-    if (!isUsableCommandName(skill.name)) {
-      skillNotices.push(`技能 ${skill.name} 只能由用户手敲,但名字不能当命令名,已跳过`)
-      continue
+  // /skills 和 /skills reload
+  // reload 要换掉三样东西:工具里的 load_skill、系统提示词里的技能段、清单文本。
+  // 只换其中一样,模型看到的和能调到的就对不上了。
+  //
+  // 只读技能的命令也要跟着重注册:扫描出来的技能集变了,命令名也可能变了。
+  const registerCommandOnlySkills = (catalog: SkillCatalog | undefined): void => {
+    for (const skill of commandOnlySkills(catalog?.skills ?? [])) {
+      if (!isUsableCommandName(skill.name)) {
+        skillNotices.push(`技能 ${skill.name} 只能由用户手敲,但名字不能当命令名,已跳过`)
+        continue
+      }
+      if (commandRegistry.find(skill.name)) {
+        skillNotices.push(`技能 ${skill.name} 的命令名和已有命令冲突,已跳过`)
+        continue
+      }
+      commandRegistry.register({
+        name: skill.name,
+        description: skill.description,
+        argumentHint: '[参数]',
+        execute: (argument) => formatCommandOnlySkill(skill, argument),
+      })
     }
-    if (commandRegistry.find(skill.name)) {
-      skillNotices.push(`技能 ${skill.name} 的命令名和已有命令冲突,已跳过`)
-      continue
-    }
-    commandRegistry.register({
-      name: skill.name,
-      description: skill.description,
-      argumentHint: '[参数]',
-      execute: (argument) => formatCommandOnlySkill(skill, argument),
-    })
   }
+
+  commandRegistry.register({
+    name: 'skills',
+    description: '列出技能,/skills reload 重新扫描',
+    argumentHint: '[reload]',
+    execute: async (argument) => {
+      if (argument.trim() !== 'reload') {
+        return formatSkillList(skillCatalog?.skills ?? [])
+      }
+      if (!config.LoadSkills) return '技能加载已关闭'
+      try {
+        const refreshed = await scanSkills()
+        skillCatalog = refreshed
+        skills = createSkillRegistry(refreshed.skills)
+        skillReport = summarizeSkills(refreshed.skills)
+        // 规则段留着,只换技能段
+        context.systemPrompt = appendPromptSection(
+          appendPromptSection(SYSTEM_PROMPT, instructionSection),
+          refreshed.promptSection,
+        )
+        replaceLoadSkillTool(tools, skills, skillApproval)
+        skillNotices.length = 0
+        skillNotices.push(...describeDisabledSkills(refreshed.skills))
+        skillNotices.push(...describeSkippedSkills(refreshed.skills))
+        registerCommandOnlySkills(refreshed)
+        logger.info({ skillCount: refreshed.skills.length }, '技能已重新扫描')
+        return `技能已重新扫描\n${formatSkillList(refreshed.skills)}`
+      } catch (error) {
+        logger.error({ errorMessage: (error as Error).message }, '重新扫描技能失败')
+        return `重新扫描技能失败:${(error as Error).message}`
+      }
+    },
+  })
+
+  registerCommandOnlySkills(skillCatalog)
 
   // 切换会话:存盘当前会话,切过去,载入目标会话的历史
   const switchToSession = async (targetSessionId: string): Promise<string> => {

@@ -234,6 +234,28 @@ function buildLoadSkill(skills: SkillRegistry, approval: ApprovalGate | undefine
   }
 }
 
+/**
+ * 换掉工具集里的 load_skill。
+ *
+ * 会话内重新扫描技能后,工具里那个闭包还指着旧的注册表。
+ * 换掉它,模型下一次调用拿到的才是新的技能。
+ * 技能从有到无时要把工具摘掉——留着它模型只会拿到「没有名为 xxx 的技能」。
+ */
+export function replaceLoadSkillTool(
+  tools: AgentTool[],
+  skills: SkillRegistry,
+  approval: ApprovalGate | undefined,
+): void {
+  const index = tools.findIndex((tool) => tool.name === 'load_skill')
+  if (skills.names().length === 0) {
+    if (index >= 0) tools.splice(index, 1)
+    return
+  }
+  const replacement = buildLoadSkill(skills, approval)
+  if (index >= 0) tools[index] = replacement
+  else tools.push(replacement)
+}
+
 // 单次编辑的措辞要和改动前一致,模型已经靠这些句子判断该重发哪一段。
 function formatSingleEditError(error: unknown): string {
   if (error instanceof TextEditError && error.reason === 'not_found') {
