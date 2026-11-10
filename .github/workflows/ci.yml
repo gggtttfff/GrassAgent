@@ -28,6 +28,9 @@ jobs:
       - name: 类型检查
         run: npm run typecheck
 
+      - name: 编译
+        run: npm run build
+
       - name: 单元测试
         run: npm run test:unit
 

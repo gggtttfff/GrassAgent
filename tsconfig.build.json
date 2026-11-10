@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": false,
+    "sourceMap": true,
+    // 源码里的 import 都带 .ts 后缀(Node 直接跑 TS 时必须有)。
+    // 编译成 JS 时要改写成 .js,否则生成的代码 import 不到东西。
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src/**/*.ts"]
+}
