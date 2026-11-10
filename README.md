@@ -140,11 +140,21 @@ npm start
 
 ### 技能
 
-`.grass/skills/`、`.cursor/skills/`、`.claude/skills/`、`.kiro/skills/`、`.opencode/skills/` 下的 `SKILL.md` 按技能处理。同名技能取上面顺序里的第一个，后面的只记日志。
+`.grass/skills/`、`.cursor/skills/`、`.claude/skills/`、`.kiro/skills/`、`.opencode/skills/` 下的 `SKILL.md` 按技能处理。名字冲突（不分大小写）时**全部禁用**并在启动时告警，不替你挑。
 
-技能正文不进系统提示词，只列名字和描述。模型判断任务和某条描述对得上时调 `load_skill` 取全文；正文里提到的脚本、模板放在技能目录下，再用 `read_file` 按需读。正文超过 24000 字会截断，并提示去读全文。没有描述也没有一级标题的技能不会被索引。
+技能正文不进系统提示词，只列名字、来源和描述。模型判断任务和某条描述对得上时调 `load_skill` 取全文；正文里提到的脚本、模板放在技能目录下，会用列表一起给出来，再用 `read_file` 按需读。正文超过 24000 字会截断，同时给出二级标题和行号，方便按段落读全文。
 
-技能目录同样必须在工作区内，指向区外的软链会跳过。用户主目录里的 `~/.cursor/skills-cursor` 这类官方技能不在扫描范围。不想要这套逻辑时设 `GRASSAGENT_LOAD_SKILLS=0`，关掉后不注册 `load_skill`。
+加载前要过审批：`GRASSAGENT_APPROVE_SKILLS` 取 `ask`（默认，输入 y 同意）、`allow`、`deny`。非交互模式没人能点头，按拒绝处理。同一批技能只问一次，会话内记住了不再重复问。
+
+标了 `disable-model-invocation: true` 的技能只给用户手敲：不进模型索引，注册成 `/技能名`，敲出来显示正文和参数提示，不发模型。
+
+`environments`、`disabled-environments`、`metadata.surfaces` 会按本地终端（`local` / `cli`）过滤，声明了别的环境的技能直接跳过。
+
+技能从**执行世界**里读：`remote` 模式下读的是沙盒里的文件，来源会标成 `user@host:port`。本地扫描结果缓存在 `.grass/tmp/skills-cache.json`，按文件大小和修改时间失效。
+
+技能目录同样必须在工作区内，指向区外的软链会跳过。用户主目录里的 `~/.cursor/skills-cursor` 这类官方技能不在扫描范围。设 `GRASSAGENT_LOAD_SKILLS=0` 关闭整个技能功能，关掉后不注册 `load_skill`。
+
+`/skills` 列出当前技能（名字、来源、状态、路径），`/skills reload` 重新扫描并热替换工具与系统提示词。
 
 ### 钩子
 

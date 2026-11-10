@@ -665,6 +665,74 @@ test('加载技能前要过审批,拒绝就不给正文', async () => {
   }
 })
 
+test('嵌套目录的技能用相对路径当名字,opencode 的根也扫', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.opencode/skills/group/nested', [
+      '---',
+      'description: 嵌套的技能',
+      '---',
+      '正文。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    assert.equal(catalog.skills.length, 1)
+    assert.equal(catalog.skills[0]?.name, 'group/nested')
+    assert.equal(catalog.skills[0]?.source, 'opencode')
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('二进制技能文件和指向工作区外的软链都跳过', async () => {
+  const workspace = await makeWorkspace()
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-skills-outside-'))
+  const log = captureLog()
+  try {
+    // 带 NUL 的文件不是文本,不能当技能正文
+    const binaryDirectory = path.join(workspace, '.grass', 'skills', 'binary')
+    await fs.mkdir(binaryDirectory, { recursive: true })
+    await fs.writeFile(
+      path.join(binaryDirectory, 'SKILL.md'),
+      Buffer.from([0x2d, 0x2d, 0x2d, 0x0a, 0x00, 0x01, 0x02, 0x0a]),
+    )
+
+    // 指向工作区外的软链等于借技能读外部文件
+    await fs.writeFile(
+      path.join(outside, 'SKILL.md'),
+      ['---', 'name: escape', 'description: 越界的技能', '---', '外部正文。'].join('\n'),
+    )
+    await fs.mkdir(path.join(workspace, '.grass', 'skills'), { recursive: true })
+    await fs.symlink(outside, path.join(workspace, '.grass', 'skills', 'escape'))
+
+    const catalog = await scanLocalSkills(workspace, log)
+    assert.equal(catalog.skills.length, 0)
+    assert.ok(log.warnings.some((message) => message.includes('读不到或不是文本')))
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+    await fs.rm(outside, { recursive: true, force: true })
+  }
+})
+
+test('打断之后 load_skill 直接返回 aborted', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/demo', [
+      '---', 'name: demo', 'description: 演示技能', '---', '正文。',
+    ].join('\n'))
+    const catalog = await scanLocalSkills(workspace)
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
+    const loadSkill = tools.find((tool) => tool.name === 'load_skill')
+
+    const controller = new AbortController()
+    controller.abort()
+    const result = await loadSkill?.execute({ names: ['demo'] }, controller.signal)
+    assert.equal(result, 'error:aborted')
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('一个技能都没有时不注册 load_skill', async () => {
   const workspace = await makeWorkspace()
   try {

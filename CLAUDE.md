@@ -19,7 +19,7 @@ logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
 hookConfig.ts → hooks.ts
 projectInstructions.ts → pathGuard.ts / frontmatter.ts
-skills.ts → pathGuard.ts / frontmatter.ts
+skills.ts → executionWorld.ts / pathGuard.ts / frontmatter.ts / jsonSafety.ts
 frontmatter.ts
 sessionBundle.ts → messages.ts
 jsonSafety.ts
@@ -29,7 +29,7 @@ jsonSafety.ts
 
 `frontmatter.ts` 只解析 `---` 包起来的头（标量、列表、`>` / `|` 块标量），被规则扫描和技能扫描共用。
 
-`projectInstructions.ts` 管规则和提示词，`skills.ts` 管技能包（`SKILL.md`）：前者整篇塞进系统提示词或列索引，后者只列名字和描述，正文由 `load_skill` 按需取。两边都不读用户主目录。
+`projectInstructions.ts` 管规则和提示词，`skills.ts` 管技能包（`SKILL.md`）：前者整篇塞进系统提示词或列索引，后者只列名字和描述，正文由 `load_skill` 按需取。两边都不读用户主目录。技能从「执行世界」里读，本地和远程走同一套扫描逻辑。
 
 `theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
@@ -164,13 +164,26 @@ jsonSafety.ts
 
 **51. 没有描述的技能不要索引。** 描述是模型判断「什么时候该用」的唯一依据，缺了它这条索引只会占上下文。正文里有一级标题时可以拿标题补，两样都没有就跳过并记日志。
 
+**52. 技能要从执行世界里读，不要直接用 `node:fs`。** 远程世界的技能文件在沙盒里，本机 `fs` 读到的是另一份（甚至根本没有）。`SkillFileSystem` 有两个实现：`createLocalSkillFiles`（fs + pathGuard）和 `createWorldSkillFiles`（world.list + world.readRaw）。
+
+**53. 读技能正文必须走 `readRaw`。** 普通 `read` 超过 200 行只返回尾部，SKILL.md 动辄几百行，用它会把正文读坏，而且症状是「内容少了一半」，很难排查。
+
+**54. `load_skill` 必须先过审批。** 技能正文是仓库里的文本，拿到它就等于让模型按别人的指令做事。`GRASSAGENT_APPROVE_SKILLS` 取 ask/allow/deny，默认 ask；没人能回答时按拒绝处理。它是 `sequential: true`——审批要独占输入通道。
+
+**55. 重新扫描技能要同时换三样东西。** 工具里的 `load_skill`、系统提示词里的技能段、只读技能的命令注册。只换其中一样，模型看到的和能调到的就对不上。重建系统提示词时规则段要单独存着，否则一次 reload 就把项目规则丢光。
+
+**56. 测试里 spawn CLI 必须显式关掉远程世界。** `runCliWithInput` 的 cwd 是仓库根，配置层会读到开发机的 `.env`；那里如果配了 `GRASSAGENT_EXECUTION_WORLD=remote`，测试就会去连真实沙盒，技能扫描也会读到远程目录。所有 CLI 测试都要带 `GRASSAGENT_EXECUTION_WORLD=local`。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
 
-- 技能是启动时扫进内存的快照，会话中途改 `SKILL.md` 要重启才生效（想看最新内容可以 `read_file`）
-- 同名技能只认先扫到的根，后面的只记日志；`.grass/skills` 排在最前面
-- 技能正文超过 24000 字会被截断，`load_skill` 会提示用 `read_file` 读全文
+- 技能是启动时扫进内存的快照，会话中途改 `SKILL.md` 要 `/skills reload` 或重启才生效（想看最新内容可以直接 `read_file`）
+- 同名技能（不分大小写）会全部禁用并在启动时告警，只记日志不自动挑选
+- 技能正文超过 24000 字会被截断，`load_skill` 会给出标题清单，让模型用 `read_file` 读缺的段落
+- 批量加载一次最多 8 个技能、合计 48000 字
+- 扫描缓存写在 `.grass/tmp/skills-cache.json`，只按大小和修改时间判断失效；缓存被改坏就当没有缓存
+- 远程世界不用缓存，每次会话的沙盒都是新的
 - `run_bash` 用 shell 字符串拼接执行，有注入风险。工作目录已锁定在沙箱内，但命令内容不做参数化
 - `edit` 工具的 `old_string` 未做大小写与空白归一化
 - `edit` 工具一次只能改一处，要改多处用 `edit_batch`
