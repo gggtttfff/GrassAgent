@@ -130,6 +130,11 @@ export const configSchema = z.object({
   ExecutionWorld: z.enum(['local', 'remote'], {
     error: 'ExecutionWorld 只能是 local 或 remote',
   }).default('local'),
+  // 控制面用哪种后端创建沙盒。docker 起容器,ssh 连远程主机起 daemon,
+  // inprocess 不起外部进程,给测试用。
+  SandboxBackend: z.enum(['docker', 'ssh', 'inprocess'], {
+    error: 'SandboxBackend 只能是 docker、ssh 或 inprocess',
+  }).default('docker'),
   SandboxControlUrl: z.preprocess(
     emptyToUndefined,
     z.url({ error: '控制面地址必须是合法 URL' }).optional(),
@@ -150,6 +155,25 @@ export const configSchema = z.object({
   }),
   SandboxNetworkAllowlist: z.string().default(''),
   SandboxKeep: booleanOption(false, 'SandboxKeep'),
+
+  // SSH 后端。控制面通过 SSH 连到远程主机,起一个 daemon 并开隧道转发调用。
+  // 主机、用户、端口描述的是远程开发机,不是控制面自己。
+  SandboxSshHost: optionalText('SandboxSshHost'),
+  SandboxSshUser: optionalText('SandboxSshUser'),
+  SandboxSshPort: numericOption({
+    minimum: 1, maximum: 65_535, defaultValue: 22, label: 'SandboxSshPort',
+  }),
+  // 私钥文件路径。留空则依赖 ssh-agent 或密码认证。
+  SandboxSshKeyPath: optionalText('SandboxSshKeyPath'),
+  // 私钥口令。加密私钥才需要。
+  SandboxSshKeyPassphrase: optionalText('SandboxSshKeyPassphrase'),
+  // known_hosts 文件。留空用 ~/.ssh/known_hosts。主机密钥变化时连接会被拒绝。
+  SandboxSshKnownHostsPath: optionalText('SandboxSshKnownHostsPath'),
+  // 远程工作区的真实路径。模型看到的是 /workspace,这里对应远程机器上的目录。
+  SandboxSshWorkspace: optionalText('SandboxSshWorkspace'),
+  SandboxSshTimeoutMs: numericOption({
+    minimum: 1_000, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshTimeoutMs',
+  }),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
@@ -167,6 +191,18 @@ export const configSchema = z.object({
   {
     path: ['SandboxImage'],
     message: '远程执行世界必须配置镜像,或提供已有的 SandboxId 挂回',
+  },
+)).check(z.refine(
+  (config) => config.SandboxBackend !== 'ssh' || Boolean(config.SandboxSshHost),
+  {
+    path: ['SandboxSshHost'],
+    message: 'SSH 后端必须配置远程主机地址',
+  },
+)).check(z.refine(
+  (config) => config.SandboxBackend !== 'ssh' || Boolean(config.SandboxSshUser),
+  {
+    path: ['SandboxSshUser'],
+    message: 'SSH 后端必须配置远程用户名',
   },
 ))
 
@@ -219,6 +255,15 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxDiskMb: `${ENV_PREFIX}SANDBOX_DISK_MB`,
   SandboxNetworkAllowlist: `${ENV_PREFIX}SANDBOX_NETWORK_ALLOWLIST`,
   SandboxKeep: `${ENV_PREFIX}SANDBOX_KEEP`,
+  SandboxBackend: `${ENV_PREFIX}SANDBOX_BACKEND`,
+  SandboxSshHost: `${ENV_PREFIX}SANDBOX_SSH_HOST`,
+  SandboxSshUser: `${ENV_PREFIX}SANDBOX_SSH_USER`,
+  SandboxSshPort: `${ENV_PREFIX}SANDBOX_SSH_PORT`,
+  SandboxSshKeyPath: `${ENV_PREFIX}SANDBOX_SSH_KEY_PATH`,
+  SandboxSshKeyPassphrase: `${ENV_PREFIX}SANDBOX_SSH_KEY_PASSPHRASE`,
+  SandboxSshKnownHostsPath: `${ENV_PREFIX}SANDBOX_SSH_KNOWN_HOSTS_PATH`,
+  SandboxSshWorkspace: `${ENV_PREFIX}SANDBOX_SSH_WORKSPACE`,
+  SandboxSshTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_TIMEOUT_MS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。
