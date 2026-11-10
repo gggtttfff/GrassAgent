@@ -130,6 +130,12 @@ export const configSchema = z.object({
   // 技能正文不常驻上下文,只在系统提示词里列名字和描述,模型用 load_skill 取全文。
   LoadSkills: booleanOption(true, 'LoadSkills'),
 
+  // 加载技能前要不要人点头。ask 是问一次;allow 直接放行;deny 一律不给。
+  // 技能正文是仓库里的文本,拿到它就等于让模型按别人的指令做事。
+  ApproveSkills: z.enum(['ask', 'allow', 'deny'], {
+    error: 'ApproveSkills 只能是 ask、allow 或 deny',
+  }).default('ask'),
+
   // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
   ExecutionWorld: z.enum(['local', 'remote'], {
     error: 'ExecutionWorld 只能是 local 或 remote',
@@ -258,6 +264,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
   LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
+  ApproveSkills: `${ENV_PREFIX}APPROVE_SKILLS`,
   ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
   SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
   SandboxImage: `${ENV_PREFIX}SANDBOX_IMAGE`,

@@ -5,11 +5,12 @@
 // 参数 schema 用 pi-schema 的 builders 写,类型和校验规则只有一处定义。
 
 import { obj, str, arr } from '@earendil-works/pi-schema'
+import { assertSkillAllowed, type ApprovalGate } from './approvalGate.ts'
 import type { AgentTool } from './agent.ts'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { formatExecResult, createLocalWorld } from './localWorld.ts'
 import { describePathError } from './pathGuard.ts'
-import { formatSkillForModel, type SkillRegistry } from './skills.ts'
+import { formatSkillForModel, type Skill, type SkillRegistry } from './skills.ts'
 import { TextEditError } from './textEdit.ts'
 
 // 命令执行超时(毫秒)。默认 3 秒——编译、跑测试这类任务通常要更久,
@@ -175,29 +176,47 @@ function buildRunBash(world: ExecutionWorld, timeoutMs: number): AgentTool {
 // 附件不在这里返回,模型按正文指到的路径自己用 read_file 读。
 //
 // 支持一次取多个:任务常常要连着看两三个技能,一个一个来要多跑几轮。
-function buildLoadSkill(skills: SkillRegistry): AgentTool {
+//
+// 审批在加载之前:技能正文是仓库里的文本,拿到它就等于让模型按别人的指令做事。
+// 没拿到放行就不给正文,只回一句让模型别再试。
+function buildLoadSkill(skills: SkillRegistry, approval: ApprovalGate | undefined): AgentTool {
   return {
     name: 'load_skill',
     description:
       '加载技能的完整说明.参数:names(技能名列表,和可用技能列表一致,最多 8 个).' +
       '返回技能正文和附件目录;正文提到的脚本、模板用 read_file 按需读',
     parameters: loadSkillParameters,
+    // 审批要占用输入通道,不能和别的工具并发跑
+    sequential: true,
     execute: async (args, signal) => {
       if (signal?.aborted) return 'error:aborted'
       const { names } = args as { names: string[] }
       const requested = [...new Set(names.map((name) => name.trim()).filter(Boolean))]
       if (requested.length === 0) return 'error: load_skill 的 names 不能为空'
 
-      const sections: string[] = []
+      const found: Skill[] = []
       const missing: string[] = []
-      let totalChars = 0
       for (const name of requested) {
         const skill = skills.find(name)
         // 报错里带上可用名字,模型下一次就能改对,不用再试一遍
-        if (!skill) {
-          missing.push(name)
-          continue
-        }
+        if (!skill) missing.push(name)
+        else found.push(skill)
+      }
+      if (found.length === 0) {
+        return `error: 没有名为 ${missing.map((name) => `"${name}"`).join('、')} 的技能。可用技能:${skills.names().join('、')}`
+      }
+
+      // 一批技能问一次。逐个问的话,一次八个技能要弹八次。
+      const summary = found.map((skill) => skill.name).join('、')
+      try {
+        await assertSkillAllowed(approval, summary)
+      } catch (error) {
+        return `error: ${(error as Error).message}。不要再次请求加载技能,按现有信息继续。`
+      }
+
+      const sections: string[] = []
+      let totalChars = 0
+      for (const skill of found) {
         const section = formatSkillForModel(skill)
         // 一批技能的总长度要有上限,不然一次塞满上下文
         if (totalChars + section.length > MAX_BATCH_SKILL_CHARS) {
@@ -207,11 +226,9 @@ function buildLoadSkill(skills: SkillRegistry): AgentTool {
         totalChars += section.length
         sections.push(section)
       }
-
       if (missing.length > 0) {
         sections.push(`error: 没有名为 ${missing.map((name) => `"${name}"`).join('、')} 的技能。可用技能:${skills.names().join('、')}`)
       }
-      if (sections.length === 0) return 'error: 没有可加载的技能'
       return sections.join('\n\n---\n\n')
     },
   }
@@ -249,6 +266,8 @@ export async function builtinTools(options: {
   commandTimeoutMs?: number
   world?: ExecutionWorld
   skills?: SkillRegistry
+  /** 加载技能前要过的审批门 */
+  approval?: ApprovalGate
 } = {}): Promise<AgentTool[]> {
   const world = options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() })
   const tools = [
@@ -259,6 +278,8 @@ export async function builtinTools(options: {
     buildRunBash(world, options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS),
   ]
   // 一个技能都没有时不注册 load_skill:模型看见用不上的工具只会乱调
-  if (options.skills && options.skills.names().length > 0) tools.push(buildLoadSkill(options.skills))
+  if (options.skills && options.skills.names().length > 0) {
+    tools.push(buildLoadSkill(options.skills, options.approval))
+  }
   return tools
 }

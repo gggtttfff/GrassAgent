@@ -13,9 +13,10 @@ import { builtinTools } from './tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { createAskUserTool } from './askUser.ts'
+import type { ApprovalDecision, ApprovalGate } from './approvalGate.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { readVersion } from './version.ts'
-import { createLoggerFromConfig } from './logger.ts'
+import { createLoggerFromConfig, type Logger } from './logger.ts'
 import { createTransport } from './transport.ts'
 import { SessionStore, generateSessionId } from './sessionStore.ts'
 import { SlashCommandRegistry } from './slashCommands.ts'
@@ -181,12 +182,17 @@ async function main() {
     messages: sessionStore.load(),
   }
 
+  // 技能加载的审批门。
+  // Tui 还没建出来,但审批发生在回合里,那时 Tui 早就在了——所以这里用变量延迟取。
+  const skillApproval = createSkillApprovalGate(config.ApproveSkills, () => tui, logger)
+
   // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
   const fileTools = await builtinTools({
     world,
     commandTimeoutMs: config.CommandTimeoutMs,
     skills,
+    approval: skillApproval,
   })
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
@@ -587,6 +593,50 @@ async function main() {
 function entryFilePath(entryArgument: string): string {
   if (entryArgument.startsWith('file:')) return fileURLToPath(entryArgument)
   return path.resolve(entryArgument)
+}
+
+/**
+ * 技能加载的审批门。
+ *
+ * ask 是问一次,答 y 才放行;allow 直接放行;deny 一律不给。
+ * 没人能回答时按拒绝处理——技能正文是仓库里的文本,拿到它就等于让模型按别人的指令做事。
+ *
+ * 同一个技能在会话里只问一次,免得模型反复请求时反复弹窗。
+ */
+function createSkillApprovalGate(
+  mode: 'ask' | 'allow' | 'deny',
+  getTui: () => Tui | undefined,
+  logger: Logger,
+): ApprovalGate {
+  const decided = new Map<string, ApprovalDecision>()
+  return {
+    async decide(action): Promise<ApprovalDecision> {
+      if (mode === 'allow') return 'allow'
+      if (mode === 'deny') return 'deny'
+      const remembered = decided.get(action.summary)
+      if (remembered) return remembered
+
+      const tui = getTui()
+      // 没有界面就没人能点头
+      if (!tui) {
+        logger.warn({ summary: action.summary }, '没有界面可问,拒绝加载技能')
+        return 'unavailable'
+      }
+      const reply = await tui.ask(
+        `要加载技能 ${action.summary} 吗?技能正文会指导模型做事,输入 y 同意,其它拒绝。`,
+      )
+      let decision: ApprovalDecision = 'deny'
+      if (reply.status === 'answered') {
+        const answer = reply.answer.trim().toLowerCase()
+        decision = answer === 'y' || answer === 'yes' ? 'allow' : 'deny'
+      } else if (reply.status === 'unavailable') {
+        decision = 'unavailable'
+      }
+      decided.set(action.summary, decision)
+      logger.info({ summary: action.summary, decision }, '技能加载已裁决')
+      return decision
+    },
+  }
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   type SkillOrigin,
 } from '../src/skills.ts'
 import { builtinTools } from '../src/tools.ts'
+import type { ApprovalGate } from '../src/approvalGate.ts'
 import { validateConfig } from '../src/config.ts'
 import { createInProcessBackend } from '../src/sandbox/inProcessBackend.ts'
 import { createControlPlane, type TimerFn } from '../src/sandbox/control.ts'
@@ -30,6 +31,9 @@ async function makeWorkspace(): Promise<string> {
 
 const localOrigin: SkillOrigin = { kind: 'local', label: '本地工作区' }
 const idleTimer: TimerFn = () => ({ refresh() {}, cancel() {} })
+
+// 默认审批是拒绝,测正文内容时得显式放行
+const allowAll: ApprovalGate = { decide: async () => 'allow' }
 
 /** 本地工作区上的技能扫描,免得每个用例都写一遍组装。 */
 async function scanLocalSkills(
@@ -227,7 +231,7 @@ test('正文过长时截断,并提示用 read_file 读全文', async () => {
 
     const catalog = await scanLocalSkills(workspace)
     assert.equal(catalog.skills[0]?.truncated, true)
-    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     const result = await loadSkill?.execute({ names: ['long'] })
     assert.match(result ?? '', /已截断/)
@@ -249,7 +253,7 @@ test('load_skill 返回正文和附件目录,未知名字报错时列出可用�
     ].join('\n'))
 
     const catalog = await scanLocalSkills(workspace)
-    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     assert.ok(loadSkill)
 
@@ -512,7 +516,7 @@ test('标题清单带文件行号,截断时仍覆盖全文', async () => {
     assert.equal(skill?.headings[0]?.line, 5)
     assert.equal(skill?.headings[1]?.line, 7)
 
-    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     const result = await loadSkill?.execute({ names: ['long'] })
     assert.match(result ?? '', /目录:/)
@@ -545,7 +549,7 @@ test('附件列在技能目录里,超大和超量的不进清单', async () => {
       '.grass/skills/demo/run.sh',
     ])
 
-    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     const result = await loadSkill?.execute({ names: ['demo'] })
     assert.match(result ?? '', /附件:\.grass\/skills\/demo\/notes\.md、\.grass\/skills\/demo\/run\.sh/)
@@ -598,7 +602,7 @@ test('一次能加载多个技能,重复的名字只加载一次', async () => {
     ].join('\n'))
 
     const catalog = await scanLocalSkills(workspace)
-    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills), approval: allowAll })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     assert.ok(loadSkill)
 
@@ -615,6 +619,47 @@ test('一次能加载多个技能,重复的名字只加载一次', async () => {
     const mixed = await loadSkill.execute({ names: ['first', 'nope'] })
     assert.match(mixed, /# 技能 first/)
     assert.match(mixed, /没有名为 "nope" 的技能/)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('加载技能前要过审批,拒绝就不给正文', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/demo', [
+      '---', 'name: demo', 'description: 演示用的技能', '---', '正文内容。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    const registry = createSkillRegistry(catalog.skills)
+
+    const allowing: ApprovalGate = { decide: async () => 'allow' }
+    const denying: ApprovalGate = { decide: async () => 'deny' }
+    const unavailable: ApprovalGate = { decide: async () => 'unavailable' }
+
+    const allowed = await builtinTools({ workspace, skills: registry, approval: allowing })
+    const allowedResult = await allowed.find((tool) => tool.name === 'load_skill')?.execute({ names: ['demo'] })
+    assert.match(allowedResult ?? '', /正文内容。/)
+
+    const denied = await builtinTools({ workspace, skills: registry, approval: denying })
+    const deniedResult = await denied.find((tool) => tool.name === 'load_skill')?.execute({ names: ['demo'] })
+    assert.match(deniedResult ?? '', /审批拒绝加载技能/)
+    assert.match(deniedResult ?? '', /不要再次请求/)
+    assert.equal((deniedResult ?? '').includes('正文内容。'), false, '拒绝时不能给出正文')
+
+    const unreachable = await builtinTools({ workspace, skills: registry, approval: unavailable })
+    const unreachableResult = await unreachable.find((tool) => tool.name === 'load_skill')?.execute({ names: ['demo'] })
+    assert.match(unreachableResult ?? '', /审批拒绝加载技能/)
+
+    // 没有审批门就是拒绝:没人能点头就不给正文
+    const noGate = await builtinTools({ workspace, skills: registry })
+    const noGateResult = await noGate.find((tool) => tool.name === 'load_skill')?.execute({ names: ['demo'] })
+    assert.match(noGateResult ?? '', /审批拒绝加载技能/)
+    assert.equal((noGateResult ?? '').includes('正文内容。'), false)
+
+    // 审批要独占输入通道
+    assert.equal(noGate.find((tool) => tool.name === 'load_skill')?.sequential, true)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
   }

@@ -453,6 +453,37 @@ test('始终生效的项目规则会发给模型,提示词不会', async () => {
   }
 })
 
+test('非交互模式加载技能要审批,没人能点头就拒绝', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-approve-'))
+  await mkdir(path.join(directory, '.grass', 'skills', 'demo'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'skills', 'demo', 'SKILL.md'),
+    ['---', 'name: demo', 'description: 演示技能', '---', '这段正文不该被加载。'].join('\n'),
+  )
+  const loadSkillResponse =
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_skill","function":{"name":"load_skill","arguments":"{\\"names\\":[\\"demo\\"]}"}}]}}]}\n\n' +
+    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n' +
+    'data: [DONE]\n\n'
+  const finalResponse =
+    'data: {"choices":[{"delta":{"content":"加载被拒了"},"finish_reason":"stop"}]}\n\n' +
+    'data: [DONE]\n\n'
+  const mock = await startMockServer([loadSkillResponse, finalResponse])
+  try {
+    const { exitCode, output } = await runCliWithInput('用一下 demo 技能\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.equal(output.includes('这段正文不该被加载'), false, '没人点头就不该给出正文')
+    assert.ok(output.includes('加载被拒了'), output.slice(-400))
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('普通输入照常发给模型', async () => {
   const mock = await startMockServer()
   try {

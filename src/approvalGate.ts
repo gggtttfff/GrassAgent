@@ -6,7 +6,7 @@
 export type ApprovalDecision = 'allow' | 'deny' | 'unavailable'
 
 export type ApprovalAction = {
-  kind: 'write' | 'edit' | 'exec' | 'escalate'
+  kind: 'write' | 'edit' | 'exec' | 'escalate' | 'skill'
   summary: string
 }
 
@@ -26,6 +26,23 @@ export function createDefaultApprovalGate(): ApprovalGate {
       if (action.kind === 'escalate') return 'unavailable'
       return 'allow'
     },
+  }
+}
+
+/**
+ * 加载技能必须拿到 allow。
+ *
+ * 技能正文是仓库里的文本,拿到它就等于让模型按别人的指令做事。
+ * deny 和 unavailable 都是拒绝,不返回正文。
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+export async function assertSkillAllowed(
+  gate: ApprovalGate | undefined,
+  summary: string,
+): Promise<void> {
+  const decision = gate ? await gate.decide({ kind: 'skill', summary }) : 'unavailable'
+  if (decision !== 'allow') {
+    throw new Error(`审批拒绝加载技能: ${summary}`)
   }
 }
 
