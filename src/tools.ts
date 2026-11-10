@@ -9,6 +9,7 @@ import type { AgentTool } from './agent.ts'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { formatExecResult, createLocalWorld } from './localWorld.ts'
 import { describePathError } from './pathGuard.ts'
+import { formatSkillForModel, type SkillRegistry } from './skills.ts'
 import { TextEditError } from './textEdit.ts'
 
 // 命令执行超时(毫秒)。默认 3 秒——编译、跑测试这类任务通常要更久,
@@ -46,6 +47,10 @@ const editBatchParameters = obj({
 
 const runBashParameters = obj({
   command: str({ description: '要执行的 shell 命令' }),
+})
+
+const loadSkillParameters = obj({
+  name: str({ description: '技能名,和可用技能列表里的一致' }),
 })
 
 // read_file:返回文件内容。超过 200 行或字节上限时只带尾部,全文在世界的临时区。
@@ -158,6 +163,29 @@ function buildRunBash(world: ExecutionWorld, timeoutMs: number): AgentTool {
   }
 }
 
+// load_skill:按名字取技能正文。
+// 正文是启动时扫进内存的,不在工具里重新读盘——技能目录改到一半读进来更糟。
+// 附件不在这里返回,模型按正文指到的路径自己用 read_file 读。
+function buildLoadSkill(skills: SkillRegistry): AgentTool {
+  return {
+    name: 'load_skill',
+    description:
+      '加载技能的完整说明.参数:name(技能名,和可用技能列表一致).' +
+      '返回技能正文和附件目录;正文提到的脚本、模板用 read_file 按需读',
+    parameters: loadSkillParameters,
+    execute: async (args, signal) => {
+      if (signal?.aborted) return 'error:aborted'
+      const { name } = args as { name: string }
+      const trimmed = name.trim()
+      if (!trimmed) return 'error: load_skill 的 name 不能为空'
+      const skill = skills.find(trimmed)
+      // 报错里带上可用名字,模型下一次就能改对,不用再试一遍
+      if (!skill) return `error: 没有名为 "${trimmed}" 的技能。可用技能:${skills.names().join('、')}`
+      return formatSkillForModel(skill)
+    },
+  }
+}
+
 // 单次编辑的措辞要和改动前一致,模型已经靠这些句子判断该重发哪一段。
 function formatSingleEditError(error: unknown): string {
   if (error instanceof TextEditError && error.reason === 'not_found') {
@@ -189,13 +217,17 @@ export async function builtinTools(options: {
   workspace?: string
   commandTimeoutMs?: number
   world?: ExecutionWorld
+  skills?: SkillRegistry
 } = {}): Promise<AgentTool[]> {
   const world = options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() })
-  return [
+  const tools = [
     buildReadFile(world),
     buildWriteFile(world),
     buildEdit(world),
     buildEditBatch(world),
     buildRunBash(world, options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS),
   ]
+  // 一个技能都没有时不注册 load_skill:模型看见用不上的工具只会乱调
+  if (options.skills && options.skills.names().length > 0) tools.push(buildLoadSkill(options.skills))
+  return tools
 }

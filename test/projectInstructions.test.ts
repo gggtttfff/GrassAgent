@@ -164,9 +164,11 @@ test('认出四家工具的规则和提示词,并且不把提示词整篇塞进�
     assert.equal(ship?.relativePath, 'opencode.jsonc')
     assert.match(ship?.description ?? '', /发版/)
 
-    const skill = catalog.instructions.find((item) => item.relativePath === '.claude/skills/review/SKILL.md')
-    assert.equal(skill?.kind, 'prompt')
-    assert.equal(skill?.activation, 'intelligent')
+    // 技能归 skills.ts 管(要能被 load_skill 按名字取正文),这里不再重复列成提示词
+    assert.equal(
+      catalog.instructions.some((item) => item.relativePath === '.claude/skills/review/SKILL.md'),
+      false,
+    )
 
     assert.equal(catalog.instructions.some((item) => item.relativePath.includes('node_modules')), false)
     assert.equal(catalog.instructions.some((item) => item.relativePath === '.cursor/rules/notes.md'), false)

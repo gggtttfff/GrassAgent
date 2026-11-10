@@ -126,6 +126,10 @@ export const configSchema = z.object({
   // 关掉之后系统提示词里只有 Grass 自己的那一段。
   LoadProjectInstructions: booleanOption(true, 'LoadProjectInstructions'),
 
+  // 启动时是否扫描工作区里的技能包(.grass/skills、.cursor/skills 等)。
+  // 技能正文不常驻上下文,只在系统提示词里列名字和描述,模型用 load_skill 取全文。
+  LoadSkills: booleanOption(true, 'LoadSkills'),
+
   // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
   ExecutionWorld: z.enum(['local', 'remote'], {
     error: 'ExecutionWorld 只能是 local 或 remote',
@@ -253,6 +257,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   HooksPath: `${ENV_PREFIX}HOOKS_PATH`,
   HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
+  LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
   ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
   SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
   SandboxImage: `${ENV_PREFIX}SANDBOX_IMAGE`,

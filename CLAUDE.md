@@ -18,12 +18,18 @@ config.ts  pathGuard.ts
 logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
 hookConfig.ts → hooks.ts
-projectInstructions.ts → pathGuard.ts
+projectInstructions.ts → pathGuard.ts / frontmatter.ts
+skills.ts → pathGuard.ts / frontmatter.ts
+frontmatter.ts
 sessionBundle.ts → messages.ts
 jsonSafety.ts
 ```
 
 `messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
+
+`frontmatter.ts` 只解析 `---` 包起来的头（标量、列表、`>` / `|` 块标量），被规则扫描和技能扫描共用。
+
+`projectInstructions.ts` 管规则和提示词，`skills.ts` 管技能包（`SKILL.md`）：前者整篇塞进系统提示词或列索引，后者只列名字和描述，正文由 `load_skill` 按需取。两边都不读用户主目录。
 
 `theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
@@ -152,10 +158,19 @@ jsonSafety.ts
 
 **48. 部署全程复用一条 SFTP 会话。** 每个操作单开会话要重复握手，11 个文件加建目录实测 40 秒；一条会话降到 14 秒。建目录用 `pathLevels` 逐级建并记住建过的层。
 
+**49. 技能正文不进系统提示词，只有名字和描述进。** 一个技能动辄几百行（Cursor 官方的 `create-skill` 有 508 行），每轮都塞会挤掉对话。模型判断任务和描述对得上时调 `load_skill` 取全文，正文提到的脚本、模板再用 `read_file` 读。没被点名、描述也对不上的不要加载。
+
+**50. 技能和附件都必须在工作区内。** `skills.ts` 和规则扫描共用同一个 `pathGuard`，软链指到工作区外直接跳过。技能根是工作区相对的（`.grass/skills`、`.cursor/skills` 等），不要加 `~/.cursor/skills-cursor` 这类用户主目录——那要给沙箱开只读口子，是另一个决定。
+
+**51. 没有描述的技能不要索引。** 描述是模型判断「什么时候该用」的唯一依据，缺了它这条索引只会占上下文。正文里有一级标题时可以拿标题补，两样都没有就跳过并记日志。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
 
+- 技能是启动时扫进内存的快照，会话中途改 `SKILL.md` 要重启才生效（想看最新内容可以 `read_file`）
+- 同名技能只认先扫到的根，后面的只记日志；`.grass/skills` 排在最前面
+- 技能正文超过 24000 字会被截断，`load_skill` 会提示用 `read_file` 读全文
 - `run_bash` 用 shell 字符串拼接执行，有注入风险。工作目录已锁定在沙箱内，但命令内容不做参数化
 - `edit` 工具的 `old_string` 未做大小写与空白归一化
 - `edit` 工具一次只能改一处，要改多处用 `edit_batch`

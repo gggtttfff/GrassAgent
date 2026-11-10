@@ -2,14 +2,16 @@
 // 项目规则 —— 认出仓库里 opencode、cursor、claude、kiro 留下的规则和提示词。
 //
 // 始终生效的规则放进系统提示词,否则模型看不见项目约定。
-// 按文件生效的规则、以及命令/技能/角色提示词只列索引:
+// 按文件生效的规则、以及命令/角色提示词只列索引:
 // 整篇塞进去会占满上下文,提示词没被点名也不该自动执行。
+// 技能(SKILL.md)不归这里管,见 skills.ts —— 它们要能被 load_skill 按名字取正文。
 // 模型要用时走 read_file。远程 URL 不抓取,工作区外的路径和软链不读。
 
 import { promises as fs } from 'node:fs'
 import { glob } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { splitFrontmatter, type FrontmatterValue } from './frontmatter.ts'
 import { JsonSafetyError, parseJson } from './jsonSafety.ts'
 import { createPathGuard, type PathGuard } from './pathGuard.ts'
 
@@ -84,9 +86,7 @@ interface Draft {
   bodyText?: string
 }
 
-type FrontmatterValue = string | boolean | string[]
-
-export function appendProjectInstructions(systemPrompt: string, section: string): string {
+export function appendPromptSection(systemPrompt: string, section: string): string {
   if (!section) return systemPrompt
   return `${systemPrompt}\n\n${section}`
 }
@@ -247,7 +247,6 @@ async function collectCursor(
 
   const commandsRoot = path.join(pathGuard.workspace, '.cursor', 'commands')
   await collectPromptFiles(commandsRoot, pathGuard, drafts, state, logger, 'cursor', 'command')
-  await collectSkillFiles(path.join(pathGuard.workspace, '.cursor', 'skills'), pathGuard, drafts, state, logger, 'cursor')
 }
 
 function cursorActivation(data: Record<string, FrontmatterValue>): InstructionActivation {
@@ -297,7 +296,6 @@ async function collectClaude(
   await collectPromptFiles(path.join(claudeRoot, 'commands'), pathGuard, drafts, state, logger, 'claude', 'command')
   await collectPromptFiles(path.join(claudeRoot, 'agents'), pathGuard, drafts, state, logger, 'claude', 'agent')
   await collectPromptFiles(path.join(claudeRoot, 'output-styles'), pathGuard, drafts, state, logger, 'claude', 'style')
-  await collectSkillFiles(path.join(claudeRoot, 'skills'), pathGuard, drafts, state, logger, 'claude')
 }
 
 async function collectKiro(
@@ -334,7 +332,6 @@ async function collectKiro(
   )
 
   await collectPromptFiles(path.join(kiroRoot, 'agents'), pathGuard, drafts, state, logger, 'kiro', 'agent')
-  await collectSkillFiles(path.join(kiroRoot, 'skills'), pathGuard, drafts, state, logger, 'kiro')
   await collectKiroAgentJson(path.join(kiroRoot, 'agents'), pathGuard, drafts, state, logger)
 }
 
@@ -401,7 +398,6 @@ async function collectOpenCode(
   await collectPromptFiles(path.join(openCodeRoot, 'command'), pathGuard, drafts, state, logger, 'opencode', 'command')
   await collectPromptFiles(path.join(openCodeRoot, 'agents'), pathGuard, drafts, state, logger, 'opencode', 'agent')
   await collectPromptFiles(path.join(openCodeRoot, 'agent'), pathGuard, drafts, state, logger, 'opencode', 'agent')
-  await collectSkillFiles(path.join(openCodeRoot, 'skills'), pathGuard, drafts, state, logger, 'opencode')
 
   for (const relativeConfig of OPENCODE_CONFIG_FILES) {
     const filePath = path.join(pathGuard.workspace, relativeConfig)
@@ -528,30 +524,6 @@ async function collectPromptFiles(
       kind: 'prompt',
       activation: 'manual',
       title,
-      description: clip(stringValue(data.description) ?? firstHeading(body)),
-      patterns: [],
-    }, logger, state)
-  })
-}
-
-async function collectSkillFiles(
-  directory: string,
-  pathGuard: PathGuard,
-  drafts: Map<string, Draft>,
-  state: ScanState,
-  logger: InstructionLog,
-  tool: InstructionTool,
-): Promise<void> {
-  await collectUnder(directory, pathGuard, state, logger, (relativePath) => relativePath.endsWith('/SKILL.md') || relativePath === 'SKILL.md', async (filePath) => {
-    const text = await readProjectText(filePath, pathGuard, logger)
-    if (text === undefined) return
-    const { data, body } = splitFrontmatter(text)
-    const nested = path.relative(directory, filePath).replaceAll(path.sep, '/').replace(/\/SKILL\.md$/i, '')
-    await remember(drafts, pathGuard, filePath, {
-      tools: new Set([tool]),
-      kind: 'prompt',
-      activation: stringValue(data.description) ? 'intelligent' : 'manual',
-      title: stringValue(data.name) ?? nested,
       description: clip(stringValue(data.description) ?? firstHeading(body)),
       patterns: [],
     }, logger, state)
@@ -935,72 +907,6 @@ async function relativeProjectPath(pathGuard: PathGuard, filePath: string): Prom
 
 function toPosixRelative(root: string, filePath: string): string {
   return path.relative(root, filePath).split(path.sep).join('/')
-}
-
-function splitFrontmatter(text: string): { data: Record<string, FrontmatterValue>; body: string } {
-  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
-  if (!normalized.startsWith('---\n')) return { data: {}, body: normalized }
-  const closing = normalized.indexOf('\n---', 3)
-  if (closing === -1) return { data: {}, body: normalized }
-  const raw = normalized.slice(4, closing)
-  let body = normalized.slice(closing + 4)
-  if (body.startsWith('\n')) body = body.slice(1)
-  return { data: parseSimpleYaml(raw), body }
-}
-
-function parseSimpleYaml(raw: string): Record<string, FrontmatterValue> {
-  const data: Record<string, FrontmatterValue> = {}
-  let listKey: string | undefined
-  for (const line of raw.split('\n')) {
-    if (!line.trim() || line.trim().startsWith('#')) continue
-    const listItem = /^\s+-\s+(.*)$/.exec(line)
-    if (listItem && listKey) {
-      const current = data[listKey]
-      const items = Array.isArray(current) ? current : []
-      const value = unquote(listItem[1].trim())
-      if (value) items.push(value)
-      data[listKey] = items
-      continue
-    }
-    const field = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line)
-    if (!field) continue
-    const key = field[1]
-    const value = field[2].trim()
-    if (!value) {
-      listKey = key
-      data[key] = []
-      continue
-    }
-    listKey = undefined
-    data[key] = parseScalar(key, value)
-  }
-  return data
-}
-
-function parseScalar(key: string, value: string): FrontmatterValue {
-  if (value.startsWith('[') && value.endsWith(']')) {
-    return value.slice(1, -1).split(',').map((part) => unquote(part.trim())).filter(Boolean)
-  }
-  const unquoted = unquote(value)
-  if (unquoted === 'true') return true
-  if (unquoted === 'false') return false
-  if (
-    (key === 'globs' || key === 'paths' || key === 'fileMatchPattern' || key === 'fileMatch')
-    && unquoted.includes(',')
-  ) {
-    return unquoted.split(',').map((part) => part.trim()).filter(Boolean)
-  }
-  return unquoted
-}
-
-function unquote(value: string): string {
-  if (
-    (value.startsWith('"') && value.endsWith('"'))
-    || (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1)
-  }
-  return value
 }
 
 function stringValue(value: FrontmatterValue | undefined): string | undefined {

@@ -1,6 +1,9 @@
+#!/usr/bin/env node
 // src/cli.ts
 // 拼装层 —— 把 llm / agent / tui / tools / config 粘起来，是唯一入口。
 // session 持久化：每轮结束把 context.messages 写进 ~/.grassagent/sessions.db。
+//
+// 第一行是 shebang,给 npm bin 用。`node src/cli.ts` 照样跑,Node 会跳过它。
 
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,6 +14,7 @@ import { openExecutionWorld } from './sandbox/openWorld.ts'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { createAskUserTool } from './askUser.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
+import { readVersion } from './version.ts'
 import { createLoggerFromConfig } from './logger.ts'
 import { createTransport } from './transport.ts'
 import { SessionStore, generateSessionId } from './sessionStore.ts'
@@ -20,11 +24,12 @@ import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import { appendHookContext, createHookRunner, type HookRunner } from './hooks.ts'
 import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './hookConfig.ts'
 import {
-  appendProjectInstructions,
+  appendPromptSection,
   discoverProjectInstructions,
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
+import { createSkillRegistry, discoverSkills, summarizeSkills, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -44,6 +49,12 @@ const SYSTEM_PROMPT =
   '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。'
 
 async function main() {
+  // --version 在加载配置之前处理。查版本不该要求先配好 API Key。
+  if (process.argv.includes('--version') || process.argv.includes('-v')) {
+    process.stdout.write(`grassagent ${readVersion()}\n`)
+    return
+  }
+
   // 配置先加载并校验:启动阶段就报错，比第一次调 API 失败好排查
   let config: AgentConfig
   try {
@@ -97,13 +108,32 @@ async function main() {
         warn: (object, message) => logger.warn(object, message),
         info: (object, message) => logger.info(object, message),
       })
-      systemPrompt = appendProjectInstructions(SYSTEM_PROMPT, catalog.promptSection)
+      systemPrompt = appendPromptSection(SYSTEM_PROMPT, catalog.promptSection)
       instructionReport = formatInstructionReport(catalog.instructions)
       if (catalog.instructions.length > 0) instructionNotice = summarizeInstructions(catalog.instructions)
     } catch (error) {
       instructionReport = '识别项目规则失败,本次不加载外部规则'
       instructionNotice = instructionReport
       logger.error({ errorMessage: (error as Error).message }, '识别项目规则失败,继续启动')
+    }
+  }
+
+  // 技能:正文不进系统提示词,只列名字和描述,模型要做这件事时用 load_skill 取全文。
+  // 识别失败和规则一样不挡启动,按「没有技能」处理。
+  let skills: SkillRegistry | undefined
+  let skillReport = '技能加载已关闭'
+  if (config.LoadSkills) {
+    try {
+      const skillCatalog = await discoverSkills(config.Workspace, {
+        warn: (object, message) => logger.warn(object, message),
+        info: (object, message) => logger.info(object, message),
+      })
+      systemPrompt = appendPromptSection(systemPrompt, skillCatalog.promptSection)
+      skills = createSkillRegistry(skillCatalog.skills)
+      skillReport = summarizeSkills(skillCatalog.skills)
+    } catch (error) {
+      skillReport = '识别技能失败,本次不加载技能'
+      logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
     }
   }
 
@@ -137,6 +167,7 @@ async function main() {
   const fileTools = await builtinTools({
     world,
     commandTimeoutMs: config.CommandTimeoutMs,
+    skills,
   })
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
@@ -388,8 +419,8 @@ async function main() {
 
   commandRegistry.register({
     name: 'instructions',
-    description: '列出识别到的规则和提示词',
-    execute: () => instructionReport,
+    description: '列出识别到的规则、提示词和技能',
+    execute: () => `${instructionReport}\n${skillReport}`,
   })
 
   // 切换会话:存盘当前会话,切过去,载入目标会话的历史

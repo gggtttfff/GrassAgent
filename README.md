@@ -125,10 +125,10 @@ npm start
 
 | 工具 | 规则 | 提示词 |
 | --- | --- | --- |
-| opencode | `AGENTS.md`，以及 `opencode.json` / `opencode.jsonc` 里 `instructions` 指向的本地文件 | `.opencode/commands/`、`.opencode/agents/`、`.opencode/skills/`，还有配置里的 `command` / `agents` |
-| cursor | `.cursor/rules/**/*.mdc`、根目录 `.cursorrules`、`AGENTS.md` | `.cursor/commands/`、`.cursor/skills/` |
-| claude | `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md`、`.claude/rules/` | `.claude/commands/`、`.claude/agents/`、`.claude/skills/`、`.claude/output-styles/` |
-| kiro | `.kiro/steering/`、`AGENTS.md` | `.kiro/agents/`、`.kiro/skills/` |
+| opencode | `AGENTS.md`，以及 `opencode.json` / `opencode.jsonc` 里 `instructions` 指向的本地文件 | `.opencode/commands/`、`.opencode/agents/`，还有配置里的 `command` / `agents` |
+| cursor | `.cursor/rules/**/*.mdc`、根目录 `.cursorrules`、`AGENTS.md` | `.cursor/commands/` |
+| claude | `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md`、`.claude/rules/` | `.claude/commands/`、`.claude/agents/`、`.claude/output-styles/` |
+| kiro | `.kiro/steering/`、`AGENTS.md` | `.kiro/agents/` |
 
 始终生效的规则（例如根目录 `AGENTS.md`、`alwaysApply: true`、没有 `paths` 的 Claude 规则、Kiro `inclusion: always`）会放进系统提示词。按文件匹配、按描述判断、点名才用的规则只留一行索引，模型改到相关文件时用 `read_file` 再读。提示词同样只进索引：用户点名，或任务和描述对上时才读正文，不会当成当前任务自动执行。
 
@@ -137,6 +137,14 @@ npm start
 不抓取配置里的 `https://` 地址，不读工作区外面的文件。指向区外的软链会跳过。`node_modules`、`.git` 这类目录不扫描。某个文件坏了，或者 JSON 嵌套过深，只记日志，启动继续。不想要这套识别时设 `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS=0`。
 
 用户主目录里的全局规则（`~/.claude`、`~/.config/opencode`、`~/.kiro`）不在这次的扫描范围里，它们不属于当前项目。
+
+### 技能
+
+`.grass/skills/`、`.cursor/skills/`、`.claude/skills/`、`.kiro/skills/`、`.opencode/skills/` 下的 `SKILL.md` 按技能处理。同名技能取上面顺序里的第一个，后面的只记日志。
+
+技能正文不进系统提示词，只列名字和描述。模型判断任务和某条描述对得上时调 `load_skill` 取全文；正文里提到的脚本、模板放在技能目录下，再用 `read_file` 按需读。正文超过 24000 字会截断，并提示去读全文。没有描述也没有一级标题的技能不会被索引。
+
+技能目录同样必须在工作区内，指向区外的软链会跳过。用户主目录里的 `~/.cursor/skills-cursor` 这类官方技能不在扫描范围。不想要这套逻辑时设 `GRASSAGENT_LOAD_SKILLS=0`，关掉后不注册 `load_skill`。
 
 ### 钩子
 
