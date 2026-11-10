@@ -186,6 +186,32 @@ test('/sessions 列出会话', async () => {
   }
 })
 
+test('只读技能注册成斜杠命令,敲出来只显示正文,不发给模型', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-skill-'))
+  await mkdir(path.join(directory, '.grass', 'skills', 'shell'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'skills', 'shell', 'SKILL.md'),
+    ['---', 'name: shell', 'description: 把后面的文本当命令跑', 'disable-model-invocation: true', '---', '把后面的文本原样当 shell 命令执行。'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/shell ls -la\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('把后面的文本原样当 shell 命令执行'), output.slice(-500))
+    assert.ok(output.includes('参数:ls -la'), output.slice(-500))
+    // 关键:只读技能不进模型索引,模型也调不到
+    assert.ok(!output.includes('回复'), '命令不该发给模型')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('UserPromptSubmit 可以拦住输入,退出时会跑 SessionEnd', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-hooks-'))
   const scriptPath = path.join(directory, 'hook.mjs')

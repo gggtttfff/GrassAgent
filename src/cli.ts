@@ -29,7 +29,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, discoverSkills, summarizeSkills, type SkillOrigin, type SkillRegistry } from './skills.ts'
+import { commandOnlySkills, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -142,6 +142,7 @@ async function main() {
   // 技能从执行世界里读,远程时读的是沙盒里的文件,不是本机那份。
   // 识别失败和规则一样不挡启动,按「没有技能」处理。
   let skills: SkillRegistry | undefined
+  let skillCatalog: SkillCatalog | undefined
   let skillReport = '技能加载已关闭'
   const skillNotices: string[] = []
   if (config.LoadSkills) {
@@ -150,7 +151,7 @@ async function main() {
       const skillFiles = skillOrigin.kind === 'remote'
         ? createWorldSkillFiles(world)
         : await createLocalSkillFiles(config.Workspace)
-      const skillCatalog = await discoverSkills({
+      skillCatalog = await discoverSkills({
         files: skillFiles,
         origin: skillOrigin,
         logger: {
@@ -434,6 +435,25 @@ async function main() {
     description: '列出识别到的规则、提示词和技能',
     execute: () => `${instructionReport}\n${skillReport}`,
   })
+
+  // 只允许用户手敲的技能注册成斜杠命令。
+  // 它们不进模型索引,模型也调不到——用户敲了就把正文显示出来,要不要发给模型由用户决定。
+  for (const skill of commandOnlySkills(skillCatalog?.skills ?? [])) {
+    if (!isUsableCommandName(skill.name)) {
+      skillNotices.push(`技能 ${skill.name} 只能由用户手敲,但名字不能当命令名,已跳过`)
+      continue
+    }
+    if (commandRegistry.find(skill.name)) {
+      skillNotices.push(`技能 ${skill.name} 的命令名和已有命令冲突,已跳过`)
+      continue
+    }
+    commandRegistry.register({
+      name: skill.name,
+      description: skill.description,
+      argumentHint: '[参数]',
+      execute: (argument) => formatCommandOnlySkill(skill, argument),
+    })
+  }
 
   // 切换会话:存盘当前会话,切过去,载入目标会话的历史
   const switchToSession = async (targetSessionId: string): Promise<string> => {

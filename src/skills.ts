@@ -37,6 +37,11 @@ export interface Skill {
   origin: SkillOrigin
   /** 被禁用时写明原因。禁用的技能不进索引,load_skill 也取不到。 */
   disabledReason?: string
+  /**
+   * 只允许用户手敲,模型不能自己调。
+   * 这类技能不进索引,注册成斜杠命令。
+   */
+  commandOnly: boolean
 }
 
 export interface SkillCatalog {
@@ -226,8 +231,9 @@ function disableDuplicatedSkills(skills: Skill[], logger: SkillLog): Skill[] {
 }
 
 export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
-  // 被禁用的技能不进注册表:模型问 load_skill 时找不到它,就不会拿一份来路不明的正文
-  const usable = skills.filter((skill) => !skill.disabledReason)
+  // 被禁用的技能不进注册表:模型问 load_skill 时找不到它,就不会拿一份来路不明的正文。
+  // 只允许用户手敲的技能同样不进——模型不能自己调它们。
+  const usable = skills.filter((skill) => !skill.disabledReason && !skill.commandOnly)
   const byExactName = new Map(usable.map((skill) => [skill.name, skill]))
   const byLowerCaseName = new Map<string, Skill>()
   for (const skill of usable) {
@@ -246,7 +252,7 @@ export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
 }
 
 export function renderSkillSection(skills: readonly Skill[]): string {
-  const usable = skills.filter((skill) => !skill.disabledReason)
+  const usable = skills.filter((skill) => !skill.disabledReason && !skill.commandOnly)
   if (usable.length === 0) return ''
   return [
     '## 可用技能',
@@ -262,6 +268,32 @@ export function describeDisabledSkills(skills: readonly Skill[]): string[] {
   return skills
     .filter((skill) => skill.disabledReason)
     .map((skill) => `技能 ${skill.name} 已禁用:${skill.disabledReason}`)
+}
+
+/** 只允许用户手敲的技能。 */
+export function commandOnlySkills(skills: readonly Skill[]): Skill[] {
+  return skills.filter((skill) => !skill.disabledReason && skill.commandOnly)
+}
+
+/** 技能名能不能当斜杠命令名。带斜杠或空格的名字在补全列表里会出问题。 */
+export function isUsableCommandName(name: string): boolean {
+  return /^[a-z0-9][a-z0-9_-]*$/i.test(name)
+}
+
+/**
+ * 只读技能被敲出来时的文本。
+ *
+ * 不发给模型——用户自己看到正文,再决定要不要粘给模型。
+ * 参数原样带上,提示语要说清下一步该做什么。
+ */
+export function formatCommandOnlySkill(skill: Skill, argument: string): string {
+  const lines = [`# 技能 ${skill.name}`, `来源:${skill.origin.label}`, `正文:${skill.relativePath}`, '']
+  lines.push(skill.body)
+  if (argument) {
+    lines.push('', '---', `按上面的技能处理,参数:${argument}`)
+  }
+  lines.push('', '(这段正文只显示给你。要让模型照着做,把上面的内容发给它。)')
+  return lines.join('\n')
 }
 
 /** load_skill 回给模型的文本:正文 + 附件目录提示。 */
@@ -367,7 +399,17 @@ async function loadSkill(
     truncated,
     source,
     origin: context.origin,
+    commandOnly: isCommandOnly(data),
   })
+}
+
+/**
+ * 只允许用户手敲的技能。
+ * Cursor 的写法是 disable-model-invocation,Claude 的写法是 disable-model-invocation,
+ * 驼峰写法也认。
+ */
+function isCommandOnly(data: Record<string, unknown>): boolean {
+  return data['disable-model-invocation'] === true || data.disableModelInvocation === true
 }
 
 async function listEntries(directory: string, context: CollectContext): Promise<SkillFileEntry[]> {

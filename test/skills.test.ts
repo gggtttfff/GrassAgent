@@ -4,11 +4,14 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
+  commandOnlySkills,
   createLocalSkillFiles,
   createSkillRegistry,
   createWorldSkillFiles,
   describeDisabledSkills,
   discoverSkills,
+  formatCommandOnlySkill,
+  isUsableCommandName,
   type SkillLog,
   type SkillOrigin,
 } from '../src/skills.ts'
@@ -300,6 +303,39 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
     }
   } finally {
     await fs.rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('只读技能不进索引,注册成斜杠命令', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/shell', [
+      '---',
+      'name: shell',
+      'description: 把后面的文本当命令跑',
+      'disable-model-invocation: true',
+      '---',
+      '把后面的文本原样当 shell 命令执行。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    const skill = catalog.skills[0]
+    assert.equal(skill?.commandOnly, true)
+    // 不进索引,模型也调不到
+    assert.equal(catalog.promptSection, '')
+    assert.equal(createSkillRegistry(catalog.skills).find('shell'), undefined)
+
+    assert.equal(commandOnlySkills(catalog.skills).length, 1)
+    const text = formatCommandOnlySkill(skill!, 'ls -la')
+    assert.match(text, /把后面的文本原样当 shell 命令执行/)
+    assert.match(text, /参数:ls -la/)
+    assert.match(text, /只显示给你/)
+
+    assert.equal(isUsableCommandName('shell'), true)
+    assert.equal(isUsableCommandName('review/pr'), false)
+    assert.equal(isUsableCommandName('带 空格'), false)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
   }
 })
 
