@@ -317,6 +317,7 @@ export function formatSkillForModel(skill: Skill): string {
     `来源:${skill.origin.label}`,
     `正文:${skill.relativePath}`,
     `附件目录:${skill.directoryPath}(脚本、模板、参考文档在这里,用 read_file 按需读,不要整目录读)`,
+    `正文里的相对路径都相对于 ${skill.directoryPath},不是工作区根目录。`,
   ]
   if (skill.attachments.length > 0) {
     lines.push(`附件:${skill.attachments.join('、')}`)

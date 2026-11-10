@@ -254,6 +254,8 @@ test('load_skill 返回正文和附件目录,未知名字报错时列出可用�
     const result = await loadSkill.execute({ name: '/DEMO' })
     assert.match(result, /# 技能 demo/)
     assert.match(result, /附件目录:\.grass\/skills\/demo/)
+    // 正文里的相对路径是相对技能目录的,不是工作区根
+    assert.match(result, /相对路径都相对于 \.grass\/skills\/demo/)
     assert.match(result, /第一步读 scripts\/run\.sh/)
 
     const missing = await loadSkill.execute({ name: 'nope' })
