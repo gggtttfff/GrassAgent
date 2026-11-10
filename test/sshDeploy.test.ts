@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Writable } from 'node:stream'
 import ssh2 from 'ssh2'
 import { shellQuote, pathLevels } from '../src/sandbox/sshDeploy.ts'
@@ -239,10 +240,10 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
     // SFTP 写的是真磁盘。daemon 源码和它的依赖都要传过去。
     const remoteRoot = path.join(path.parse(process.cwd()).root, 'tmp', 'grass-test123')
     const daemonContent = await readFile(path.join(remoteRoot, 'src', 'sandbox', 'daemon.ts'), 'utf-8')
-    const localDaemon = await readFile(
-      new URL('../src/sandbox/daemon.ts', import.meta.url).pathname.replace(/^\//, ''),
-      'utf-8',
-    )
+    // 用 fileURLToPath 而不是 url.pathname。Windows 上 pathname 是 /B:/...,
+// 去掉开头的斜杠恰好能用;Linux 上是 /home/..., 去掉就变成相对路径了。
+    const localDaemonPath = fileURLToPath(new URL('../src/sandbox/daemon.ts', import.meta.url))
+    const localDaemon = await readFile(localDaemonPath, 'utf-8')
     assert.equal(daemonContent, localDaemon, '传过去的 daemon 源码要和本地一致')
 
     // 依赖也传了
