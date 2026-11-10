@@ -44,6 +44,14 @@ export interface Skill {
   commandOnly: boolean
   /** 技能目录下的附件。模型按名字用 read_file 读。 */
   attachments: string[]
+  /** 正文的二级标题和它们在文件里的行号。正文被截断时靠它定位。 */
+  headings: SkillHeading[]
+}
+
+/** 技能正文里的一个标题。行号是 SKILL.md 文件里的行号,read_file 对得上。 */
+export interface SkillHeading {
+  title: string
+  line: number
 }
 
 export interface SkillCatalog {
@@ -313,12 +321,17 @@ export function formatSkillForModel(skill: Skill): string {
   if (skill.attachments.length > 0) {
     lines.push(`附件:${skill.attachments.join('、')}`)
   }
+  if (skill.headings.length > 0) {
+    lines.push('目录:')
+    for (const heading of skill.headings) lines.push(`- ${heading.title}(第 ${heading.line} 行)`)
+  }
   lines.push('', skill.body)
   if (skill.truncated) {
     lines.push(
       '',
       '---',
-      `正文超过 ${MAX_SKILL_BODY_CHARS} 字已截断,完整内容用 read_file 读 ${skill.relativePath}。`,
+      `正文超过 ${MAX_SKILL_BODY_CHARS} 字已截断,上面的目录覆盖全文,` +
+      `用 read_file 读 ${skill.relativePath} 的对应段落。`,
     )
   }
   return lines.join('\n')
@@ -375,7 +388,7 @@ async function loadSkill(
     return
   }
 
-  const { data, body } = splitFrontmatter(text)
+  const { data, body, bodyStartLine } = splitFrontmatter(text)
   // 没写 name 就用它在技能根下的目录名,允许多级,比如 "review/pr"
   const directoryName = relativeOf(rootDirectory, filePath)
   const name = (stringValue(data.name) ?? directoryName).trim()
@@ -410,7 +423,25 @@ async function loadSkill(
     origin: context.origin,
     commandOnly: isCommandOnly(data),
     attachments,
+    headings: collectHeadings(normalizedBody, bodyStartLine),
   })
+}
+
+/**
+ * 正文里的二级标题和它们的文件行号。
+ *
+ * 正文被截断时,模型靠这份清单用 read_file 去读缺掉的那一段。
+ * 行号按整个 SKILL.md 算,read_file 给的行号才对得上。
+ */
+function collectHeadings(body: string, bodyStartLine: number): SkillHeading[] {
+  const headings: SkillHeading[] = []
+  const lines = body.split('\n')
+  for (let index = 0; index < lines.length; index++) {
+    const match = /^##\s+(.+)$/.exec(lines[index] ?? '')
+    if (!match) continue
+    headings.push({ title: match[1].trim(), line: bodyStartLine + index })
+  }
+  return headings
 }
 
 /**

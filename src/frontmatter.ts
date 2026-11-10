@@ -7,16 +7,27 @@
 
 export type FrontmatterValue = string | boolean | string[]
 
-/** 拆出 `---` 包围的头和正文。没有头时整篇都是正文。行尾统一成 \n。 */
-export function splitFrontmatter(text: string): { data: Record<string, FrontmatterValue>; body: string } {
+/**
+ * 拆出 `---` 包围的头和正文。没有头时整篇都是正文。行尾统一成 \n。
+ *
+ * bodyStartLine 是正文第一行在原文件里的行号(从 1 开始)。
+ * 技能用它把标题的行号换算成文件行号,模型才能拿 read_file 定位。
+ */
+export function splitFrontmatter(text: string): {
+  data: Record<string, FrontmatterValue>
+  body: string
+  bodyStartLine: number
+} {
   const normalized = text.replace(/^﻿/, '').replace(/\r\n/g, '\n')
-  if (!normalized.startsWith('---\n')) return { data: {}, body: normalized }
+  if (!normalized.startsWith('---\n')) return { data: {}, body: normalized, bodyStartLine: 1 }
   const closing = normalized.indexOf('\n---', 3)
-  if (closing === -1) return { data: {}, body: normalized }
+  if (closing === -1) return { data: {}, body: normalized, bodyStartLine: 1 }
   const raw = normalized.slice(4, closing)
   let body = normalized.slice(closing + 4)
   if (body.startsWith('\n')) body = body.slice(1)
-  return { data: parseFrontmatterYaml(raw), body }
+  // 头占了几行:'---\n' 一行,头本身几行,收尾的 '---' 一行
+  const headerLines = raw.split('\n').length
+  return { data: parseFrontmatterYaml(raw), body, bodyStartLine: headerLines + 3 }
 }
 
 export function parseFrontmatterYaml(raw: string): Record<string, FrontmatterValue> {

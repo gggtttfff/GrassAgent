@@ -306,6 +306,42 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
   }
 })
 
+test('标题清单带文件行号,截断时仍覆盖全文', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/long', [
+      '---',
+      'name: long',
+      'description: 分节的技能',
+      '---',
+      '## 第一节',
+      '内容一。',
+      '## 第二节',
+      '内容二。',
+      '## 第三节',
+      'x'.repeat(25_000),
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    const skill = catalog.skills[0]
+    assert.deepEqual(skill?.headings.map((heading) => heading.title), ['第一节', '第二节', '第三节'])
+    // 行号按整个 SKILL.md 算,read_file 对得上
+    assert.equal(skill?.headings[0]?.line, 5)
+    assert.equal(skill?.headings[1]?.line, 7)
+
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const loadSkill = tools.find((tool) => tool.name === 'load_skill')
+    const result = await loadSkill?.execute({ name: 'long' })
+    assert.match(result ?? '', /目录:/)
+    assert.match(result ?? '', /第一节\(第 5 行\)/)
+    // 截断了,目录仍要覆盖全文
+    assert.match(result ?? '', /第三节\(第 9 行\)/)
+    assert.match(result ?? '', /上面的目录覆盖全文/)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('附件列在技能目录里,超大和超量的不进清单', async () => {
   const workspace = await makeWorkspace()
   try {
