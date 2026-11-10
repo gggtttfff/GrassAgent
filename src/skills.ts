@@ -11,6 +11,7 @@ import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import type { ExecutionWorld } from './executionWorld.ts'
 import { splitFrontmatter, type FrontmatterValue } from './frontmatter.ts'
+import { parseJson } from './jsonSafety.ts'
 import { createPathGuard, type PathGuard } from './pathGuard.ts'
 
 export type SkillSource = 'grass' | 'cursor' | 'claude' | 'kiro' | 'opencode'
@@ -95,6 +96,23 @@ export interface SkillFileSystem {
   readText(relativePath: string): Promise<string | undefined>
 }
 
+/**
+ * 技能扫描的缓存。
+ *
+ * 按文件的大小和修改时间判断有没有变过——变了就得重读。
+ * 缓存文件在工作区的 .grass/tmp 下,模型能改它,所以读的时候要当不可信输入校验。
+ */
+export interface SkillCache {
+  /** 先把缓存读进来。必须在扫描之前调,否则命中不了。 */
+  load(): Promise<void>
+  /** 取缓存。文件变了或者没有缓存都返回 undefined */
+  get(relativePath: string, size?: number, mtimeMs?: number): Skill | undefined
+  /** 存缓存 */
+  set(relativePath: string, size: number | undefined, mtimeMs: number | undefined, skill: Skill): void
+  /** 落盘。失败不影响本次使用 */
+  flush(): Promise<void>
+}
+
 // 顺序就是优先级:工作区自己的技能写在最前面,同名时不被别的工具覆盖。
 const SKILL_ROOTS: readonly { directory: string; source: SkillSource }[] = [
   { directory: '.grass/skills', source: 'grass' },
@@ -118,6 +136,12 @@ const SKILL_FILE_NAME = 'skill.md'
 // 附件只列名字,数量和体积都要有上限,不然工具输出会被撑大
 const MAX_ATTACHMENTS = 20
 const MAX_ATTACHMENT_BYTES = 256 * 1024
+
+// 缓存文件的格式版本。解析不了或版本对不上就当没有缓存。
+const CACHE_VERSION = 1
+
+/** 缓存文件在工作区里的位置。放在 .grass/tmp 下,那目录已经在 .gitignore 里。 */
+export const SKILL_CACHE_RELATIVE_PATH = '.grass/tmp/skills-cache.json'
 
 // GrassAgent 跑在本地终端上。技能声明别的环境就装不进来。
 const GRASS_ENVIRONMENT = 'local'
@@ -190,16 +214,104 @@ export function createWorldSkillFiles(world: ExecutionWorld): SkillFileSystem {
 }
 
 /**
+ * 扫描缓存。放在 .grass/tmp 下,那目录已经在 .gitignore 里。
+ *
+ * 只缓存「文件没变」的情况:大小和修改时间都对得上才复用。
+ * 缓存文件模型也能写,所以读的时候按不可信输入处理,结构对不上就当没有缓存。
+ */
+export function createSkillCache(options: {
+  /** 工作区根目录 */
+  workspace: string
+  /** 缓存文件在工作区里的相对路径 */
+  relativePath: string
+  logger?: SkillLog
+}): SkillCache {
+  const logger = options.logger ?? noopLog
+  const entries = new Map<string, CacheEntry>()
+  const filePath = path.join(options.workspace, options.relativePath)
+
+  return {
+    async load(): Promise<void> {
+      let text: string
+      try {
+        text = await fs.readFile(filePath, 'utf8')
+      } catch {
+        // 没有缓存是正常情况,第一次扫描完就有了
+        return
+      }
+      for (const entry of parseCache(text)) entries.set(entry.path, entry)
+    },
+    get(relativePath, size, mtimeMs) {
+      const entry = entries.get(relativePath)
+      if (!entry) return undefined
+      if (entry.size !== size || entry.mtimeMs !== mtimeMs) return undefined
+      return entry.skill
+    },
+    set(relativePath, size, mtimeMs, skill) {
+      entries.set(relativePath, { path: relativePath, size, mtimeMs, skill })
+    },
+    async flush(): Promise<void> {
+      const payload = {
+        version: CACHE_VERSION,
+        entries: [...entries.values()],
+      }
+      try {
+        await fs.mkdir(path.dirname(filePath), { recursive: true })
+        await fs.writeFile(filePath, JSON.stringify(payload), 'utf8')
+      } catch (error) {
+        logger.warn({ path: filePath, errorMessage: errorMessage(error) }, '技能缓存写入失败,已忽略')
+      }
+    },
+  }
+}
+
+interface CacheEntry {
+  path: string
+  size: number | undefined
+  mtimeMs: number | undefined
+  skill: Skill
+}
+
+function parseCache(text: string): CacheEntry[] {
+  try {
+    const parsed = parseJson(text) as { version?: unknown; entries?: unknown }
+    if (parsed.version !== CACHE_VERSION || !Array.isArray(parsed.entries)) return []
+    const result: CacheEntry[] = []
+    for (const raw of parsed.entries) {
+      if (!raw || typeof raw !== 'object') continue
+      const entry = raw as Record<string, unknown>
+      if (typeof entry.path !== 'string' || !entry.skill || typeof entry.skill !== 'object') continue
+      const skill = entry.skill as unknown as Skill
+      if (typeof skill.name !== 'string' || typeof skill.body !== 'string') continue
+      result.push({
+        path: entry.path,
+        size: typeof entry.size === 'number' ? entry.size : undefined,
+        mtimeMs: typeof entry.mtimeMs === 'number' ? entry.mtimeMs : undefined,
+        skill,
+      })
+    }
+    return result
+  } catch (error) {
+    // 缓存坏了就当没有,不能因为它挡启动
+    return []
+  }
+}
+
+/**
  * 扫出工作区里的全部技能。识别失败不抛错——技能是锦上添花,不能挡启动。
  */
 export async function discoverSkills(options: {
   files: SkillFileSystem
   origin: SkillOrigin
   logger?: SkillLog
+  /** 给了就用缓存,省掉重复读文件和解析 */
+  cache?: SkillCache
 }): Promise<SkillCatalog> {
   const logger = options.logger ?? noopLog
   const collected: Skill[] = []
   const maxDepth = options.origin.kind === 'remote' ? REMOTE_WALK_DEPTH : LOCAL_WALK_DEPTH
+
+  await options.cache?.load()
 
   for (const root of SKILL_ROOTS) {
     if (collected.length >= MAX_SKILLS) {
@@ -211,6 +323,7 @@ export async function discoverSkills(options: {
       origin: options.origin,
       maxDepth,
       skills: collected,
+      cache: options.cache,
       logger,
     })
   }
@@ -220,6 +333,7 @@ export async function discoverSkills(options: {
   const skills = disableDuplicatedSkills(collected, logger)
 
   skills.sort((left, right) => left.name.localeCompare(right.name))
+  await options.cache?.flush()
   logger.info({ skillCount: skills.length, origin: options.origin.label }, '技能已识别')
   return { skills, promptSection: renderSkillSection(skills) }
 }
@@ -381,6 +495,7 @@ interface CollectContext {
   origin: SkillOrigin
   maxDepth: number
   skills: Skill[]
+  cache?: SkillCache
   logger: SkillLog
 }
 
@@ -401,7 +516,7 @@ async function collectSkillFiles(
       continue
     }
     if (entry.type !== 'file' || entry.name.toLowerCase() !== SKILL_FILE_NAME) continue
-    await loadSkill(child, rootDirectory, source, context)
+    await loadSkill(child, rootDirectory, source, entry.size, entry.mtimeMs, context)
   }
 }
 
@@ -409,8 +524,17 @@ async function loadSkill(
   filePath: string,
   rootDirectory: string,
   source: SkillSource,
+  size: number | undefined,
+  mtimeMs: number | undefined,
   context: CollectContext,
 ): Promise<void> {
+  // 文件没变就用缓存,省掉读文件和解析
+  const cached = context.cache?.get(filePath, size, mtimeMs)
+  if (cached) {
+    context.skills.push(cached)
+    return
+  }
+
   const text = await context.files.readText(filePath)
   if (text === undefined) {
     context.logger.warn({ path: filePath }, '技能文件读不到或不是文本,已跳过')
@@ -463,6 +587,7 @@ async function loadSkill(
     headings: collectHeadings(normalizedBody, bodyStartLine),
     skippedReason,
   })
+  context.cache?.set(filePath, size, mtimeMs, context.skills[context.skills.length - 1]!)
 }
 
 /**

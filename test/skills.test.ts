@@ -6,12 +6,14 @@ import * as path from 'node:path'
 import {
   commandOnlySkills,
   createLocalSkillFiles,
+  createSkillCache,
   createSkillRegistry,
   createWorldSkillFiles,
   describeDisabledSkills,
   discoverSkills,
   formatCommandOnlySkill,
   isUsableCommandName,
+  SKILL_CACHE_RELATIVE_PATH,
   type SkillLog,
   type SkillOrigin,
 } from '../src/skills.ts'
@@ -305,6 +307,89 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
     }
   } finally {
     await fs.rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+test('缓存命中时不重读文件,文件变了就失效', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/demo', [
+      '---',
+      'name: demo',
+      'description: 演示用的技能',
+      '---',
+      '正文。',
+    ].join('\n'))
+
+    const cache = createSkillCache({
+      workspace,
+      relativePath: SKILL_CACHE_RELATIVE_PATH,
+    })
+    const first = await discoverSkills({
+      files: await createLocalSkillFiles(workspace),
+      origin: localOrigin,
+      cache,
+    })
+    assert.equal(first.skills.length, 1)
+    // 缓存文件已经落盘
+    assert.equal(
+      await fs.stat(path.join(workspace, SKILL_CACHE_RELATIVE_PATH)).then(() => true),
+      true,
+    )
+
+    // 第二次扫描:把读文件的通道掐掉,还能扫出技能就说明走了缓存
+    const files = await createLocalSkillFiles(workspace)
+    const brokenRead: typeof files.readText = async () => undefined
+    const cached = await discoverSkills({
+      files: { listEntries: files.listEntries, readText: brokenRead },
+      origin: localOrigin,
+      cache,
+    })
+    assert.equal(cached.skills.length, 1)
+    assert.equal(cached.skills[0]?.name, 'demo')
+
+    // 文件改了,缓存失效,重新读
+    await writeSkill(workspace, '.grass/skills/demo', [
+      '---',
+      'name: demo',
+      'description: 改过的描述',
+      '---',
+      '新正文。',
+    ].join('\n'))
+    const refreshed = await discoverSkills({
+      files: await createLocalSkillFiles(workspace),
+      origin: localOrigin,
+      cache,
+    })
+    assert.equal(refreshed.skills[0]?.description, '改过的描述')
+    assert.equal(refreshed.skills[0]?.body, '新正文。')
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('缓存文件坏了当没有缓存', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/demo', [
+      '---',
+      'name: demo',
+      'description: 演示用的技能',
+      '---',
+      '正文。',
+    ].join('\n'))
+    await fs.mkdir(path.join(workspace, '.grass', 'tmp'), { recursive: true })
+    await fs.writeFile(path.join(workspace, SKILL_CACHE_RELATIVE_PATH), '{ 坏的 json')
+
+    const cache = createSkillCache({ workspace, relativePath: SKILL_CACHE_RELATIVE_PATH })
+    const catalog = await discoverSkills({
+      files: await createLocalSkillFiles(workspace),
+      origin: localOrigin,
+      cache,
+    })
+    assert.equal(catalog.skills.length, 1)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
   }
 })
 

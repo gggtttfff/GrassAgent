@@ -29,7 +29,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { commandOnlySkills, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
+import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -151,9 +151,14 @@ async function main() {
       const skillFiles = skillOrigin.kind === 'remote'
         ? createWorldSkillFiles(world)
         : await createLocalSkillFiles(config.Workspace)
+      // 缓存只在本地用:远程的目录每次都是新克隆的,缓存没有意义
+      const skillCache = skillOrigin.kind === 'remote'
+        ? undefined
+        : createSkillCache({ workspace: config.Workspace, relativePath: SKILL_CACHE_RELATIVE_PATH })
       skillCatalog = await discoverSkills({
         files: skillFiles,
         origin: skillOrigin,
+        cache: skillCache,
         logger: {
           warn: (object, message) => logger.warn(object, message),
           info: (object, message) => logger.info(object, message),
