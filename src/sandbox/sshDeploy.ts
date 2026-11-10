@@ -12,6 +12,7 @@ import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Logger } from '../logger.ts'
+import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
 
 /** daemon 及其依赖。相对本仓库根目录。 */
 const DAEMON_SOURCES = [
@@ -195,7 +196,7 @@ async function waitForDaemon(
         `curl -sS -m 5 -X POST http://127.0.0.1:${port}/call`,
         `-H 'content-type: application/json'`,
         `-H 'authorization: Bearer ${token}'`,
-        `--data '{"version":1,"kind":"health"}'`,
+        `--data '{"version":${SANDBOX_PROTOCOL_VERSION},"kind":"health"}'`,
       ].join(' '),
       logger,
     )
