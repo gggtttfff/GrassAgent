@@ -9,29 +9,34 @@
 **每个模块单一职责**，依赖方向单向向下，禁止循环依赖：
 
 ```
-cli.ts → agent.ts → llm.ts → protocol.ts
-   ↓        ↓                      ↑
-  tui.ts   tools.ts           providers/
-   ↓        ↓                (openai.ts)
-config.ts  pathGuard.ts
-   ↓          hooks.ts
-logger.ts / transport.ts / retry.ts / mutationQueue.ts
-sessionStore.ts
-hookConfig.ts → hooks.ts
-projectInstructions.ts → pathGuard.ts / frontmatter.ts
-skills.ts → executionWorld.ts / pathGuard.ts / frontmatter.ts / jsonSafety.ts
-frontmatter.ts
-sessionBundle.ts → messages.ts
-jsonSafety.ts
+cli.ts                  唯一入口：拼装所有簇，自己不被任何模块引用
+  ↓
+ui/         tui / theme / sessionPicker / nonInteractiveTerminal / lineQueue / slashCommands
+  ↓
+agent/      agent / tools / askUser / hooks / hookConfig
+  ↓
+llm/        llm / protocol / messages / compaction / providers/
+instructions/ projectInstructions / skills
+session/    sessionStore / sessionBundle
+sandbox/    daemon / docker·inProcess·ssh 后端 / 控制面 / remoteWorld
+  ↓
+world/      executionWorld / localWorld / outputBound / approvalGate
+  ↓
+core/       logger / jsonSafety / retry / transport / validation /
+            mutationQueue / pathGuard / textEdit / frontmatter
+  ↓
+config.ts / version.ts   叶子：只被引用，不引用任何模块
 ```
 
-`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
+同一层的簇之间只有一条边：`session → llm`（会话要读写内部消息模型）。`remoteWorld` 留在 `sandbox/` 而不是 `world/`——它 import `sandbox/lexicalPath` 和 `sandbox/protocol`，挪过去就是 `world ↔ sandbox` 双向依赖。
 
-`frontmatter.ts` 只解析 `---` 包起来的头（标量、列表、`>` / `|` 块标量），被规则扫描和技能扫描共用。
+`llm/messages.ts` 是内部消息模型，provider 无关；`llm/protocol.ts` 定义 provider 协议和注册表；`llm/providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`core/jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
 
-`projectInstructions.ts` 管规则和提示词，`skills.ts` 管技能包（`SKILL.md`）：前者整篇塞进系统提示词或列索引，后者只列名字和描述，正文由 `load_skill` 按需取。两边都不读用户主目录。技能从「执行世界」里读，本地和远程走同一套扫描逻辑。
+`core/frontmatter.ts` 只解析 `---` 包起来的头（标量、列表、`>` / `|` 块标量），被规则扫描和技能扫描共用。
 
-`theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
+`instructions/projectInstructions.ts` 管规则和提示词，`instructions/skills.ts` 管技能包（`SKILL.md`）：前者整篇塞进系统提示词或列索引，后者只列名字和描述，正文由 `load_skill` 按需取。两边都不读用户主目录。技能从「执行世界」里读，本地和远程走同一套扫描逻辑。
+
+`ui/theme.ts` 只被 `ui/tui.ts` 消费，配色相关的东西都在那。`ui/nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
 ## 环境
 
@@ -51,10 +56,10 @@ jsonSafety.ts
 
 写业务逻辑必须有兜底，触发兜底要记日志，日志带上关键调用信息。参考已有实现：
 
-- `src/agent.ts` 上下文压缩失败时保留原始消息，不用空摘要替换
+- `src/agent/agent.ts` 上下文压缩失败时保留原始消息，不用空摘要替换
 - `src/cli.ts` 会话文件逐行容错解析，坏行跳过而非丢弃全部历史
-- `src/llm.ts` 请求失败时区分 abort 与真实错误，返回不同事件
-- `src/transport.ts` 每次重试都新建超时控制器，超时信号不跨尝试污染
+- `src/llm/llm.ts` 请求失败时区分 abort 与真实错误，返回不同事件
+- `src/core/transport.ts` 每次重试都新建超时控制器，超时信号不跨尝试污染
 
 ## 不能破坏的约束
 
@@ -74,25 +79,25 @@ jsonSafety.ts
 
 **7. 内部消息模型不能带 provider 语义。** `messages.ts` 里的 `ContentBlock` 是自有结构，不许出现 OpenAI 的 `tool_calls`/`tool_call_id` 之类字段。协议转换只发生在 `providers/` 下。这样加新 provider 不用改 agent 循环和上下文管理。
 
-**8. provider 注册是有副作用的，要显式导入。** 内置 provider 在 `src/providers/index.ts` 里注册。需要内置 provider 的地方必须 `import './providers/index.ts'`，不能假设它一定被加载过。
+**8. provider 注册是有副作用的，要显式导入。** 内置 provider 在 `src/llm/providers/index.ts` 里注册。需要内置 provider 的地方必须 `import './providers/index.ts'`，不能假设它一定被加载过。
 
 **9. 工具参数必须先校验再执行。** `agent.ts` 在执行前调 `validateToolArguments`，校验失败不执行工具，把错误回填给 context 让模型重发。执行时要用校验后的参数（类型转换的结果要生效），不是原始参数。
 
-**10. 会话用 SQLite 存，不自己管锁文件。** `src/sessionStore.ts` 用 Node 内置的 `node:sqlite`，WAL 模式 + `busy_timeout` 支持多进程并发读写。每个进程独立的 `sessionId`，会话互相隔离。不要再加锁文件机制——SQLite 已经处理了，而且锁文件方案会拒绝第二个实例，多会话共存更合理。
+**10. 会话用 SQLite 存，不自己管锁文件。** `src/session/sessionStore.ts` 用 Node 内置的 `node:sqlite`，WAL 模式 + `busy_timeout` 支持多进程并发读写。每个进程独立的 `sessionId`，会话互相隔离。不要再加锁文件机制——SQLite 已经处理了，而且锁文件方案会拒绝第二个实例，多会话共存更合理。
 
 **11. `createPathGuard` 和 `builtinTools` 是异步的。** 它们要先 `realpath` 解析工作区的真实路径才能做沙箱判断。改动它们的调用方时要跟着 await。
 
-**12. `node:sqlite` 的实验性警告要压掉。** 启动脚本用 `--disable-warning=ExperimentalWarning`（按类型精确静音，不影响其他警告），`src/sessionStore.ts` 里还有运行时兜底。**兜底必须拦 `process.emit` 而不是 `process.emitWarning`**——Node 派发警告走的是前者，只拦后者无效（实测过）。
+**12. `node:sqlite` 的实验性警告要压掉。** 启动脚本用 `--disable-warning=ExperimentalWarning`（按类型精确静音，不影响其他警告），`src/session/sessionStore.ts` 里还有运行时兜底。**兜底必须拦 `process.emit` 而不是 `process.emitWarning`**——Node 派发警告走的是前者，只拦后者无效（实测过）。
 
 **13. 用 `DatabaseSync` 而不是 `Database`。** `DatabaseSync` 在 Node 26.11 起是文档级弃用别名（DEP0210），但 `Database` 导出要到 v26.11 才有——当前 `@types/node` 也只有 `DatabaseSync`。所以现在只能用 `DatabaseSync`，等 Node 26.11 普及后再换。
 
-**14. 修改文件的工具必须声明 `mutatesFiles`。** 并行执行时，声明了 `mutatesFiles: ['path']` 的工具会按文件真实路径排队（`src/mutationQueue.ts`），同一文件依次执行、不同文件并行。
+**14. 修改文件的工具必须声明 `mutatesFiles`。** 并行执行时，声明了 `mutatesFiles: ['path']` 的工具会按文件真实路径排队（`src/core/mutationQueue.ts`），同一文件依次执行、不同文件并行。
 
 没声明的工具默认自由并发。**「读-改-写」流程的工具（像 `edit`）必须声明**，否则两个并发 edit 同一文件会互相覆盖，丢更新。
 
 **15. 工具结果的顺序必须和 tool_call 原始顺序一致。** 事件可以按完成顺序发，但写进 context 的结果顺序不能乱——API 要求每个 tool_call 有配对的 tool_result，顺序错了下次恢复会话会 400。
 
-**16. 文件队列的 key 解析必须在注册队列内部。** `src/mutationQueue.ts` 里 `getMutationQueueKey` 要放进 `registrationQueue` 里面执行，不能在外面先 await。否则两个并发调用解析 key 的完成顺序不确定，同一文件的操作可能按 `[2, 1]` 而不是 `[1, 2]` 执行——模型说"先写 A 再改 A"时顺序就错了。
+**16. 文件队列的 key 解析必须在注册队列内部。** `src/core/mutationQueue.ts` 里 `getMutationQueueKey` 要放进 `registrationQueue` 里面执行，不能在外面先 await。否则两个并发调用解析 key 的完成顺序不确定，同一文件的操作可能按 `[2, 1]` 而不是 `[1, 2]` 执行——模型说"先写 A 再改 A"时顺序就错了。
 
 **17. 文件队列必须可重入。** 用 `AsyncLocalStorage` 跟踪当前执行链持有的 key。工具内部自己又包一层 `withFileMutationQueue` 是安全的，不会把自己等死（没有可重入支持时会静默挂住 agent）。
 
@@ -100,7 +105,7 @@ jsonSafety.ts
 
 **19. 声明了 `mutatesFiles` 的工具必须锁住全部路径。** 只锁第一个路径的话，第二个文件上的并发写照样会互相覆盖。多路径时按路径排序后依次拿锁——所有工具用同一套排序，不会互相等死。
 
-**20. `sequential: true` 的工具单独成段。** 它不该和同一轮里的其他工具并发跑，不管有没有声明 `mutatesFiles`。`src/agent.ts` 的 `splitIntoSegments` 把这类工具切成独立的段。
+**20. `sequential: true` 的工具单独成段。** 它不该和同一轮里的其他工具并发跑，不管有没有声明 `mutatesFiles`。`src/agent/agent.ts` 的 `splitIntoSegments` 把这类工具切成独立的段。
 
 **21. 测试里模拟 abort 不要用计数器。** 并行执行下工具完成顺序不确定，`counter++` 之后判断 `=== 1` 可能永远不成立（另一个工具已经把计数加到 2 了），abort 根本触发不了，测的还是正常路径。用独立的标志位。
 
@@ -110,7 +115,7 @@ jsonSafety.ts
 
 **24. 非交互模式的输入要逐字符发。** pi-tui 的编辑器把输入当按键序列处理，不是当整行文本。一次发一整行的话 `decodePrintableKey` 只能取到第一个字符。回车要单独发——它是提交键，混在文本里会被当成插入换行。
 
-**25. 非 TTY 时不要发 ANSI 控制序列。** 输出重定向到文件时它们就是乱码。`src/nonInteractiveTerminal.ts` 的 `writeControl` 在 `!process.stdout.isTTY` 时跳过。
+**25. 非 TTY 时不要发 ANSI 控制序列。** 输出重定向到文件时它们就是乱码。`src/ui/nonInteractiveTerminal.ts` 的 `writeControl` 在 `!process.stdout.isTTY` 时跳过。
 
 **26. 上下文压缩只改「发给模型的视图」，不改历史。** `context.messages` 是完整历史（也是会话存储的内容），`context.compaction` 记录「前多少条已被摘要覆盖」。发给模型的是 `buildModelContext()` 拼出来的摘要 + 保留区。改历史会带来两个后果：切点可能劈开 tool_use/tool_result 导致 API 400；会话存储按条数切片，历史被砍之后新消息写不进去。
 
@@ -209,11 +214,13 @@ jsonSafety.ts
 
 单元测试用 Node 内置 `node:test`，放在 `test/`，不需要额外测试框架。端到端测试 `e2e-smoke.ts` 起本地 mock SSE 服务，不发真实 API 请求。
 
-新增模块要在 `test/` 下补对应测试文件，文件名 `<模块名>.test.ts`。
+新增模块要在 `test/` 下补对应测试文件，文件名 `<模块名>.test.ts`，子目录和 `src/` 保持一致（`test/core/`、`test/llm/` ……）。
+
+测试文件比仓库根深了一层，用 `../src/` 引用源码的地方要写成 `../../src/<簇>/`。`test/cli/nonInteractiveCli.test.ts` 和 `test/core/version.test.ts` 里的 `projectRoot` 也要多退一层。
 
 ## 会话存储
 
-`~/.grassagent/sessions.db`，SQLite 库。`SessionStore` 负责读写，详见 `src/sessionStore.ts`。
+`~/.grassagent/sessions.db`，SQLite 库。`SessionStore` 负责读写，详见 `src/session/sessionStore.ts`。
 
 `sync(messages)` 传的是**完整会话列表**，不是增量——内部按 `persistedCount` 切片只写新增部分。传增量会写不进去（切片后为空）。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏配对关系。
 
@@ -231,7 +238,7 @@ jsonSafety.ts
 
 `/resume` 不带参数时弹会话选择器（`SelectList` + overlay），回车切换、Esc 取消。非交互模式没键盘，改成列出所有会话 ID 让人自己挑。
 
-命令实现在 `src/cli.ts` 里注册，`src/slashCommands.ts` 只管解析和分发。
+命令实现在 `src/cli.ts` 里注册，`src/ui/slashCommands.ts` 只管解析和分发。
 
 ## 提交规范
 

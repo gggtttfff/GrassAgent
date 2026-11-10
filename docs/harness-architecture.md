@@ -17,11 +17,11 @@ DeepSeek 把系统分成三层：Cordis 负责插件可装卸，Harness 负责�
 
 | 模块 | 职责 |
 | --- | --- |
-| [src/agent.ts](../src/agent.ts) | 流式回合、工具结果配对、压缩只改发给模型的视图 |
-| [src/tools.ts](../src/tools.ts) | `read_file` / `write_file` / `edit` / `edit_batch` / `run_bash` |
-| [src/pathGuard.ts](../src/pathGuard.ts) | 展开路径、解析软链、拒绝工作区外的路径 |
-| [src/sessionStore.ts](../src/sessionStore.ts) | 会话 SQLite，按 `sessionId` 隔离 |
-| [src/askUser.ts](../src/askUser.ts) | 向用户提问。工具不碰终端，回答由调用方注入 |
+| [src/agent/agent.ts](../src/agent/agent.ts) | 流式回合、工具结果配对、压缩只改发给模型的视图 |
+| [src/agent/tools.ts](../src/agent/tools.ts) | `read_file` / `write_file` / `edit` / `edit_batch` / `run_bash` |
+| [src/core/pathGuard.ts](../src/core/pathGuard.ts) | 展开路径、解析软链、拒绝工作区外的路径 |
+| [src/session/sessionStore.ts](../src/session/sessionStore.ts) | 会话 SQLite，按 `sessionId` 隔离 |
+| [src/agent/askUser.ts](../src/agent/askUser.ts) | 向用户提问。工具不碰终端，回答由调用方注入 |
 | [src/cli.ts](../src/cli.ts) | 组装配置、会话、工具和界面 |
 
 今天的缺口有两处。文件工具直接调用 `node:fs` 和 `child_process`，工作目录在 `builtinTools({ workspace })` 里一次绑死。路径沙箱是逻辑边界：它能拦住 `../` 和软链，挡不住同一台机器上的进程逃逸。远程开发环境因此无处安放。
@@ -126,13 +126,13 @@ interface ExecutionWorld {
 | `workspace-write` | 可写工作区 | `cwd` 锁在工作区。这是云端开发环境的默认 |
 | `danger-full-access` | 绕过 seam | 只有调用方明确要求绕过时才存在。普通工具构造不出这种世界 |
 
-客户端先做路径展开和越界判断，给模型一条和今天 `PathOutsideWorkspaceError` 相同的错误，省掉一次往返。daemon 再用工作区真实路径做一遍，拒绝软链、`..` 和工作区外路径。两边的比较规则沿用 [src/pathGuard.ts](../src/pathGuard.ts)：先 resolve，再 realpath，用 `path.relative` 判断包含关系。
+客户端先做路径展开和越界判断，给模型一条和今天 `PathOutsideWorkspaceError` 相同的错误，省掉一次往返。daemon 再用工作区真实路径做一遍，拒绝软链、`..` 和工作区外路径。两边的比较规则沿用 [src/core/pathGuard.ts](../src/core/pathGuard.ts)：先 resolve，再 realpath，用 `path.relative` 判断包含关系。
 
-`edit` 放在世界上，是为了让「检查唯一匹配」和「写入」发生在拥有字节的那一侧。远程若拆成先读后写，两次往返之间文件可能变。`edit_batch` 的顺序应用和原子性保持现在 [src/tools.ts](../src/tools.ts) 的语义：全部成功才写，失败则文件不变。单次 `edit` 是长度为 1 的 `edits`。
+`edit` 放在世界上，是为了让「检查唯一匹配」和「写入」发生在拥有字节的那一侧。远程若拆成先读后写，两次往返之间文件可能变。`edit_batch` 的顺序应用和原子性保持现在 [src/agent/tools.ts](../src/agent/tools.ts) 的语义：全部成功才写，失败则文件不变。单次 `edit` 是长度为 1 的 `edits`。
 
 截断也跟着世界走。今天 `truncateOutput` 把全文写到 Grass 宿主机的临时目录。远程调用若仍写宿主机，模型拿到的路径在沙盒里不存在。超长的文件和命令输出截取尾部，完整内容留在该世界自己的临时区，返回文本里的路径必须能被同一个 `ExecutionWorld` 再次读到。
 
-同一进程里的改文件排队仍由 [src/mutationQueue.ts](../src/mutationQueue.ts) 负责。一个 Grass 进程绑定一个世界时，这把锁够用。两个进程共用一个 `sandboxId` 不在这一版的契约里。
+同一进程里的改文件排队仍由 [src/core/mutationQueue.ts](../src/core/mutationQueue.ts) 负责。一个 Grass 进程绑定一个世界时，这把锁够用。两个进程共用一个 `sandboxId` 不在这一版的契约里。
 
 ### 审批
 
@@ -260,7 +260,7 @@ type WorkerBinding = {
 ## 明确不做
 
 - 不把 Grass 改成插件运行时，不引入 Cordis。
-- 不改 [src/agent.ts](../src/agent.ts) 的回合结构，不把会话改成事件溯源。
+- 不改 [src/agent/agent.ts](../src/agent/agent.ts) 的回合结构，不把会话改成事件溯源。
 - 不把模型循环搬进容器。第一阶段循环仍在 Grass 进程里，手伸到远程世界。
 - 不给模型开放通用 SSH，不把宿主机密钥目录挂进沙盒。
 - 不做 IM、邮件、GitHub 事件接入，不做推测执行，不做 Watchdog 模型会话。

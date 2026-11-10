@@ -27,34 +27,66 @@
 
 ```
 src/
-  llm.ts         LLM 门面：按模型选 provider，转发调用
-  protocol.ts    Provider 协议 + 注册表
-  messages.ts    内部消息模型（provider 无关）
-  providers/     按厂商分文件：openai.ts 等
-  agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
-  compaction.ts  压缩层：决定发给模型看哪一段，不改历史
-  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
-  askUser.ts     向用户提问。工具本身不碰终端，怎么问由调用方注入
-  lineQueue.ts   非交互输入队列：回合进行中到达的整行先留住
-  tui.ts         终端界面:组件树 + 差分渲染 + markdown 排版
-  theme.ts       配色:markdown / 编辑器 / 列表的主题定义
-  slashCommands.ts 斜杠命令：解析 + 分发
-  sessionPicker.ts  会话选择器：列表 + 弹窗
-  sessionBundle.ts 会话包：把 SQLite 里的对话收成 JSON，再导回来
-  projectInstructions.ts 识别 opencode / cursor / claude / kiro 的规则和提示词
-  hooks.ts       钩子运行时：命令 / 函数、拒绝、改写、超时
-  hookConfig.ts  钩子配置：读取并校验 hooks.json
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
-  logger.ts      日志层：结构化 JSON 输出
-  retry.ts       重试层：错误分类 + 指数退避 + 并发闸门
-  transport.ts   传输层：超时 + 重试 + 并发控制
-  pathGuard.ts   沙箱层：路径越界检测
-  validation.ts  校验层：工具参数 JSON Schema 校验 + 类型转换
-  mutationQueue.ts 变更队列：按文件串行化写操作
-  sessionStore.ts 会话层：SQLite 存储（node:sqlite，零依赖）
+  version.ts     版本号：只从 package.json 读
 
-test/            单元测试（node:test，无测试框架依赖）
+  core/          零业务语义的底层，被谁都能用
+    logger.ts        日志层：结构化 JSON 输出
+    jsonSafety.ts    不可信 JSON 的深度护栏
+    retry.ts         重试层：错误分类 + 指数退避 + 并发闸门
+    transport.ts     传输层：超时 + 重试 + 并发控制
+    validation.ts    校验层：工具参数 JSON Schema 校验 + 类型转换
+    mutationQueue.ts 变更队列：按文件串行化写操作
+    pathGuard.ts     沙箱层：路径越界检测
+    textEdit.ts      唯一替换的唯一实现，本地世界和 daemon 共用
+    frontmatter.ts   YAML 头解析：标量 / 列表 / 块标量
+
+  llm/           模型侧
+    llm.ts       LLM 门面：按模型选 provider，转发调用
+    protocol.ts  Provider 协议 + 注册表
+    messages.ts  内部消息模型（provider 无关）
+    compaction.ts 压缩层：决定发给模型看哪一段，不改历史
+    providers/   按厂商分文件：openai.ts 等
+
+  agent/         回合循环与工具
+    agent.ts     Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
+    tools.ts     内置工具：read_file / write_file / edit / edit_batch / run_bash
+    askUser.ts   向用户提问。工具本身不碰终端，怎么问由调用方注入
+    hooks.ts     钩子运行时：命令 / 函数、拒绝、改写、超时
+    hookConfig.ts 钩子配置：读取并校验 hooks.json
+
+  world/         执行世界
+    executionWorld.ts 文件读写和命令执行的统一接口
+    localWorld.ts     本机实现：pathGuard + 子进程
+    outputBound.ts    大文件和长命令只把尾部交给模型
+    approvalGate.ts   要不要人点头
+
+  session/       会话持久化
+    sessionStore.ts   SQLite 存储（node:sqlite，零依赖）
+    sessionBundle.ts  会话包：把 SQLite 里的对话收成 JSON，再导回来
+
+  ui/            终端界面
+    tui.ts          组件树 + 差分渲染 + markdown 排版
+    theme.ts        配色：markdown / 编辑器 / 列表
+    sessionPicker.ts 会话选择器：列表 + 弹窗
+    nonInteractiveTerminal.ts 管道输入时的终端实现
+    lineQueue.ts    非交互输入队列：回合进行中到达的整行先留住
+    slashCommands.ts 斜杠命令：解析 + 分发
+
+  instructions/  仓库里已有的约定
+    projectInstructions.ts 识别 opencode / cursor / claude / kiro 的规则和提示词
+    skills.ts      SKILL.md：只列名字描述，正文由 load_skill 按需取
+
+  sandbox/       沙箱后端与控制面
+    daemon.ts      跑在沙盒里的窄服务
+    control*.ts    控制面：生命周期、HTTP 服务、命令行入口
+    *Backend.ts    docker / in-process / ssh 三种后端
+    ssh*.ts        SSH 连接、主机密钥校验、隧道、远程部署
+    openWorld.ts   按配置打开执行世界
+    remoteWorld.ts 走窄协议连控制面的远程世界
+
+test/            单元测试（node:test，无测试框架依赖），子目录与 src 一一对应
 e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场景 31 项断言
 ```
 
@@ -345,7 +377,7 @@ echo "读一下 README.md" | npm start
 
 流式输出有个细节：markdown 组件是整块渲染的，没法边流边排版。所以流式期间用纯文本组件累积（渲染快），回合结束后换成 markdown 组件重新排版一次。用户看到的是「先出字，后成型」，而不是等全部收完才突然排好版。
 
-配色在 `src/theme.ts`，用的是 pi-tui 自带的 `styleText`（不引 chalk）——它会按终端能力降级，真彩色不够时自动降到 256 色。
+配色在 `src/ui/theme.ts`，用的是 pi-tui 自带的 `styleText`（不引 chalk）——它会按终端能力降级，真彩色不够时自动降到 256 色。
 
 **工具并发执行。** 一轮里多个 tool_call 会并发跑，不用排队等。模型要改三个文件时，三个写入同时进行。
 
@@ -367,7 +399,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 
 写入按「新增条数」增量进行。但历史有可能被整体换掉（`/clear` 清空、`/resume` 切换会话），这时存储层会对账——发现内容对不上就删掉旧内容重写，不然按条数切片会算错，新消息一条也写不进去。
 
-`node:sqlite` 目前是实验性 API，会打印 `ExperimentalWarning`。启动脚本已加 `--disable-warning=ExperimentalWarning` 精确静音这一类警告（其他警告不受影响），`src/sessionStore.ts` 里还有一层运行时兜底，直接跑 `node src/cli.ts` 也是干净的。
+`node:sqlite` 目前是实验性 API，会打印 `ExperimentalWarning`。启动脚本已加 `--disable-warning=ExperimentalWarning` 精确静音这一类警告（其他警告不受影响），`src/session/sessionStore.ts` 里还有一层运行时兜底，直接跑 `node src/cli.ts` 也是干净的。
 
 > 早期版本用 JSONL 文件存会话。升级后旧文件不会自动导入，需要的话可以自己写脚本转换。
 
@@ -389,7 +421,7 @@ npm run test:all     # 上面三样一起跑
 - Ctrl+C 打断后每个 `tool_call` 都有配对 `tool_result`
 - 消息超阈值后的上下文压缩
 
-另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型。
+另外 `test/cli/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型。
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 
@@ -397,7 +429,7 @@ npm run test:all     # 上面三样一起跑
 
 ### 加一个新 provider
 
-在 `src/providers/` 下新建文件，实现 `Provider` 接口——消息转换 + 流式解析：
+在 `src/llm/providers/` 下新建文件，实现 `Provider` 接口——消息转换 + 流式解析：
 
 ```typescript
 export const myProvider: Provider = {
@@ -412,13 +444,13 @@ export const myProvider: Provider = {
 }
 ```
 
-然后在 `src/providers/index.ts` 里 `registerProvider(myProvider)`。
+然后在 `src/llm/providers/index.ts` 里 `registerProvider(myProvider)`。
 
 内部消息模型不会泄漏到协议层——转换只在你自己的 `stream` 里做。
 
 ### 加一个新工具
 
-在 `src/tools.ts` 里写工厂函数接收 `PathGuard`：
+在 `src/agent/tools.ts` 里写工厂函数接收 `PathGuard`：
 
 ```typescript
 function buildMyTool(pathGuard: PathGuard): AgentTool {
@@ -447,7 +479,7 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
 不想写 JSON 的话，可以在进程里直接注册函数钩子。命令钩子和函数钩子走同一份结果：
 
 ```typescript
-import { createHookRunner } from './hooks.ts'
+import { createHookRunner } from './agent/hooks.ts'
 
 const hooks = createHookRunner([
   {
