@@ -5,7 +5,7 @@
 // Docker 后端把 daemon 装进容器,这个后端把它装到远程机器上。
 // 对控制面来说接口一样——创建、转发、销毁。
 
-import type { Logger } from '../logger.ts'
+import type { Logger } from '../core/logger.ts'
 import type { ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
 import { deployRemoteDaemon, type RemoteDaemon } from './sshDeploy.ts'
 import { resolveSshConfig, type SshConnectionConfig } from './sshConfig.ts'

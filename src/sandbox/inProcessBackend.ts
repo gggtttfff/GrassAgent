@@ -4,7 +4,7 @@
 
 import { mkdir, rm, stat } from 'node:fs/promises'
 import * as path from 'node:path'
-import { parseJson } from '../jsonSafety.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 import { startDaemon } from './daemon.ts'
 import { cloneRepository } from './gitClone.ts'
 import { ADVERTISED_WORKSPACE } from './lexicalPath.ts'

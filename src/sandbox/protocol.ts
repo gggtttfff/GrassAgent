@@ -6,8 +6,8 @@ import {
   PolicyDeniedError,
   SandboxUnavailableError,
   type TextEdit,
-} from '../executionWorld.ts'
-import { TextEditError } from '../textEdit.ts'
+} from '../world/executionWorld.ts'
+import { TextEditError } from '../core/textEdit.ts'
 
 /** 对不上就拒绝,不在半新半旧的进程上继续干活。 */
 export const SANDBOX_PROTOCOL_VERSION = 2

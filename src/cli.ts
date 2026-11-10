@@ -7,30 +7,30 @@
 
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { runAgent } from './agent.ts'
-import { Tui } from './tui.ts'
-import { builtinTools, replaceLoadSkillTool } from './tools.ts'
+import { runAgent } from './agent/agent.ts'
+import { Tui } from './ui/tui.ts'
+import { builtinTools, replaceLoadSkillTool } from './agent/tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
-import type { ExecutionWorld } from './executionWorld.ts'
-import { createAskUserTool } from './askUser.ts'
-import type { ApprovalDecision, ApprovalGate } from './approvalGate.ts'
+import type { ExecutionWorld } from './world/executionWorld.ts'
+import { createAskUserTool } from './agent/askUser.ts'
+import type { ApprovalDecision, ApprovalGate } from './world/approvalGate.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { readVersion } from './version.ts'
-import { createLoggerFromConfig, type Logger } from './logger.ts'
-import { createTransport } from './transport.ts'
-import { SessionStore, generateSessionId } from './sessionStore.ts'
-import { SlashCommandRegistry } from './slashCommands.ts'
-import { buildSessionChoices } from './sessionPicker.ts'
-import { canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
-import { appendHookContext, createHookRunner, type HookRunner } from './hooks.ts'
-import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './hookConfig.ts'
+import { createLoggerFromConfig, type Logger } from './core/logger.ts'
+import { createTransport } from './core/transport.ts'
+import { SessionStore, generateSessionId } from './session/sessionStore.ts'
+import { SlashCommandRegistry } from './ui/slashCommands.ts'
+import { buildSessionChoices } from './ui/sessionPicker.ts'
+import { canUseInteractiveTerminal } from './ui/nonInteractiveTerminal.ts'
+import { appendHookContext, createHookRunner, type HookRunner } from './agent/hooks.ts'
+import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './agent/hookConfig.ts'
 import {
   appendPromptSection,
   discoverProjectInstructions,
   formatInstructionReport,
   summarizeInstructions,
-} from './projectInstructions.ts'
-import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
+} from './instructions/projectInstructions.ts'
+import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -39,9 +39,9 @@ import {
   readBundleFile,
   resolveBundlePath,
   writeBundleFile,
-} from './sessionBundle.ts'
-import { messagesArePaired } from './messages.ts'
-import type { Model, Context } from './llm.ts'
+} from './session/sessionBundle.ts'
+import { messagesArePaired } from './llm/messages.ts'
+import type { Model, Context } from './llm/llm.ts'
 
 /** 固定 system prompt */
 const SYSTEM_PROMPT =

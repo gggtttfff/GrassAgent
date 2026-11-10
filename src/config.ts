@@ -101,7 +101,7 @@ export const configSchema = z.object({
   // 上下文压缩。估算 token 超过「窗口 - 预留」就把旧消息总结成摘要,
   // 摘要 + 大约 CompactKeepRecentTokens 的最近消息一起发给模型。
   // 历史本身不会被删掉,只是发给模型的内容变短了。
-  // 默认值和 src/compaction.ts 的常量是同一组,那边不能被这里依赖。
+  // 默认值和 src/llm/compaction.ts 的常量是同一组,那边不能被这里依赖。
   ContextWindow: numericOption({
     minimum: 4_096, maximum: 2_000_000, defaultValue: 128_000, label: 'ContextWindow',
   }),

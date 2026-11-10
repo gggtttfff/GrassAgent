@@ -11,8 +11,8 @@ import {
   type ExecutionWorld,
   type SandboxPolicy,
   type TextEdit,
-} from '../executionWorld.ts'
-import { parseJson } from '../jsonSafety.ts'
+} from '../world/executionWorld.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 import { advertisedPath } from './lexicalPath.ts'
 import {
   failureToError,

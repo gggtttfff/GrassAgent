@@ -2,7 +2,7 @@
 // 控制面掌握沙盒的生命周期:创建、转发、空闲回收。
 // Grass 进程只跟它说话。容器断开时调用失败,不会改去读本机工作区。
 
-import type { Logger } from '../logger.ts'
+import type { Logger } from '../core/logger.ts'
 import type { SandboxCall, SandboxResult } from './protocol.ts'
 import { scrubSecrets, tokenMatches } from './protocol.ts'
 import {

@@ -2,9 +2,9 @@
 // 按配置打开执行世界。远程创建失败就停在这里,不退回本机工作区。
 
 import type { AgentConfig } from '../config.ts'
-import type { ExecutionWorld } from '../executionWorld.ts'
-import { createLocalWorld } from '../localWorld.ts'
-import { parseJson } from '../jsonSafety.ts'
+import type { ExecutionWorld } from '../world/executionWorld.ts'
+import { createLocalWorld } from '../world/localWorld.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 import { createRemoteWorld } from './remoteWorld.ts'
 import { createSshBackend } from './sshBackend.ts'
 import { createControlPlane } from './control.ts'

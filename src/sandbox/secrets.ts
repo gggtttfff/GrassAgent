@@ -4,7 +4,7 @@
 import { randomBytes } from 'node:crypto'
 import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
-import { parseJson } from '../jsonSafety.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 
 const SECRET_NAME = /KEY|PASSWORD|SECRET|TOKEN/i
 

@@ -5,7 +5,7 @@
 // openWorld.ts 要在本进程里起控制面,导入入口文件会带进副作用。
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { parseJson } from '../jsonSafety.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 import {
   type ControlPlane,
   type CreateSandboxInput,

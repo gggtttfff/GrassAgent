@@ -9,13 +9,13 @@ import {
   EncodingError,
   PolicyDeniedError,
   type SandboxMode,
-} from '../executionWorld.ts'
-import { parseJson } from '../jsonSafety.ts'
-import { runArgv } from '../localWorld.ts'
-import { presentFile } from '../outputBound.ts'
-import { createPathGuard, PathOutsideWorkspaceError, type PathGuard } from '../pathGuard.ts'
-import { applyEdits } from '../textEdit.ts'
-import { TextEditError } from '../textEdit.ts'
+} from '../world/executionWorld.ts'
+import { parseJson } from '../core/jsonSafety.ts'
+import { runArgv } from '../world/localWorld.ts'
+import { presentFile } from '../world/outputBound.ts'
+import { createPathGuard, PathOutsideWorkspaceError, type PathGuard } from '../core/pathGuard.ts'
+import { applyEdits } from '../core/textEdit.ts'
+import { TextEditError } from '../core/textEdit.ts'
 import {
   advertisedFromLocal,
   advertisedPath,

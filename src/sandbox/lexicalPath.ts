@@ -5,7 +5,7 @@
 
 import * as path from 'node:path'
 import * as posix from 'node:path/posix'
-import { PathOutsideWorkspaceError } from '../pathGuard.ts'
+import { PathOutsideWorkspaceError } from '../core/pathGuard.ts'
 
 /** 容器里工作区的固定位置。客户端和 daemon 用同一个字符串做词法判断。 */
 export const ADVERTISED_WORKSPACE = '/workspace'

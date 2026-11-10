@@ -5,7 +5,7 @@
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseJson } from '../jsonSafety.ts'
+import { parseJson } from '../core/jsonSafety.ts'
 import type { ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
 import { createProcessRunner, type CommandRunner } from './commandRunner.ts'
 import { cloneRepository } from './gitClone.ts'

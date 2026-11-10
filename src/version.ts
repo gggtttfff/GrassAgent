@@ -5,7 +5,7 @@
 import { readFileSync } from 'node:fs'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseJson } from './jsonSafety.ts'
+import { parseJson } from './core/jsonSafety.ts'
 
 /** 读不到版本号时的兜底。发版流程坏了不该让程序起不来。 */
 const FALLBACK_VERSION = '0.0.0'

@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createServer, type Socket } from 'node:net'
 import type { AddressInfo } from 'node:net'
-import type { Logger } from '../logger.ts'
+import type { Logger } from '../core/logger.ts'
 import { readPrivateKey, type SshConnectionConfig } from './sshConfig.ts'
 
 const { Client } = ssh2

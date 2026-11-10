@@ -11,7 +11,7 @@ import type { Client, SFTPWrapper } from 'ssh2'
 import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Logger } from '../logger.ts'
+import type { Logger } from '../core/logger.ts'
 import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
 
 /** daemon 及其依赖。相对本仓库根目录。 */
@@ -20,13 +20,13 @@ const DAEMON_SOURCES = [
   'src/sandbox/lexicalPath.ts',
   'src/sandbox/protocol.ts',
   'src/sandbox/secrets.ts',
-  'src/executionWorld.ts',
-  'src/jsonSafety.ts',
-  'src/localWorld.ts',
-  'src/outputBound.ts',
-  'src/pathGuard.ts',
-  'src/textEdit.ts',
-  'src/approvalGate.ts',
+  'src/world/executionWorld.ts',
+  'src/core/jsonSafety.ts',
+  'src/world/localWorld.ts',
+  'src/world/outputBound.ts',
+  'src/core/pathGuard.ts',
+  'src/core/textEdit.ts',
+  'src/world/approvalGate.ts',
 ] as const
 
 export type RemoteDaemon = {

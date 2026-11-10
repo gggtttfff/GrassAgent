@@ -7,9 +7,9 @@ import { createServer } from 'node:http'
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import { runAgent } from './src/agent.ts'
-import { builtinTools } from './src/tools.ts'
-import type { Model, Context } from './src/llm.ts'
+import { runAgent } from './src/agent/agent.ts'
+import { builtinTools } from './src/agent/tools.ts'
+import type { Model, Context } from './src/llm/llm.ts'
 
 // 测试工作目录:放在系统临时目录,与项目源码隔离
 const WORK_DIR = path.join(os.tmpdir(), `grassagent-e2e-${process.pid}`)
