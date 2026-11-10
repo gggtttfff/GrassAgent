@@ -3,14 +3,24 @@
 //
 // 正文不进系统提示词,只列名字和描述:一个技能动辄几百行,每轮都塞进去会挤掉对话。
 // 模型判断任务对得上时调 load_skill 取全文,再按正文去读附件。
-// 技能和附件都在工作区内,read_file 直接读得到,沙箱不用为它开口子。
+//
+// 技能从「执行世界」里读,本地和远程走同一套扫描逻辑:
+// 远程世界里的文件在另一台机器上,本机 fs 读不到。
 
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
+import type { ExecutionWorld } from './executionWorld.ts'
 import { splitFrontmatter } from './frontmatter.ts'
 import { createPathGuard, type PathGuard } from './pathGuard.ts'
 
 export type SkillSource = 'grass' | 'cursor' | 'claude' | 'kiro' | 'opencode'
+
+/** 技能是从哪儿读到的。本地和远程要分开标,不然模型分不清自己在改哪台机器上的文件。 */
+export interface SkillOrigin {
+  kind: 'local' | 'remote'
+  /** 给模型看的来源说明。远程时是 user@host:port 之类。 */
+  label: string
+}
 
 export interface Skill {
   /** load_skill 用的名字。同名时先扫到的根优先。 */
@@ -24,6 +34,7 @@ export interface Skill {
   /** 正文超过上限被截断过 */
   truncated: boolean
   source: SkillSource
+  origin: SkillOrigin
 }
 
 export interface SkillCatalog {
@@ -40,6 +51,27 @@ export interface SkillRegistry {
 export interface SkillLog {
   warn(object: object, message: string): void
   info(object: object, message: string): void
+}
+
+/** 目录里的一个条目。size 和 mtimeMs 用来判断文件有没有变过。 */
+export interface SkillFileEntry {
+  name: string
+  type: 'file' | 'directory' | 'symlink' | 'other'
+  size?: number
+  mtimeMs?: number
+}
+
+/**
+ * 技能扫描要用的文件接口。路径一律是工作区相对路径。
+ *
+ * 抽出来是因为本地和远程的字节不在一处:
+ * 本地走 fs + 路径沙箱,远程走执行世界。
+ */
+export interface SkillFileSystem {
+  /** 列出工作区相对目录下的直接子项 */
+  listEntries(relativeDirectory: string): Promise<SkillFileEntry[]>
+  /** 读工作区相对路径的文本。读不到、太大或不是文本时返回 undefined */
+  readText(relativePath: string): Promise<string | undefined>
 }
 
 // 顺序就是优先级:工作区自己的技能写在最前面,同名时不被别的工具覆盖。
@@ -59,9 +91,12 @@ const SKIP_DIRECTORY_NAMES = new Set([
 const MAX_SKILL_BYTES = 256 * 1024
 const MAX_SKILL_BODY_CHARS = 24_000
 const MAX_SKILLS = 64
-const MAX_WALK_DEPTH = 6
 const MAX_DESCRIPTION_CHARS = 200
 const SKILL_FILE_NAME = 'skill.md'
+
+// 本地目录树浅一点没关系,远程每层目录都是一次往返。
+const LOCAL_WALK_DEPTH = 6
+const REMOTE_WALK_DEPTH = 3
 
 // 文件里出现 NUL 说明是二进制,不能当技能正文。用码点写,免得源码里出现不可见字符。
 const NUL_CHARACTER = String.fromCharCode(0)
@@ -69,35 +104,92 @@ const NUL_CHARACTER = String.fromCharCode(0)
 const noopLog: SkillLog = { warn() {}, info() {} }
 
 /**
+ * 本地技能文件接口。软链和越界路径由路径沙箱挡住。
+ */
+export async function createLocalSkillFiles(workspace: string): Promise<SkillFileSystem> {
+  const pathGuard = await createPathGuard(workspace)
+  return {
+    async listEntries(relativeDirectory: string): Promise<SkillFileEntry[]> {
+      const resolved = await pathGuard.resolve(relativeDirectory)
+      const entries = await fs.readdir(resolved, { withFileTypes: true })
+      const result: SkillFileEntry[] = []
+      for (const entry of entries) {
+        const child = path.join(resolved, entry.name)
+        // 软链要先确认落在工作区内,否则等于借技能读到外面去
+        if (entry.isSymbolicLink() && !(await pathGuard.isInside(child))) continue
+        let size: number | undefined
+        let mtimeMs: number | undefined
+        let type: SkillFileEntry['type'] = 'other'
+        try {
+          const stats = await fs.stat(child)
+          size = stats.size
+          mtimeMs = stats.mtimeMs
+          type = stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : 'other'
+        } catch {
+          // 读不到就只留名字,判断不出类型就不当技能目录用
+        }
+        result.push({ name: entry.name, type, size, mtimeMs })
+      }
+      return result
+    },
+    async readText(relativePath: string): Promise<string | undefined> {
+      const resolved = await pathGuard.resolve(relativePath)
+      const stats = await fs.stat(resolved)
+      if (stats.size > MAX_SKILL_BYTES) return undefined
+      const text = await fs.readFile(resolved, 'utf8')
+      if (text.includes(NUL_CHARACTER)) return undefined
+      return text
+    },
+  }
+}
+
+/**
+ * 远程技能文件接口。字节在沙盒里,一切都走执行世界。
+ */
+export function createWorldSkillFiles(world: ExecutionWorld): SkillFileSystem {
+  return {
+    async listEntries(relativeDirectory: string): Promise<SkillFileEntry[]> {
+      return world.list(relativeDirectory)
+    },
+    async readText(relativePath: string): Promise<string | undefined> {
+      const text = await world.readRaw(relativePath)
+      if (!text) return undefined
+      if (text.includes(NUL_CHARACTER)) return undefined
+      return text
+    },
+  }
+}
+
+/**
  * 扫出工作区里的全部技能。识别失败不抛错——技能是锦上添花,不能挡启动。
  */
-export async function discoverSkills(
-  workspace: string,
-  logger: SkillLog = noopLog,
-): Promise<SkillCatalog> {
-  let pathGuard: PathGuard
-  try {
-    pathGuard = await createPathGuard(workspace)
-  } catch (error) {
-    logger.warn({ errorMessage: errorMessage(error), workspace }, '工作区无法作为技能扫描根,已跳过')
-    return { skills: [], promptSection: '' }
-  }
-
+export async function discoverSkills(options: {
+  files: SkillFileSystem
+  origin: SkillOrigin
+  logger?: SkillLog
+}): Promise<SkillCatalog> {
+  const logger = options.logger ?? noopLog
   const skills: Skill[] = []
   const takenNames = new Set<string>()
+  const maxDepth = options.origin.kind === 'remote' ? REMOTE_WALK_DEPTH : LOCAL_WALK_DEPTH
+
   for (const root of SKILL_ROOTS) {
     if (skills.length >= MAX_SKILLS) {
       logger.warn({ maxSkills: MAX_SKILLS }, '技能数量到上限,其余不再扫描')
       break
     }
-    const rootDirectory = path.join(pathGuard.workspace, root.directory)
-    await collectSkillFiles(rootDirectory, rootDirectory, 0, root.source, {
-      pathGuard, skills, takenNames, logger,
+    await collectSkillFiles(root.directory, root.directory, 0, root.source, {
+      files: options.files,
+      origin: options.origin,
+      maxDepth,
+      skills,
+      takenNames,
+      logger,
     })
   }
 
   skills.sort((left, right) => left.name.localeCompare(right.name))
-  logger.info({ skillCount: skills.length }, '技能已识别')
+  logger.info({ skillCount: skills.length, origin: options.origin.label }, '技能已识别')
   return { skills, promptSection: renderSkillSection(skills) }
 }
 
@@ -126,7 +218,7 @@ export function renderSkillSection(skills: readonly Skill[]): string {
     '下面是打包好的多步流程,正文没有放进上下文。',
     '任务和某条描述对得上时,先调用 load_skill 取全文,再按正文执行;不要凭名字猜步骤。',
     '没被点名、描述也对不上的技能不要用。',
-    ...skills.map((skill) => `- ${skill.name}: ${skill.description}`),
+    ...skills.map((skill) => `- ${skill.name}(来源:${skill.origin.label}): ${skill.description}`),
   ].join('\n')
 }
 
@@ -134,6 +226,7 @@ export function renderSkillSection(skills: readonly Skill[]): string {
 export function formatSkillForModel(skill: Skill): string {
   const lines = [
     `# 技能 ${skill.name}`,
+    `来源:${skill.origin.label}`,
     `正文:${skill.relativePath}`,
     `附件目录:${skill.directoryPath}(脚本、模板、参考文档在这里,用 read_file 按需读,不要整目录读)`,
     '',
@@ -155,7 +248,9 @@ export function summarizeSkills(skills: readonly Skill[]): string {
 }
 
 interface CollectContext {
-  pathGuard: PathGuard
+  files: SkillFileSystem
+  origin: SkillOrigin
+  maxDepth: number
   skills: Skill[]
   takenNames: Set<string>
   logger: SkillLog
@@ -168,27 +263,17 @@ async function collectSkillFiles(
   source: SkillSource,
   context: CollectContext,
 ): Promise<void> {
-  if (depth > MAX_WALK_DEPTH) return
-  const entries = await readDirectory(directory, context.logger)
+  if (depth > context.maxDepth) return
+  const entries = await listEntries(directory, context)
   for (const entry of entries) {
     if (SKIP_DIRECTORY_NAMES.has(entry.name)) continue
-    const child = path.join(directory, entry.name)
-    try {
-      // 软链必须落回工作区内,否则等于借技能读到工作区外的文件
-      if (entry.isSymbolicLink() && !(await context.pathGuard.isInside(child))) {
-        context.logger.warn({ path: child }, '符号链接越出工作区,已跳过')
-        continue
-      }
-      const stats = await fs.stat(child)
-      if (stats.isDirectory()) {
-        await collectSkillFiles(rootDirectory, child, depth + 1, source, context)
-        continue
-      }
-      if (!stats.isFile() || entry.name.toLowerCase() !== SKILL_FILE_NAME) continue
-      await loadSkill(child, rootDirectory, source, context)
-    } catch (error) {
-      context.logger.warn({ path: child, errorMessage: errorMessage(error) }, '技能文件读取失败,已跳过')
+    const child = joinRelative(directory, entry.name)
+    if (entry.type === 'directory') {
+      await collectSkillFiles(rootDirectory, child, depth + 1, source, context)
+      continue
     }
+    if (entry.type !== 'file' || entry.name.toLowerCase() !== SKILL_FILE_NAME) continue
+    await loadSkill(child, rootDirectory, source, context)
   }
 }
 
@@ -198,12 +283,15 @@ async function loadSkill(
   source: SkillSource,
   context: CollectContext,
 ): Promise<void> {
-  const text = await readSkillText(filePath, context)
-  if (text === undefined) return
+  const text = await context.files.readText(filePath)
+  if (text === undefined) {
+    context.logger.warn({ path: filePath }, '技能文件读不到或不是文本,已跳过')
+    return
+  }
 
   const { data, body } = splitFrontmatter(text)
   // 没写 name 就用它在技能根下的目录名,允许多级,比如 "review/pr"
-  const directoryName = toPosixRelative(rootDirectory, path.dirname(filePath))
+  const directoryName = relativeOf(rootDirectory, filePath)
   const name = (stringValue(data.name) ?? directoryName).trim()
   const description = clipDescription(stringValue(data.description) ?? firstHeading(body))
   if (!name) {
@@ -230,45 +318,39 @@ async function loadSkill(
   context.skills.push({
     name,
     description,
-    relativePath: toPosixRelative(context.pathGuard.workspace, filePath),
-    directoryPath: toPosixRelative(context.pathGuard.workspace, path.dirname(filePath)),
+    relativePath: filePath,
+    directoryPath: parentOf(filePath),
     body: truncated ? normalizedBody.slice(0, MAX_SKILL_BODY_CHARS) : normalizedBody,
     truncated,
     source,
+    origin: context.origin,
   })
 }
 
-async function readSkillText(filePath: string, context: CollectContext): Promise<string | undefined> {
-  let realPath: string
+async function listEntries(directory: string, context: CollectContext): Promise<SkillFileEntry[]> {
   try {
-    realPath = await context.pathGuard.resolve(filePath)
+    return await context.files.listEntries(directory)
   } catch (error) {
-    context.logger.warn({ path: filePath, errorMessage: errorMessage(error) }, '技能路径越出工作区,已跳过')
-    return undefined
-  }
-  const stats = await fs.stat(realPath)
-  if (stats.size > MAX_SKILL_BYTES) {
-    context.logger.warn({ path: filePath, size: stats.size }, '技能文件过大,已跳过')
-    return undefined
-  }
-  const text = await fs.readFile(realPath, 'utf8')
-  if (text.includes(NUL_CHARACTER)) {
-    context.logger.warn({ path: filePath }, '技能文件不是文本,已跳过')
-    return undefined
-  }
-  return text
-}
-
-async function readDirectory(directory: string, logger: SkillLog): Promise<import('node:fs').Dirent[]> {
-  try {
-    return await fs.readdir(directory, { withFileTypes: true })
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
     // 没有这个根很正常,大多数项目里只有一两种工具
-    if (code === 'ENOENT' || code === 'ENOTDIR') return []
-    logger.warn({ path: directory, errorMessage: errorMessage(error) }, '读取技能目录失败,已跳过')
+    context.logger.warn({ path: directory, errorMessage: errorMessage(error) }, '读取技能目录失败,已跳过')
     return []
   }
+}
+
+function joinRelative(directory: string, name: string): string {
+  return directory ? `${directory}/${name}` : name
+}
+
+function parentOf(filePath: string): string {
+  const index = filePath.lastIndexOf('/')
+  return index === -1 ? '' : filePath.slice(0, index)
+}
+
+function relativeOf(rootDirectory: string, filePath: string): string {
+  const directory = parentOf(filePath)
+  if (!directory) return ''
+  if (directory === rootDirectory) return ''
+  return directory.slice(rootDirectory.length + 1)
 }
 
 function stringValue(value: unknown): string | undefined {
@@ -287,10 +369,6 @@ function clipDescription(text: string | undefined): string | undefined {
   return collapsed.length <= MAX_DESCRIPTION_CHARS
     ? collapsed
     : `${collapsed.slice(0, MAX_DESCRIPTION_CHARS)}…`
-}
-
-function toPosixRelative(root: string, target: string): string {
-  return path.relative(root, target).split(path.sep).join('/')
 }
 
 function errorMessage(error: unknown): string {

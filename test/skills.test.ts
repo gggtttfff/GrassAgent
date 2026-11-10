@@ -4,14 +4,37 @@ import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
+  createLocalSkillFiles,
   createSkillRegistry,
+  createWorldSkillFiles,
   discoverSkills,
   type SkillLog,
+  type SkillOrigin,
 } from '../src/skills.ts'
 import { builtinTools } from '../src/tools.ts'
+import { validateConfig } from '../src/config.ts'
+import { createInProcessBackend } from '../src/sandbox/inProcessBackend.ts'
+import { createControlPlane, type TimerFn } from '../src/sandbox/control.ts'
+import { listenControl } from '../src/sandbox/controlHttp.ts'
+import { openExecutionWorld } from '../src/sandbox/openWorld.ts'
 
 async function makeWorkspace(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), 'grass-skills-'))
+}
+
+const localOrigin: SkillOrigin = { kind: 'local', label: '本地工作区' }
+const idleTimer: TimerFn = () => ({ refresh() {}, cancel() {} })
+
+/** 本地工作区上的技能扫描,免得每个用例都写一遍组装。 */
+async function scanLocalSkills(
+  workspace: string,
+  logger?: SkillLog,
+): Promise<Awaited<ReturnType<typeof discoverSkills>>> {
+  return discoverSkills({
+    files: await createLocalSkillFiles(workspace),
+    origin: localOrigin,
+    logger,
+  })
 }
 
 interface CapturedLog extends SkillLog {
@@ -52,7 +75,7 @@ test('技能只把名字和描述放进索引,正文留给 load_skill', async ()
       '正文里才有具体步骤。',
     ].join('\n'))
 
-    const catalog = await discoverSkills(workspace, log)
+    const catalog = await scanLocalSkills(workspace, log)
     assert.equal(catalog.skills.length, 1)
     const skill = catalog.skills[0]
     assert.equal(skill?.name, 'demo')
@@ -63,9 +86,11 @@ test('技能只把名字和描述放进索引,正文留给 load_skill', async ()
     assert.equal(skill?.truncated, false)
     assert.match(skill?.body ?? '', /正文里才有具体步骤/)
 
-    // 索引里有名字和描述,不能有正文
-    assert.match(catalog.promptSection, /demo: 演示用的技能/)
+    // 索引里有名字、来源和描述,不能有正文
+    assert.match(catalog.promptSection, /demo\(来源:本地工作区\): 演示用的技能/)
     assert.equal(catalog.promptSection.includes('正文里才有具体步骤'), false)
+    assert.equal(skill?.origin.kind, 'local')
+    assert.equal(skill?.origin.label, '本地工作区')
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
   }
@@ -85,7 +110,7 @@ test('Cursor 那种 >- 折叠描述能解析成一句话', async () => {
       '按 interview 的结论搭骨架。',
     ].join('\n'))
 
-    const catalog = await discoverSkills(workspace)
+    const catalog = await scanLocalSkills(workspace)
     assert.equal(
       catalog.skills[0]?.description,
       'Scaffold a new agent: short interview, then verify a turn. Ask only what the message left open.',
@@ -114,7 +139,7 @@ test('同名技能按根的顺序取第一个,并记下被忽略的那个', asyn
       'cursor 的做法。',
     ].join('\n'))
 
-    const catalog = await discoverSkills(workspace, log)
+    const catalog = await scanLocalSkills(workspace, log)
     assert.equal(catalog.skills.length, 1)
     assert.equal(catalog.skills[0]?.source, 'grass')
     assert.equal(catalog.skills[0]?.description, '自己的审查流程')
@@ -132,7 +157,7 @@ test('没有名字的技能用目录名,没有描述又不能从标题补的跳�
     await writeSkill(workspace, '.claude/skills/no-description', '---\nname: no-description\n---\n正文,没写描述也没有标题。')
     await writeSkill(workspace, '.kiro/skills/from-heading', '---\nname: from-heading\n---\n# 从标题取描述\n正文。')
 
-    const catalog = await discoverSkills(workspace, log)
+    const catalog = await scanLocalSkills(workspace, log)
     const names = catalog.skills.map((skill) => skill.name).sort()
     assert.deepEqual(names, ['from-heading', 'no-name'])
     assert.equal(
@@ -156,7 +181,7 @@ test('正文过长时截断,并提示用 read_file 读全文', async () => {
       'x'.repeat(25_000),
     ].join('\n'))
 
-    const catalog = await discoverSkills(workspace)
+    const catalog = await scanLocalSkills(workspace)
     assert.equal(catalog.skills[0]?.truncated, true)
     const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
@@ -179,7 +204,7 @@ test('load_skill 返回正文和附件目录,未知名字报错时列出可用�
       '第一步读 scripts/run.sh。',
     ].join('\n'))
 
-    const catalog = await discoverSkills(workspace)
+    const catalog = await scanLocalSkills(workspace)
     const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     assert.ok(loadSkill)
@@ -200,10 +225,49 @@ test('load_skill 返回正文和附件目录,未知名字报错时列出可用�
   }
 })
 
+test('远程世界的技能从沙盒里读,来源标出主机', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-skills-remote-'))
+  try {
+    const backend = createInProcessBackend({ stateDir })
+    const plane = createControlPlane({ backend, timer: idleTimer })
+    const listening = await listenControl(plane)
+    try {
+      const config = validateConfig({
+        ApiKey: 'sk-test',
+        ExecutionWorld: 'remote',
+        SandboxControlUrl: listening.url,
+        SandboxImage: 'test-image',
+        Workspace: stateDir,
+      })
+      const world = await openExecutionWorld(config, { sessionId: 'session-skills' })
+      await world.write(
+        '.grass/skills/demo/SKILL.md',
+        ['---', 'name: demo', 'description: 远程的技能', '---', '远程正文。'].join('\n'),
+      )
+
+      const origin: SkillOrigin = { kind: 'remote', label: '远程 user@host:22' }
+      const catalog = await discoverSkills({
+        files: createWorldSkillFiles(world),
+        origin,
+      })
+      assert.equal(catalog.skills.length, 1)
+      assert.equal(catalog.skills[0]?.name, 'demo')
+      assert.equal(catalog.skills[0]?.origin.kind, 'remote')
+      assert.equal(catalog.skills[0]?.origin.label, '远程 user@host:22')
+      assert.equal(catalog.skills[0]?.body, '远程正文。')
+      assert.match(catalog.promptSection, /demo\(来源:远程 user@host:22\)/)
+    } finally {
+      await listening.close().catch(() => undefined)
+    }
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true })
+  }
+})
+
 test('一个技能都没有时不注册 load_skill', async () => {
   const workspace = await makeWorkspace()
   try {
-    const catalog = await discoverSkills(workspace)
+    const catalog = await scanLocalSkills(workspace)
     assert.equal(catalog.skills.length, 0)
     assert.equal(catalog.promptSection, '')
 

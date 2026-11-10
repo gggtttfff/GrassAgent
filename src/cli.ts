@@ -29,7 +29,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { createSkillRegistry, discoverSkills, summarizeSkills, type SkillRegistry } from './skills.ts'
+import { createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, discoverSkills, summarizeSkills, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -118,30 +118,6 @@ async function main() {
     }
   }
 
-  // 技能:正文不进系统提示词,只列名字和描述,模型要做这件事时用 load_skill 取全文。
-  // 识别失败和规则一样不挡启动,按「没有技能」处理。
-  let skills: SkillRegistry | undefined
-  let skillReport = '技能加载已关闭'
-  if (config.LoadSkills) {
-    try {
-      const skillCatalog = await discoverSkills(config.Workspace, {
-        warn: (object, message) => logger.warn(object, message),
-        info: (object, message) => logger.info(object, message),
-      })
-      systemPrompt = appendPromptSection(systemPrompt, skillCatalog.promptSection)
-      skills = createSkillRegistry(skillCatalog.skills)
-      skillReport = summarizeSkills(skillCatalog.skills)
-    } catch (error) {
-      skillReport = '识别技能失败,本次不加载技能'
-      logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
-    }
-  }
-
-  const context: Context = {
-    systemPrompt,
-    messages: sessionStore.load(),
-  }
-
   // 文件和命令进同一个执行世界。远程创建失败就退出,不改绑本机工作区。
   let world: ExecutionWorld
   try {
@@ -161,6 +137,39 @@ async function main() {
     sandboxId: world.sandboxId,
     executionWorld: config.ExecutionWorld,
   }, '执行世界已绑定')
+
+  // 技能:正文不进系统提示词,只列名字和描述,模型要做这件事时用 load_skill 取全文。
+  // 技能从执行世界里读,远程时读的是沙盒里的文件,不是本机那份。
+  // 识别失败和规则一样不挡启动,按「没有技能」处理。
+  let skills: SkillRegistry | undefined
+  let skillReport = '技能加载已关闭'
+  if (config.LoadSkills) {
+    try {
+      const skillOrigin = describeSkillOrigin(config, world)
+      const skillFiles = skillOrigin.kind === 'remote'
+        ? createWorldSkillFiles(world)
+        : await createLocalSkillFiles(config.Workspace)
+      const skillCatalog = await discoverSkills({
+        files: skillFiles,
+        origin: skillOrigin,
+        logger: {
+          warn: (object, message) => logger.warn(object, message),
+          info: (object, message) => logger.info(object, message),
+        },
+      })
+      systemPrompt = appendPromptSection(systemPrompt, skillCatalog.promptSection)
+      skills = createSkillRegistry(skillCatalog.skills)
+      skillReport = summarizeSkills(skillCatalog.skills)
+    } catch (error) {
+      skillReport = '识别技能失败,本次不加载技能'
+      logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
+    }
+  }
+
+  const context: Context = {
+    systemPrompt,
+    messages: sessionStore.load(),
+  }
 
   // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
@@ -548,6 +557,23 @@ async function main() {
 function entryFilePath(entryArgument: string): string {
   if (entryArgument.startsWith('file:')) return fileURLToPath(entryArgument)
   return path.resolve(entryArgument)
+}
+
+/**
+ * 技能是从哪儿读到的。
+ * 远程时主机名来自 SSH 配置——模型改的是那台机器上的文件,来源必须说清楚。
+ */
+function describeSkillOrigin(config: AgentConfig, world: ExecutionWorld): SkillOrigin {
+  if (config.ExecutionWorld !== 'remote') {
+    return { kind: 'local', label: '本地工作区' }
+  }
+  if (config.SandboxSshHost) {
+    const user = config.SandboxSshUser ? `${config.SandboxSshUser}@` : ''
+    const port = config.SandboxSshPort && config.SandboxSshPort !== 22 ? `:${config.SandboxSshPort}` : ''
+    return { kind: 'remote', label: `远程 ${user}${config.SandboxSshHost}${port}` }
+  }
+  if (world.sandboxId) return { kind: 'remote', label: `远程沙盒 ${world.sandboxId}` }
+  return { kind: 'remote', label: '远程工作区' }
 }
 
 // 直接运行才启动。调试器在 Windows 上给出的 argv 和 import.meta.url 经常对不齐，只比字符串会静默退出。
