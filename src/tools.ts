@@ -16,6 +16,9 @@ import { TextEditError } from './textEdit.ts'
 // 可通过 GRASSAGENT_COMMAND_TIMEOUT_MS 调整。
 const DEFAULT_COMMAND_TIMEOUT_MS = 3000
 
+// 一批技能正文的总长度上限。一次取太多会把上下文塞满,不如让模型分批来。
+const MAX_BATCH_SKILL_CHARS = 48_000
+
 // 参数 schema。用封闭对象(additionalProperties: false):
 // 模型多传的字段是幻觉,直接拒绝比静默忽略更容易让它自我纠正。
 const readFileParameters = obj({
@@ -50,7 +53,11 @@ const runBashParameters = obj({
 })
 
 const loadSkillParameters = obj({
-  name: str({ description: '技能名,和可用技能列表里的一致' }),
+  names: arr(str({ description: '技能名,和可用技能列表里的一致' }), {
+    description: '要加载的技能名列表',
+    minItems: 1,
+    maxItems: 8,
+  }),
 })
 
 // read_file:返回文件内容。超过 200 行或字节上限时只带尾部,全文在世界的临时区。
@@ -166,22 +173,46 @@ function buildRunBash(world: ExecutionWorld, timeoutMs: number): AgentTool {
 // load_skill:按名字取技能正文。
 // 正文是启动时扫进内存的,不在工具里重新读盘——技能目录改到一半读进来更糟。
 // 附件不在这里返回,模型按正文指到的路径自己用 read_file 读。
+//
+// 支持一次取多个:任务常常要连着看两三个技能,一个一个来要多跑几轮。
 function buildLoadSkill(skills: SkillRegistry): AgentTool {
   return {
     name: 'load_skill',
     description:
-      '加载技能的完整说明.参数:name(技能名,和可用技能列表一致).' +
+      '加载技能的完整说明.参数:names(技能名列表,和可用技能列表一致,最多 8 个).' +
       '返回技能正文和附件目录;正文提到的脚本、模板用 read_file 按需读',
     parameters: loadSkillParameters,
     execute: async (args, signal) => {
       if (signal?.aborted) return 'error:aborted'
-      const { name } = args as { name: string }
-      const trimmed = name.trim()
-      if (!trimmed) return 'error: load_skill 的 name 不能为空'
-      const skill = skills.find(trimmed)
-      // 报错里带上可用名字,模型下一次就能改对,不用再试一遍
-      if (!skill) return `error: 没有名为 "${trimmed}" 的技能。可用技能:${skills.names().join('、')}`
-      return formatSkillForModel(skill)
+      const { names } = args as { names: string[] }
+      const requested = [...new Set(names.map((name) => name.trim()).filter(Boolean))]
+      if (requested.length === 0) return 'error: load_skill 的 names 不能为空'
+
+      const sections: string[] = []
+      const missing: string[] = []
+      let totalChars = 0
+      for (const name of requested) {
+        const skill = skills.find(name)
+        // 报错里带上可用名字,模型下一次就能改对,不用再试一遍
+        if (!skill) {
+          missing.push(name)
+          continue
+        }
+        const section = formatSkillForModel(skill)
+        // 一批技能的总长度要有上限,不然一次塞满上下文
+        if (totalChars + section.length > MAX_BATCH_SKILL_CHARS) {
+          sections.push(`(其余技能因总量超过 ${MAX_BATCH_SKILL_CHARS} 字未加载)`)
+          break
+        }
+        totalChars += section.length
+        sections.push(section)
+      }
+
+      if (missing.length > 0) {
+        sections.push(`error: 没有名为 ${missing.map((name) => `"${name}"`).join('、')} 的技能。可用技能:${skills.names().join('、')}`)
+      }
+      if (sections.length === 0) return 'error: 没有可加载的技能'
+      return sections.join('\n\n---\n\n')
     },
   }
 }

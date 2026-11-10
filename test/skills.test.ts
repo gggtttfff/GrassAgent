@@ -229,7 +229,7 @@ test('正文过长时截断,并提示用 read_file 读全文', async () => {
     assert.equal(catalog.skills[0]?.truncated, true)
     const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
-    const result = await loadSkill?.execute({ name: 'long' })
+    const result = await loadSkill?.execute({ names: ['long'] })
     assert.match(result ?? '', /已截断/)
     assert.match(result ?? '', /read_file 读 \.grass\/skills\/long\/SKILL\.md/)
   } finally {
@@ -253,19 +253,19 @@ test('load_skill 返回正文和附件目录,未知名字报错时列出可用�
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
     assert.ok(loadSkill)
 
-    const result = await loadSkill.execute({ name: '/DEMO' })
+    const result = await loadSkill.execute({ names: ['/DEMO'] })
     assert.match(result, /# 技能 demo/)
     assert.match(result, /附件目录:\.grass\/skills\/demo/)
     // 正文里的相对路径是相对技能目录的,不是工作区根
     assert.match(result, /相对路径都相对于 \.grass\/skills\/demo/)
     assert.match(result, /第一步读 scripts\/run\.sh/)
 
-    const missing = await loadSkill.execute({ name: 'nope' })
+    const missing = await loadSkill.execute({ names: ['nope'] })
     assert.match(missing, /没有名为 "nope" 的技能/)
     assert.match(missing, /可用技能:demo/)
 
-    const blank = await loadSkill.execute({ name: '   ' })
-    assert.match(blank, /name 不能为空/)
+    const blank = await loadSkill.execute({ names: ['   '] })
+    assert.match(blank, /names 不能为空/)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
   }
@@ -514,7 +514,7 @@ test('标题清单带文件行号,截断时仍覆盖全文', async () => {
 
     const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
-    const result = await loadSkill?.execute({ name: 'long' })
+    const result = await loadSkill?.execute({ names: ['long'] })
     assert.match(result ?? '', /目录:/)
     assert.match(result ?? '', /第一节\(第 5 行\)/)
     // 截断了,目录仍要覆盖全文
@@ -547,7 +547,7 @@ test('附件列在技能目录里,超大和超量的不进清单', async () => {
 
     const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
     const loadSkill = tools.find((tool) => tool.name === 'load_skill')
-    const result = await loadSkill?.execute({ name: 'demo' })
+    const result = await loadSkill?.execute({ names: ['demo'] })
     assert.match(result ?? '', /附件:\.grass\/skills\/demo\/notes\.md、\.grass\/skills\/demo\/run\.sh/)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
@@ -582,6 +582,39 @@ test('只读技能不进索引,注册成斜杠命令', async () => {
     assert.equal(isUsableCommandName('shell'), true)
     assert.equal(isUsableCommandName('review/pr'), false)
     assert.equal(isUsableCommandName('带 空格'), false)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('一次能加载多个技能,重复的名字只加载一次', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/first', [
+      '---', 'name: first', 'description: 第一个', '---', '正文一。',
+    ].join('\n'))
+    await writeSkill(workspace, '.grass/skills/second', [
+      '---', 'name: second', 'description: 第二个', '---', '正文二。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const loadSkill = tools.find((tool) => tool.name === 'load_skill')
+    assert.ok(loadSkill)
+
+    const result = await loadSkill.execute({ names: ['first', 'second'] })
+    assert.match(result, /# 技能 first/)
+    assert.match(result, /# 技能 second/)
+    assert.match(result, /正文一。/)
+    assert.match(result, /正文二。/)
+
+    const repeated = await loadSkill.execute({ names: ['first', 'first'] })
+    assert.equal(repeated.match(/# 技能 first/g)?.length, 1)
+
+    // 已知和未知的混在一起:已知的照样给出来
+    const mixed = await loadSkill.execute({ names: ['first', 'nope'] })
+    assert.match(mixed, /# 技能 first/)
+    assert.match(mixed, /没有名为 "nope" 的技能/)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
   }
