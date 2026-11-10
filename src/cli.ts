@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url'
 import { runAgent } from './agent.ts'
 import { Tui } from './tui.ts'
 import { builtinTools } from './tools.ts'
+import { openExecutionWorld } from './sandbox/openWorld.ts'
+import type { ExecutionWorld } from './executionWorld.ts'
 import { createAskUserTool } from './askUser.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { createLoggerFromConfig } from './logger.ts'
@@ -110,10 +112,30 @@ async function main() {
     messages: sessionStore.load(),
   }
 
-  // 工具的文件访问被限制在工作区内。
+  // 文件和命令进同一个执行世界。远程创建失败就退出,不改绑本机工作区。
+  let world: ExecutionWorld
+  try {
+    world = await openExecutionWorld(config, { sessionId })
+  } catch (error) {
+    logger.error({
+      errorMessage: (error as Error).message,
+      executionWorld: config.ExecutionWorld,
+      sessionId,
+    }, '执行世界创建失败')
+    console.error(`[grassagent] ${(error as Error).message}`)
+    sessionStore.close()
+    process.exit(1)
+  }
+  logger.info({
+    sessionId,
+    sandboxId: world.sandboxId,
+    executionWorld: config.ExecutionWorld,
+  }, '执行世界已绑定')
+
+  // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
   const fileTools = await builtinTools({
-    workspace: config.Workspace,
+    world,
     commandTimeoutMs: config.CommandTimeoutMs,
   })
 
@@ -135,6 +157,7 @@ async function main() {
     if (error instanceof HookConfigError) {
       console.error(`[grassagent] ${error.message}`)
       for (const issue of error.issues) console.error(issue)
+      await world.close()
       sessionStore.close()
       process.exit(1)
     }
@@ -145,6 +168,7 @@ async function main() {
   if (sessionStart.blocked || sessionStart.preventContinuation) {
     console.error(`[grassagent] 会话被钩子拒绝: ${sessionStart.reason ?? 'Blocked by hook'}`)
     for (const message of sessionStart.systemMessages) console.error(`[grassagent] ${message}`)
+    await world.close()
     sessionStore.close()
     process.exit(1)
   }
@@ -184,6 +208,11 @@ async function main() {
       } catch (error) {
         logger.error({ errorMessage: (error as Error).message }, 'SessionEnd 钩子失败')
       }
+    }
+    try {
+      await world.close()
+    } catch (error) {
+      logger.error({ errorMessage: (error as Error).message, sandboxId: world.sandboxId }, '释放执行世界失败')
     }
     cleanupSync()
   }

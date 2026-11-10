@@ -20,6 +20,13 @@ const REDACT_PATHS = [
   '*.apiKey',
   'req.headers.authorization',
   'headers.authorization',
+  'token',
+  '*.token',
+  'credential',
+  '*.credential',
+  'credentialRef',
+  'gitToken',
+  'sandboxToken',
 ]
 
 export interface LoggerOptions {

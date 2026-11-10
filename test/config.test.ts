@@ -186,6 +186,29 @@ test('默认会识别项目里的规则和提示词', () => {
   assert.equal(config.LoadProjectInstructions, true)
 })
 
+test('默认执行世界是本地,远程缺少控制面地址时失败', () => {
+  const config = validateConfig({ ApiKey: 'k' })
+  assert.equal(config.ExecutionWorld, 'local')
+  assert.equal(config.SandboxTtlMs, 1_800_000)
+  assert.equal(config.SandboxKeep, false)
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', ExecutionWorld: 'remote' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_SANDBOX_CONTROL_URL')))
+      return true
+    },
+  )
+  const remote = validateConfig({
+    ApiKey: 'k',
+    ExecutionWorld: 'remote',
+    SandboxControlUrl: 'http://127.0.0.1:9473',
+    SandboxImage: 'node:22',
+  })
+  assert.equal(remote.ExecutionWorld, 'remote')
+  assert.equal(remote.SandboxImage, 'node:22')
+})
+
 test('LoadProjectInstructions 可以用 0 关掉', () => {
   const config = validateConfig({ ApiKey: 'k', LoadProjectInstructions: '0' })
   assert.equal(config.LoadProjectInstructions, false)

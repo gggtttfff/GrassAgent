@@ -33,6 +33,12 @@ const numericOption = (options: {
   )
 
 // 布尔型环境变量:接受 1/0、true/false、yes/no
+const optionalText = (label: string) =>
+  z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: `${label} 不能为空` }).optional(),
+  )
+
 const booleanOption = (defaultValue: boolean, label: string) =>
   z.preprocess(
     (value) => {
@@ -119,11 +125,48 @@ export const configSchema = z.object({
   // 启动时是否识别项目里 opencode、cursor、claude、kiro 的规则和提示词。
   // 关掉之后系统提示词里只有 Grass 自己的那一段。
   LoadProjectInstructions: booleanOption(true, 'LoadProjectInstructions'),
+
+  // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
+  ExecutionWorld: z.enum(['local', 'remote'], {
+    error: 'ExecutionWorld 只能是 local 或 remote',
+  }).default('local'),
+  SandboxControlUrl: z.preprocess(
+    emptyToUndefined,
+    z.url({ error: '控制面地址必须是合法 URL' }).optional(),
+  ),
+  SandboxImage: optionalText('SandboxImage'),
+  SandboxRepoUrl: optionalText('SandboxRepoUrl'),
+  SandboxCredentialRef: optionalText('SandboxCredentialRef'),
+  SandboxId: optionalText('SandboxId'),
+  SandboxTtlMs: numericOption({
+    minimum: 1000, maximum: 86_400_000, defaultValue: 1_800_000, label: 'SandboxTtlMs',
+  }),
+  SandboxCpu: numericOption({ minimum: 1, maximum: 32, defaultValue: 1, label: 'SandboxCpu' }),
+  SandboxMemoryMb: numericOption({
+    minimum: 128, maximum: 65_536, defaultValue: 1024, label: 'SandboxMemoryMb',
+  }),
+  SandboxDiskMb: numericOption({
+    minimum: 1, maximum: 1_048_576, defaultValue: 10_240, label: 'SandboxDiskMb',
+  }),
+  SandboxNetworkAllowlist: z.string().default(''),
+  SandboxKeep: booleanOption(false, 'SandboxKeep'),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
     path: ['CompactKeepRecentTokens'],
     message: 'CompactKeepRecentTokens 与 CompactReserveTokens 之和必须小于 ContextWindow,否则压缩腾不出空间',
+  },
+)).check(z.refine(
+  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxControlUrl),
+  {
+    path: ['SandboxControlUrl'],
+    message: '远程执行世界必须配置控制面地址',
+  },
+)).check(z.refine(
+  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxId) || Boolean(config.SandboxImage),
+  {
+    path: ['SandboxImage'],
+    message: '远程执行世界必须配置镜像,或提供已有的 SandboxId 挂回',
   },
 ))
 
@@ -164,6 +207,18 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   HooksPath: `${ENV_PREFIX}HOOKS_PATH`,
   HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
+  ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
+  SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
+  SandboxImage: `${ENV_PREFIX}SANDBOX_IMAGE`,
+  SandboxRepoUrl: `${ENV_PREFIX}SANDBOX_REPO_URL`,
+  SandboxCredentialRef: `${ENV_PREFIX}SANDBOX_CREDENTIAL_REF`,
+  SandboxId: `${ENV_PREFIX}SANDBOX_ID`,
+  SandboxTtlMs: `${ENV_PREFIX}SANDBOX_TTL_MS`,
+  SandboxCpu: `${ENV_PREFIX}SANDBOX_CPU`,
+  SandboxMemoryMb: `${ENV_PREFIX}SANDBOX_MEMORY_MB`,
+  SandboxDiskMb: `${ENV_PREFIX}SANDBOX_DISK_MB`,
+  SandboxNetworkAllowlist: `${ENV_PREFIX}SANDBOX_NETWORK_ALLOWLIST`,
+  SandboxKeep: `${ENV_PREFIX}SANDBOX_KEEP`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。
