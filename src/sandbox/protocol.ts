@@ -10,19 +10,32 @@ import {
 import { TextEditError } from '../textEdit.ts'
 
 /** 对不上就拒绝,不在半新半旧的进程上继续干活。 */
-export const SANDBOX_PROTOCOL_VERSION = 1
+export const SANDBOX_PROTOCOL_VERSION = 2
 
 export const MAX_CALL_BYTES = 2 * 1024 * 1024
 
+/** raw 读的上限。技能、配置这类要全文的文件走这条,普通读取不受它管。 */
+export const MAX_RAW_BYTES = 1024 * 1024
+
 export type SandboxCall = {
   version: number
-  kind: 'health' | 'read' | 'write' | 'edit' | 'exec'
+  kind: 'health' | 'read' | 'write' | 'edit' | 'exec' | 'list'
   path?: string
   content?: string
   edits?: TextEdit[]
   argv?: string[]
   cwd?: string
   timeoutMs?: number
+  /** read 时要全文就带上它,不走输出上限的截断 */
+  raw?: boolean
+}
+
+/** 目录里的一个条目。size 和 mtimeMs 让客户端能判断文件有没有变过。 */
+export type SandboxEntry = {
+  name: string
+  type: 'file' | 'directory' | 'symlink' | 'other'
+  size?: number
+  mtimeMs?: number
 }
 
 export type SandboxSuccess = {
@@ -30,6 +43,7 @@ export type SandboxSuccess = {
   version: number
   content?: string
   path?: string
+  entries?: SandboxEntry[]
   exitCode?: number
   stdout?: string
   stderr?: string

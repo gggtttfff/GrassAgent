@@ -39,6 +39,16 @@ export type ExecResult = {
 }
 
 /**
+ * 目录里的一个条目。size 和 mtimeMs 让调用方能判断文件有没有变过。
+ */
+export type DirectoryEntry = {
+  name: string
+  type: 'file' | 'directory' | 'symlink' | 'other'
+  size?: number
+  mtimeMs?: number
+}
+
+/**
  * 文件和命令读同一份根。
  * sandboxId 在本地世界为 null。远程世界是控制面返回的 id。
  */
@@ -48,6 +58,14 @@ export interface ExecutionWorld {
   readonly policy: SandboxPolicy
   /** 读取文件。超长内容只返回尾部,全文留在这个世界自己的临时区。作者：Pieory 创建日期：2025-07-18 */
   read(filePath: string): Promise<string>
+  /**
+   * 读取文件全文,不做输出上限的截断。
+   * 技能、配置这类要原样读的文件走这条——普通 read 只给尾部,会把正文读坏。
+   * 作者：Pieory 创建日期：2025-07-18
+   */
+  readRaw(filePath: string): Promise<string>
+  /** 列目录。只返回直接子项,不含递归。作者：Pieory 创建日期：2025-07-18 */
+  list(directoryPath: string): Promise<DirectoryEntry[]>
   /** 覆盖写入。返回解析后的路径,供工具拼给模型看的回执。作者：Pieory 创建日期：2025-07-18 */
   write(filePath: string, content: string): Promise<string>
   /**

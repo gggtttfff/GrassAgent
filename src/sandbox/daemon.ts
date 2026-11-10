@@ -24,9 +24,11 @@ import {
 } from './lexicalPath.ts'
 import {
   MAX_CALL_BYTES,
+  MAX_RAW_BYTES,
   SANDBOX_PROTOCOL_VERSION,
   tokenMatches,
   type SandboxCall,
+  type SandboxEntry,
   type SandboxResult,
 } from './protocol.ts'
 import { sandboxProcessEnv } from './secrets.ts'
@@ -163,10 +165,64 @@ async function dispatch(
     }
     if (body.kind === 'read') {
       const resolved = await resolveCallPath(body.path ?? '', context)
+      // raw 读要全文:走普通 read 会被输出上限截成尾部,正文就少了
+      if (body.raw) {
+        const content = await readFile(resolved)
+        if (content.byteLength > MAX_RAW_BYTES) {
+          throw new Error(`文件超过 raw 读上限 ${MAX_RAW_BYTES} 字节`)
+        }
+        let text: string
+        try {
+          text = new TextDecoder('utf-8', { fatal: true }).decode(content)
+        } catch (error) {
+          throw new EncodingError(resolved, (error as Error).message)
+        }
+        return { ok: true, version: context.version, content: text }
+      }
       const content = await presentFile(resolved, context.pathGuard.workspace, (local) => (
         advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, local)
       ))
       return { ok: true, version: context.version, content }
+    }
+    if (body.kind === 'list') {
+      const resolved = await resolveCallPath(body.path ?? '', context)
+      const { readdir, stat } = await import('node:fs/promises')
+      let entries
+      try {
+        entries = await readdir(resolved, { withFileTypes: true })
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+          return { ok: true, version: context.version, entries: [] }
+        }
+        throw error
+      }
+      const listed: SandboxEntry[] = []
+      for (const entry of entries) {
+        const child = path.join(resolved, entry.name)
+        let size: number | undefined
+        let mtimeMs: number | undefined
+        try {
+          const stats = await stat(child)
+          size = stats.size
+          mtimeMs = stats.mtimeMs
+        } catch {
+          // 读不到就只给名字,调用方按名字判断也够用
+        }
+        listed.push({
+          name: entry.name,
+          type: entry.isDirectory()
+            ? 'directory'
+            : entry.isFile()
+              ? 'file'
+              : entry.isSymbolicLink()
+                ? 'symlink'
+                : 'other',
+          size,
+          mtimeMs,
+        })
+      }
+      return { ok: true, version: context.version, entries: listed }
     }
     if (body.kind === 'write') {
       assertWritable(context.mode, '写入')

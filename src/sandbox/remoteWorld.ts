@@ -5,6 +5,7 @@
 import {
   PolicyDeniedError,
   SandboxUnavailableError,
+  type DirectoryEntry,
   type ExecRequest,
   type ExecResult,
   type ExecutionWorld,
@@ -59,6 +60,20 @@ class RemoteWorld implements ExecutionWorld {
     const path = advertisedPath(this.workspaceRoot, filePath)
     const result = await this.rpc({ version: SANDBOX_PROTOCOL_VERSION, kind: 'read', path })
     return result.content ?? ''
+  }
+
+  /** 作者：Pieory 创建日期：2025-07-18 */
+  async readRaw(filePath: string): Promise<string> {
+    const path = advertisedPath(this.workspaceRoot, filePath)
+    const result = await this.rpc({ version: SANDBOX_PROTOCOL_VERSION, kind: 'read', path, raw: true })
+    return result.content ?? ''
+  }
+
+  /** 作者：Pieory 创建日期：2025-07-18 */
+  async list(directoryPath: string): Promise<DirectoryEntry[]> {
+    const path = advertisedPath(this.workspaceRoot, directoryPath)
+    const result = await this.rpc({ version: SANDBOX_PROTOCOL_VERSION, kind: 'list', path })
+    return result.entries ?? []
   }
 
   /** 作者：Pieory 创建日期：2025-07-18 */

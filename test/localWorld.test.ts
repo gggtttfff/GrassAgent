@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { createDefaultApprovalGate } from '../src/approvalGate.ts'
@@ -72,6 +72,36 @@ test('超过字节上限的文件不会整段留在返回值里', async () => {
     assert.ok(fullPath)
     const info = await stat(fullPath)
     assert.equal(info.size, 8 * 256 * 1024)
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('raw 读拿到全文,列目录给出条目和大小', async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'grass-raw-'))
+  try {
+    const world = await createLocalWorld({ workspace })
+    // 普通读超过 200 行就只给尾部,技能正文常常有几百行,raw 读要拿到完整正文
+    const manyLines = Array.from({ length: 300 }, (_, index) => `line-${index}`).join('\n')
+    await writeFile(path.join(workspace, 'skill.md'), manyLines)
+    const shown = await world.read('skill.md')
+    assert.ok(shown.length < manyLines.length, '普通读应该被截断')
+    assert.equal(await world.readRaw('skill.md'), manyLines)
+
+    await writeFile(path.join(workspace, 'note.txt'), 'hello')
+    await mkdir(path.join(workspace, 'sub'), { recursive: true })
+    const entries = await world.list('.')
+    const names = entries.map((entry) => entry.name)
+    assert.equal(names.includes('note.txt'), true)
+    assert.equal(names.includes('skill.md'), true)
+    assert.equal(names.includes('sub'), true)
+    const note = entries.find((entry) => entry.name === 'note.txt')
+    assert.equal(note?.type, 'file')
+    assert.equal(note?.size, 5)
+    assert.equal(typeof note?.mtimeMs, 'number')
+    assert.equal(entries.find((entry) => entry.name === 'sub')?.type, 'directory')
+
+    await assert.rejects(() => world.list('../outside'), /越界/)
   } finally {
     await rm(workspace, { recursive: true, force: true })
   }

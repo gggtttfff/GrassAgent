@@ -10,6 +10,7 @@ import { Writable } from 'node:stream'
 import ssh2 from 'ssh2'
 import { createSshBackend } from '../src/sandbox/sshBackend.ts'
 import { createLogger } from '../src/logger.ts'
+import { SANDBOX_PROTOCOL_VERSION } from '../src/sandbox/protocol.ts'
 
 // SSH 后端的测试。
 //
@@ -48,7 +49,7 @@ async function startFakeRemote(): Promise<FakeRemote> {
     request.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as { kind: string }
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ ok: true, version: 1, kind: body.kind }))
+      response.end(JSON.stringify({ ok: true, version: SANDBOX_PROTOCOL_VERSION, kind: body.kind }))
     })
   })
   await new Promise<void>((resolve) => daemonServer.listen(0, '127.0.0.1', () => resolve()))
@@ -276,11 +277,11 @@ test('SSH 后端:创建沙盒后能通过隧道转发调用', { timeout: 40_000 
 
     // 调用要能通过隧道送到远程 daemon
     const result = await sandbox.forward({
-      version: 1,
+      version: SANDBOX_PROTOCOL_VERSION,
       kind: 'health',
     })
     assert.equal(result.ok, true)
-    assert.equal(result.version, 1)
+    assert.equal(result.version, SANDBOX_PROTOCOL_VERSION)
 
     await sandbox.destroy({ removeVolume: true })
   } finally {

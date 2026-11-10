@@ -11,8 +11,48 @@ import { listenControl } from '../src/sandbox/controlHttp.ts'
 import { openExecutionWorld, sandboxCreateBody } from '../src/sandbox/openWorld.ts'
 import { createDockerBackend, containerEnvLines, dockerRunArguments } from '../src/sandbox/dockerBackend.ts'
 import { writeSecretFile } from '../src/sandbox/secrets.ts'
+import { SANDBOX_PROTOCOL_VERSION } from '../src/sandbox/protocol.ts'
 
 const idleTimer: TimerFn = () => ({ refresh() {}, cancel() {} })
+
+test('远程世界能列目录,raw 读拿到全文', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-remote-list-'))
+  try {
+    const backend = createInProcessBackend({ stateDir })
+    const plane = createControlPlane({ backend, timer: idleTimer })
+    const listening = await listenControl(plane)
+    try {
+      const config = validateConfig({
+        ApiKey: 'sk-test',
+        ExecutionWorld: 'remote',
+        SandboxControlUrl: listening.url,
+        SandboxImage: 'test-image',
+        Workspace: stateDir,
+      })
+      const world = await openExecutionWorld(config, { sessionId: 'session-list' })
+      // 超过 200 行普通读只给尾部,raw 读要全文
+      const manyLines = Array.from({ length: 300 }, (_, index) => `line-${index}`).join('\n')
+      await world.write('skill.md', manyLines)
+      await world.write('note.txt', 'hello')
+
+      assert.ok((await world.read('skill.md')).length < manyLines.length)
+      assert.equal(await world.readRaw('skill.md'), manyLines)
+
+      const entries = await world.list('.')
+      const names = entries.map((entry) => entry.name)
+      assert.equal(names.includes('note.txt'), true)
+      assert.equal(names.includes('skill.md'), true)
+      assert.equal(entries.find((entry) => entry.name === 'note.txt')?.size, 5)
+
+      // 越界的路径仍然要被挡住
+      await assert.rejects(() => world.list('../etc'), /越界/)
+    } finally {
+      await listening.close().catch(() => undefined)
+    }
+  } finally {
+    await rm(stateDir, { recursive: true, force: true })
+  }
+})
 
 test('断开控制面后工具结果是沙盒不可用,不会改读本机文件', async () => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-remote-'))
@@ -196,7 +236,7 @@ test('空闲到期后调用失败,keep 的卷可以挂回,不存在的卷不会�
       keep: true,
     })
     const written = await plane.call(handle.sandboxId, handle.token, {
-      version: 1,
+      version: SANDBOX_PROTOCOL_VERSION,
       kind: 'write',
       path: 'kept.txt',
       content: 'still-here',
@@ -206,7 +246,7 @@ test('空闲到期后调用失败,keep 的卷可以挂回,不存在的卷不会�
     idle?.()
     await waitUntil(async () => {
       const result = await plane.call(handle.sandboxId, handle.token, {
-        version: 1,
+        version: SANDBOX_PROTOCOL_VERSION,
         kind: 'read',
         path: 'kept.txt',
       })
@@ -217,7 +257,7 @@ test('空闲到期后调用失败,keep 的卷可以挂回,不存在的卷不会�
 
     const attached = await plane.attach(handle.sandboxId, 60_000, 'session-2')
     const readBack = await plane.call(attached.sandboxId, attached.token, {
-      version: 1,
+      version: SANDBOX_PROTOCOL_VERSION,
       kind: 'read',
       path: 'kept.txt',
     })

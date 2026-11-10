@@ -3,12 +3,13 @@
 // 默认 workspace-write,和改动之前的 Grass 一样,工作区内的调用不再询问。
 
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { assertEscalationAllowed, type ApprovalGate } from './approvalGate.ts'
 import {
   EncodingError,
   PolicyDeniedError,
+  type DirectoryEntry,
   type ExecRequest,
   type ExecResult,
   type ExecutionWorld,
@@ -62,6 +63,43 @@ class LocalWorld implements ExecutionWorld {
       if (error instanceof EncodingError) throw error
       throw fileAccessError(error, resolved)
     }
+  }
+
+  /** 作者：Pieory 创建日期：2025-07-18 */
+  async readRaw(filePath: string): Promise<string> {
+    const resolved = await this.resolveInside(filePath)
+    try {
+      return decodeFile(await readFile(resolved), resolved)
+    } catch (error) {
+      if (error instanceof EncodingError) throw error
+      throw fileAccessError(error, resolved)
+    }
+  }
+
+  /** 作者：Pieory 创建日期：2025-07-18 */
+  async list(directoryPath: string): Promise<DirectoryEntry[]> {
+    const resolved = await this.resolveInside(directoryPath)
+    let entries
+    try {
+      entries = await readdir(resolved, { withFileTypes: true })
+    } catch (error) {
+      throw fileAccessError(error, resolved)
+    }
+    const result: DirectoryEntry[] = []
+    for (const entry of entries) {
+      const child = path.join(resolved, entry.name)
+      let size: number | undefined
+      let mtimeMs: number | undefined
+      try {
+        const stats = await stat(child)
+        size = stats.size
+        mtimeMs = stats.mtimeMs
+      } catch {
+        // 读不到就当没有这些信息,调用方只靠名字判断也够用
+      }
+      result.push({ name: entry.name, type: entryType(entry), size, mtimeMs })
+    }
+    return result
   }
 
   /** 作者：Pieory 创建日期：2025-07-18 */
@@ -249,4 +287,11 @@ function decodeFile(buffer: Buffer, filePath: string): string {
   } catch (error) {
     throw new EncodingError(filePath, (error as Error).message)
   }
+}
+
+function entryType(entry: import('node:fs').Dirent): DirectoryEntry['type'] {
+  if (entry.isDirectory()) return 'directory'
+  if (entry.isFile()) return 'file'
+  if (entry.isSymbolicLink()) return 'symlink'
+  return 'other'
 }
