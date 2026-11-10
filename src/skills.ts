@@ -26,6 +26,8 @@ export interface Skill {
   /** load_skill 用的名字。同名时先扫到的根优先。 */
   name: string
   description: string
+  /** 描述被截断过。索引里要标出来,不然模型以为描述就这么长。 */
+  descriptionClipped: boolean
   /** 工作区内相对路径,指向 SKILL.md。正文被截断时靠它读全文。 */
   relativePath: string
   /** SKILL.md 所在目录,附件在该目录下 */
@@ -273,7 +275,10 @@ export function renderSkillSection(skills: readonly Skill[]): string {
     '下面是打包好的多步流程,正文没有放进上下文。',
     '任务和某条描述对得上时,先调用 load_skill 取全文,再按正文执行;不要凭名字猜步骤。',
     '没被点名、描述也对不上的技能不要用。',
-    ...usable.map((skill) => `- ${skill.name}(来源:${skill.origin.label}): ${skill.description}`),
+    ...usable.map((skill) => (
+      `- ${skill.name}(来源:${skill.origin.label}): ${skill.description}` +
+      `${skill.descriptionClipped ? '(描述已截断)' : ''}`
+    )),
   ].join('\n')
 }
 
@@ -393,7 +398,8 @@ async function loadSkill(
   // 没写 name 就用它在技能根下的目录名,允许多级,比如 "review/pr"
   const directoryName = relativeOf(rootDirectory, filePath)
   const name = (stringValue(data.name) ?? directoryName).trim()
-  const description = clipDescription(stringValue(data.description) ?? firstHeading(body))
+  const clipped = clipDescription(stringValue(data.description) ?? firstHeading(body))
+  const description = clipped?.text
   if (!name) {
     context.logger.warn({ path: filePath }, '技能没有名字,已跳过')
     return
@@ -416,6 +422,7 @@ async function loadSkill(
   context.skills.push({
     name,
     description,
+    descriptionClipped: clipped?.clipped ?? false,
     relativePath: filePath,
     directoryPath: parentOf(filePath),
     body: truncated ? normalizedBody.slice(0, MAX_SKILL_BODY_CHARS) : normalizedBody,
@@ -511,13 +518,19 @@ function firstHeading(body: string): string | undefined {
   return match?.[1]?.trim()
 }
 
-function clipDescription(text: string | undefined): string | undefined {
+function clipDescription(text: string | undefined): { text: string; clipped: boolean } | undefined {
   if (!text) return undefined
   const collapsed = text.replace(/\s+/g, ' ').trim()
   if (!collapsed) return undefined
-  return collapsed.length <= MAX_DESCRIPTION_CHARS
-    ? collapsed
-    : `${collapsed.slice(0, MAX_DESCRIPTION_CHARS)}…`
+  if (collapsed.length <= MAX_DESCRIPTION_CHARS) return { text: collapsed, clipped: false }
+  // 在句子边界截断。切在句子中间,后半句多半正是触发词所在的地方。
+  const head = collapsed.slice(0, MAX_DESCRIPTION_CHARS)
+  const boundary = Math.max(
+    head.lastIndexOf('。'), head.lastIndexOf('.'), head.lastIndexOf('；'),
+    head.lastIndexOf(';'), head.lastIndexOf('，'), head.lastIndexOf(','),
+  )
+  const cut = boundary > MAX_DESCRIPTION_CHARS * 0.6 ? head.slice(0, boundary + 1) : head
+  return { text: `${cut}…`, clipped: true }
 }
 
 function errorMessage(error: unknown): string {

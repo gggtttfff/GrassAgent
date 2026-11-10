@@ -308,6 +308,40 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
   }
 })
 
+test('描述按句子边界截断,索引里标出被截断', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    const longDescription = `${'这是一句很长的描述。'.repeat(20)}最后一句。`
+    await writeSkill(workspace, '.grass/skills/wordy', [
+      '---',
+      'name: wordy',
+      `description: ${longDescription}`,
+      '---',
+      '正文。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    const skill = catalog.skills[0]
+    assert.equal(skill?.descriptionClipped, true)
+    assert.ok((skill?.description.length ?? 0) <= 201)
+    // 截在句子边界上,不是句子中间
+    assert.match(skill?.description ?? '', /。…$/)
+    assert.match(catalog.promptSection, /描述已截断/)
+
+    await writeSkill(workspace, '.grass/skills/short', [
+      '---',
+      'name: short',
+      'description: 很短',
+      '---',
+      '正文。',
+    ].join('\n'))
+    const withShort = await scanLocalSkills(workspace)
+    assert.equal(withShort.skills.find((item) => item.name === 'short')?.descriptionClipped, false)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('标题清单带文件行号,截断时仍覆盖全文', async () => {
   const workspace = await makeWorkspace()
   try {
