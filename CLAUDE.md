@@ -14,12 +14,16 @@ cli.ts → agent.ts → llm.ts → protocol.ts
   tui.ts   tools.ts           providers/
    ↓        ↓                (openai.ts)
 config.ts  pathGuard.ts
-   ↓
+   ↓          hooks.ts
 logger.ts / transport.ts / retry.ts / mutationQueue.ts
 sessionStore.ts
+hookConfig.ts → hooks.ts
+projectInstructions.ts → pathGuard.ts
+sessionBundle.ts → messages.ts
+jsonSafety.ts
 ```
 
-`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。
+`messages.ts` 是内部消息模型，provider 无关；`protocol.ts` 定义 provider 协议和注册表；`providers/` 下按厂商分文件。`config.ts` 独立：被 cli.ts 消费，不反向依赖任何模块。`jsonSafety.ts` 只做 JSON 深度检查，被会话、规则、钩子和 provider 使用，不反向依赖它们。
 
 `theme.ts` 只被 `tui.ts` 消费，配色相关的东西都在那。`nonInteractiveTerminal.ts` 实现 pi-tui 的 `Terminal` 接口，用于 stdin 不是 TTY 的环境。
 
@@ -110,7 +114,31 @@ sessionStore.ts
 
 **29. 斜杠命令在本地执行，不发给模型。** 命令名拼错也要拦下来——否则会被当成普通输入发给模型。命令实现注入进 `SlashCommandRegistry`，TUI 只管显示。
 
-**30. `ask_user` 的回答走 tool_result，不能启动新回合。** 提问期间回合仍在跑，但输入框临时解锁。`src/tui.ts` 用 `pendingAnswer` 标记等待状态，`bindSubmit` 先检查它，再决定是回答还是新输入；不检查的话用户回答 `/clear` 会被当成斜杠命令。等待时注册 abort 监听，Ctrl+C 后取消等待、恢复输入框锁。非交互模式不要等下一行——管道可能已经 EOF，直接返回兜底让模型继续。
+**30. 钩子失败默认放行。** 退出码不是 0 也不是 2、超时、JSON 写坏，都只记日志，不拦截。想拒绝必须退出码 2，或 JSON 里 `decision: "block"` / `permissionDecision: "deny"`。把所有非 0 退出码都当成拒绝的话，一个写错的脚本会把会话卡死。
+
+**31. 钩子不能拆掉 tool_call / tool_result 配对。** `PreToolUse` 拒绝、或钩子跑到一半被 Ctrl+C 打断，没执行的工具也要补 `tool_result`（拒绝理由或 `error:aborted`）。漏了下次恢复会话会 400。
+
+**32. `updatedInput` 必须再过一遍参数校验。** 钩子改写的参数和模型给的参数一样不可信。校验失败就不执行，把错误回填给模型。
+
+**33. 工具钩子按 tool_call 的原始顺序串行跑。** `PreToolUse` 在执行之前，`PostToolUse` / `PostToolUseFailure` 在工具跑完之后。不要把钩子放进并行段里——改写结果和审计日志都依赖这个顺序。被 `PreToolUse` 拒绝的调用不再发 `PostToolUseFailure`。
+
+**34. Stop 钩子拉回回合有上限。** 默认 5 次（`maxStopContinuations`）。一个总是拒绝的脚本不能让回合永远问模型。
+
+**35. SessionEnd 不能挂在 `process` 的 `exit` 事件上。** 那个回调里不能 await。钩子走显式退出路径（Ctrl+C、stdin 结束、SIGINT），`exit` 事件只做同步的终端和数据库清理。
+
+**36. 打断之后不要再启动新钩子。** 已经在跑的命令要杀掉。`PreCompact` 只在这一轮确实要压缩时才跑，不要每轮空转。
+
+**37. `ask_user` 的回答是 tool_result，不能再开一轮用户消息。** 它必须 `sequential: true`，独占输入。非交互模式下，回合进行中到达的整行要先入队，而且要在处理当前行的第一个 `await` 之前就占住输入——晚了的话管道里已经缓冲的下一行会冲进编辑器，回车被丢掉。EOF 时正在等的提问必须立刻结束，否则回合不收尾，进程也不退。
+
+**38. 导入的会话包只当数据。** 不执行包里的文本，不写钩子，不把 API Key 放进包。`tool_call` / `tool_result` 配不上对就整段拒绝，否则下次请求 400。同 ID 默认跳过，只有 `--replace` 才覆盖。
+
+**39. 识别其他工具的规则失败不能挡住启动。** 单个文件读失败、JSON 坏了、软链越界，都跳过并记日志。远程 URL 不抓取。工作区外的路径不读。`node_modules` 和 `.git` 不扫。
+
+**40. 提示词和按文件生效的规则不要整篇塞进系统提示词。** 只有「始终生效」的规则进系统提示词，单文件 12000 字、合计 24000 字封顶。其余列成索引，让模型用 `read_file` 按需读。提示词没被点名、也和描述对不上时不要执行。
+
+**41. 导出会话前先 sync，导入覆盖当前会话后立刻 load。** 不 sync，最后一轮还在内存里，带走的是旧对话。导入之后再拿旧的 `context.messages` 去 sync，会对账失败，把刚导进来的内容盖掉。
+
+**42. 不可信 JSON 先量深度再解析。** `JSON.parse` 能吃下几万层嵌套，但之后的 `JSON.stringify`（落盘、导出、压缩、发给模型）是递归的，大约几千层就会把调用栈打穿。文本和对象都在固定栈上检查，超过 256 层直接拒绝，字符串里的括号不算。规则发现和坏的会话行仍然跳过；会话包、钩子文件把原因交给用户。
 
 ## 已知取舍
 
@@ -122,10 +150,17 @@ sessionStore.ts
 - 上下文压缩后长对话的早期细节会丢失（只剩摘要）——历史还在库里，但模型看不到
 - 工具参数用封闭对象（`additionalProperties: false`），模型多传字段会被拒绝
 - 并行执行时 abort 语义变了：所有工具同时启动，abort 后已经在跑的工具不会停下（`error:aborted` 只补给还没开始的）
-- 上下文压缩按消息条数判断，不是 token 数——消息长短差异大时压缩时机不准
+- 上下文压缩的 token 用字符数 / 4 估算，不是模型真实用量。中文和代码的实际密度会偏，只用来决定何时压、留多少
 - TUI 用主屏渲染（`TuiMainScreen`），不是备用屏——主屏保留终端的滚动历史，代价是不能自己管理滚动条
 - markdown 排版在回合结束后才做，流式期间是纯文本
 - 压缩状态存在内存里，不进数据库——重启后第一次回合会重新压缩一次
+- 钩子只有命令和进程内函数两种。没有 HTTP / prompt / agent 钩子，也不支持 async
+- 命令钩子用 shell 执行。命令来自用户自己的配置文件，不是模型输出；模型给的参数只走 stdin 的 JSON
+- 界面上先打印的 tool_call 仍是模型原始参数。钩子改写成功时，写进历史的是实际执行的那份
+- Stop 钩子默认最多把一个回合拉回 5 次
+- 按文件生效的规则不会在读到匹配文件时自动注入，只在系统提示词里留索引
+- 不读用户主目录里的全局规则，也不抓取 opencode 配置里的远程 URL
+- 会话包是明文 JSON，对话里如果曾经出现过密钥，导出时不会再扫一遍剔掉
 
 ## 测试
 
@@ -147,7 +182,9 @@ sessionStore.ts
 
 ## 斜杠命令
 
-`/clear`、`/new`、`/sessions`、`/resume` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+`/clear`、`/new`、`/sessions`、`/resume`、`/export`、`/import`、`/instructions` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+
+`/export` 把会话收成 `grassagent-bundle` JSON。默认写到工作区 `.grass/grassagent-bundle.json`，这个文件已在 `.gitignore` 里。`/import` 默认同 ID 跳过，`--replace` 覆盖。`/instructions` 只列出路径和生效方式，不把提示词再打印一遍。
 
 `/resume` 不带参数时弹会话选择器（`SelectList` + overlay），回车切换、Esc 取消。非交互模式没键盘，改成列出所有会话 ID 让人自己挑。
 

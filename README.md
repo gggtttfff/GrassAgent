@@ -10,14 +10,17 @@
 
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
 - **终端界面** —— 差分渲染 + markdown 排版，流式输出不闪屏
-- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume`，本地执行，带命令补全
+- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume` `/export` `/import` `/instructions`，本地执行，带命令补全
+- **想来就来，想走就走** —— 会话导出成一个 JSON 包，换一台机器再导回来。包里没有 API Key
+- **认得仓库里已有的约定** —— 启动时识别 opencode、cursor、claude、kiro 的规则和提示词。始终生效的规则进上下文，提示词只列目录，点名再用
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息，历史本身不丢
 - **可打断** —— Ctrl+C 中断当前回合，且不破坏 API 要求的 message 配对
-- **用户提问** —— 模型缺少关键信息时调用 `ask_user`，回答回填后继续执行
+- **向用户提问** —— 模型调用 `ask_user` 后停下等你回答，答完再继续
 - **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
 - **路径沙箱** —— 文件读写和命令执行都限制在工作区内
+- **生命周期钩子** —— 会话、提示词、工具和压缩前后可以观察、拒绝或改写
 - **结构化日志** —— JSON 输出，密钥自动脱敏
 
 ## 目录结构
@@ -30,11 +33,17 @@ src/
   providers/     按厂商分文件：openai.ts 等
   agent.ts       Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
   compaction.ts  压缩层：决定发给模型看哪一段，不改历史
-  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash / ask_user
+  tools.ts       内置工具：read_file / write_file / edit / edit_batch / run_bash
+  askUser.ts     向用户提问。工具本身不碰终端，怎么问由调用方注入
+  lineQueue.ts   非交互输入队列：回合进行中到达的整行先留住
   tui.ts         终端界面:组件树 + 差分渲染 + markdown 排版
   theme.ts       配色:markdown / 编辑器 / 列表的主题定义
   slashCommands.ts 斜杠命令：解析 + 分发
   sessionPicker.ts  会话选择器：列表 + 弹窗
+  sessionBundle.ts 会话包：把 SQLite 里的对话收成 JSON，再导回来
+  projectInstructions.ts 识别 opencode / cursor / claude / kiro 的规则和提示词
+  hooks.ts       钩子运行时：命令 / 函数、拒绝、改写、超时
+  hookConfig.ts  钩子配置：读取并校验 hooks.json
   cli.ts         拼装层：加载配置、恢复会话、把事件转发到 TUI
   config.ts      配置层：.env 解析 + schema 校验
   logger.ts      日志层：结构化 JSON 输出
@@ -86,8 +95,119 @@ npm start
 | `/new` | 开一个新会话 |
 | `/sessions` | 列出所有会话 |
 | `/resume` | 切换到别的会话 |
+| `/export` | 把会话导出成文件。不带路径时写到 `.grass/grassagent-bundle.json` |
+| `/import` | 从文件导回会话。同 ID 默认跳过，`--replace` 才覆盖 |
+| `/instructions` | 列出识别到的规则和提示词 |
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
+
+### 导入导出
+
+会话存在本机的 SQLite 里。换机器、换目录之前，把对话收成一个文件带走：
+
+```bash
+/export
+/export ~/backups/grass.json
+/export ~/backups/one.json --session <会话ID>
+/import ~/backups/grass.json
+/import ~/backups/grass.json --replace
+```
+
+文件是 `grassagent-bundle` 版本 1 的 JSON。里面只有会话 ID、时间和消息。API Key 留在原来的 `.env`，钩子留在项目的 `.grass/hooks.json`。导入只把消息写进会话库，不执行包里的文字。
+
+`tool_call` 和 `tool_result` 配不上对的会话会被拒绝，避免导进来之后下次请求直接 400。同 ID 已经存在时默认跳过，免得把这台机器上还在用的对话盖掉。嵌套超过 256 层的 JSON 会在解析前拒绝，避免一份极深的工具参数在保存或下一次请求时把进程打穿。
+
+相对路径锚定工作区，`~` 展开到用户主目录。这是用户自己的命令，所以允许把文件写到工作区外面。
+
+### 项目里已有的规则和提示词
+
+启动时扫描工作区，认出这些文件：
+
+| 工具 | 规则 | 提示词 |
+| --- | --- | --- |
+| opencode | `AGENTS.md`，以及 `opencode.json` / `opencode.jsonc` 里 `instructions` 指向的本地文件 | `.opencode/commands/`、`.opencode/agents/`、`.opencode/skills/`，还有配置里的 `command` / `agents` |
+| cursor | `.cursor/rules/**/*.mdc`、根目录 `.cursorrules`、`AGENTS.md` | `.cursor/commands/`、`.cursor/skills/` |
+| claude | `CLAUDE.md`、`CLAUDE.local.md`、`.claude/CLAUDE.md`、`.claude/rules/` | `.claude/commands/`、`.claude/agents/`、`.claude/skills/`、`.claude/output-styles/` |
+| kiro | `.kiro/steering/`、`AGENTS.md` | `.kiro/agents/`、`.kiro/skills/` |
+
+始终生效的规则（例如根目录 `AGENTS.md`、`alwaysApply: true`、没有 `paths` 的 Claude 规则、Kiro `inclusion: always`）会放进系统提示词。按文件匹配、按描述判断、点名才用的规则只留一行索引，模型改到相关文件时用 `read_file` 再读。提示词同样只进索引：用户点名，或任务和描述对上时才读正文，不会当成当前任务自动执行。
+
+单份规则超过 12000 字，或始终生效的规则合计超过 24000 字，就不再整篇塞进上下文，索引里会写明原因。
+
+不抓取配置里的 `https://` 地址，不读工作区外面的文件。指向区外的软链会跳过。`node_modules`、`.git` 这类目录不扫描。某个文件坏了，或者 JSON 嵌套过深，只记日志，启动继续。不想要这套识别时设 `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS=0`。
+
+用户主目录里的全局规则（`~/.claude`、`~/.config/opencode`、`~/.kiro`）不在这次的扫描范围里，它们不属于当前项目。
+
+### 钩子
+
+钩子是回合上的扩展点。它不改 agent 循环本身，只在固定时刻看一眼即将发生的动作，然后允许、拒绝，或改写参数和结果。
+
+配置放在工作区的 `.grass/hooks.json`。文件不存在就等于没配。也可以用 `GRASSAGENT_HOOKS_PATH` 指到别的文件——指了但找不到，启动会失败。
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "^run_bash$",
+      "hooks": [
+        { "type": "command", "command": "node .grass/guard.mjs", "timeoutMs": 5000 }
+      ]
+    }
+  ]
+}
+```
+
+`matcher` 是正则，匹配这一次事件的文本：工具事件匹配工具名，`UserPromptSubmit` 和 `Stop` 匹配提示词或模型刚说的话。不写就每次都跑。想精确匹配工具名要自己加锚点，`edit` 会命中 `edit_batch`。
+
+命令从 **stdin** 读到一行 JSON（`hook_event_name`、`session_id`、`cwd`，工具事件还有 `tool_name` / `tool_input` / `tool_use_id`）。结果看退出码和 stdout：
+
+| 结果 | 含义 |
+| --- | --- |
+| 退出码 0，stdout 为空 | 允许 |
+| 退出码 0，stdout 不是 JSON | 整段文字当作额外上下文，塞给模型 |
+| 退出码 0，stdout 是 JSON | 按下面的字段决定 |
+| 退出码 2 | 拒绝。理由用 stderr，没有就用 stdout |
+| 其他退出码 | 钩子失败，**放行**，错误打到日志和界面 |
+
+JSON 里常用的字段：
+
+```json
+{
+  "continue": true,
+  "decision": "block",
+  "reason": "不许删仓库",
+  "systemMessage": "给用户看的一行字",
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "不许删仓库",
+    "updatedInput": { "command": "ls" },
+    "additionalContext": "这段会进模型上下文",
+    "updatedOutput": "只在 PostToolUse 里替换工具结果"
+  }
+}
+```
+
+`decision: "block"` 和 `permissionDecision: "deny"` 都是拒绝。拒绝是粘性的：同一个事件上，后面的钩子不能把前面的拒绝翻回来。`continue: false` 表示这步做完就结束回合，不要再问模型。
+
+现在会触发的事件：
+
+| 事件 | 时机 | 钩子能做什么 |
+| --- | --- | --- |
+| `SessionStart` | 会话加载完、界面起来之前 | 往系统提示词追加上下文；拒绝则进程直接退出 |
+| `SessionEnd` | 进程退出之前 | 做收尾。这里不能挂太慢的命令，退出会等它 |
+| `UserPromptSubmit` | 用户回车之后、发给模型之前 | 拦住这次输入，或往消息末尾追加上下文 |
+| `PreToolUse` | 参数校验之后、工具执行之前 | 拒绝这次调用，或改写参数。改写后的参数还要再过一遍校验 |
+| `PostToolUse` | 工具成功之后 | 改写回给模型的结果，或追加上下文 |
+| `PostToolUseFailure` | 工具失败之后 | 同上。被 `PreToolUse` 拒绝的调用不会再进这里 |
+| `Stop` | 模型没再调工具、回合即将结束 | 拒绝的话把理由塞回上下文，让模型继续。连续拉回有上限，默认 5 次 |
+| `PreCompact` | 真的要压缩上下文之前 | 拒绝则这一次不压缩。历史本来就不会被改写 |
+
+工具被拒绝或中途被 Ctrl+C 打断时，每个 `tool_call` 仍然会有一条 `tool_result`。漏掉的话，下次恢复会话会 400。
+
+失败默认放行：脚本崩了、超时了、JSON 写坏了，都不该把整个会话卡死。想拦截就必须退出码 2，或者在 JSON 里明确写 `block` / `deny`。
+
+目前只有 `type: "command"`。没有 HTTP、prompt、agent 这几种，也不支持 `"async": true`——写上去会在启动时被校验拒绝。
 
 ### 非交互模式
 
@@ -121,10 +241,14 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_LOG_LEVEL` | 日志级别 | `info` |
 | `GRASSAGENT_LOG_FORMAT` | `json` 或 `pretty` | `json` |
 | `GRASSAGENT_TOOL_EXECUTION` | `parallel` 或 `sequential` | `parallel` |
-| `GRASSAGENT_COMPACT_THRESHOLD` | 上下文压缩触发阈值（消息条数） | `50` |
-| `GRASSAGENT_COMPACT_KEEP_RECENT` | 压缩时保留最近多少条消息 | `20` |
+| `GRASSAGENT_CONTEXT_WINDOW` | 上下文窗口（token），用来判断该不该压缩 | `128000` |
+| `GRASSAGENT_COMPACT_RESERVE_TOKENS` | 留给回复和摘要的 token，超过窗口减去它就开始压 | `16384` |
+| `GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS` | 压缩后尽量保留的最近 token | `20000` |
 | `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
+| `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
+| `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
+| `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS` | 是否识别 opencode、cursor、claude、kiro 的规则和提示词 | `1` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -159,7 +283,11 @@ echo "读一下 README.md" | npm start
 
 **abort 后的配对补全。** API 要求每个 `tool_call` 都有对应的 `tool_result`。被 Ctrl+C 打断时跳过的工具，会补上 `error:aborted`，否则下次启动恢复会话时直接 400。
 
-**上下文压缩。** 消息超过阈值时，先让模型把旧消息总结成摘要，之后发给模型的内容变成「摘要 + 最近若干条」。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**向用户提问。** 信息不足或有多种做法必须由用户决定时，模型调用 `ask_user`。这个工具独占一轮里的输入：问题显示出来，等你回车，回答作为 `tool_result` 回到模型，然后回合继续。它不会被当成一条新的用户消息，否则会和还没结束的工具调用叠在一起。
+
+管道输入时，回合进行中到达的下一行先排队。提问就用这一行当回答；没人问的话，本轮结束再按顺序开下一轮。输入已经结束（EOF）还在等回答时，工具返回「没有用户可以回答」，模型按现有信息继续，进程不会挂住。
+
+**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，先让模型把旧消息总结成结构化摘要（目标、约束、进展、决定、下一步），之后发给模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
 
 压缩**只改发给模型的视图，不改历史**。`context.messages` 始终是完整的，摘要单独记在 `context.compaction` 里。这一点很关键，因为改历史会出两个问题：
 
@@ -167,7 +295,7 @@ echo "读一下 README.md" | npm start
 
 二是**新消息会存不进去**。会话存储按「新增条数」增量写，历史被砍之后切片就空了，后面说的话全部消失。
 
-阈值可以配：`GRASSAGENT_COMPACT_THRESHOLD`（默认 50）和 `GRASSAGENT_COMPACT_KEEP_RECENT`（默认 20）。
+窗口、预留和保留可以配：`GRASSAGENT_CONTEXT_WINDOW`（默认 128000）、`GRASSAGENT_COMPACT_RESERVE_TOKENS`（默认 16384）、`GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS`（默认 20000）。保留和预留加起来必须小于窗口。本地小模型要把这三个一起改小。
 
 **容错读取会话。** 消息在 SQLite 里按序列号存，读出来逐条校验结构，坏行跳过而不是丢弃整个会话。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏 tool_call / tool_result 的配对关系。
 
@@ -215,10 +343,6 @@ echo "读一下 README.md" | npm start
 
 想退回串行：`GRASSAGENT_TOOL_EXECUTION=sequential`。
 
-**用户提问。** 模型遇到「改 A 还是改 B」这类不能靠读代码决定的问题时，会调用 `ask_user`，把问题显示在对话区。回答作为 `tool_result` 回填，模型据此继续，不会重复执行已经完成的工具。
-
-提问期间输入框只接收回答，不触发新回合或斜杠命令；回答后恢复原来的状态。`ask_user` 声明 `sequential: true`，不会和其他工具同时抢输入。非交互模式没有下一条输入可读，会返回「无法接收回答」的兜底结果，让模型基于已有信息继续，而不是挂住进程。
-
 **会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
 WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——允许多实例同时跑。
@@ -232,7 +356,7 @@ WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库�
 ## 测试
 
 ```bash
-npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / askUser / tuiQuestion / validation / provider / sessionStore / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal
+npm run test:unit    # 单元测试：config / pathGuard / retry / transport / tools / validation / provider / sessionStore / sessionBundle / projectInstructions / mutationQueue / parallelTools / compaction / slashCommands / sessionPicker / nonInteractiveTerminal / hooks / hookConfig / agentHooks
 npm test             # 端到端测试：本地 mock SSE 服务，不发真实 API 请求
 npm run typecheck    # 类型检查
 npm run test:all     # 上面三样一起跑
@@ -246,9 +370,8 @@ npm run test:all     # 上面三样一起跑
 - 参数 JSON 损坏但 `finish_reason` 正常时同样拦下
 - Ctrl+C 打断后每个 `tool_call` 都有配对 `tool_result`
 - 消息超阈值后的上下文压缩
-- 模型调用 `ask_user` 时，用户回答回填后继续执行；等待回答时也能打断
 
-另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型、`ask_user` 无法接收回答时有兜底。
+另外 `test/nonInteractiveCli.test.ts` 会起子进程跑真实入口，验证管道输入下的完整链路：回合跑完才退出、输出没有 ANSI 残留、斜杠命令在本地执行不发给模型。
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 
@@ -300,6 +423,27 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
 不声明 `mutatesFiles` 的工具可以自由并发。声明了但操作的是「读-改-写」流程的（像 `edit`），必须声明，否则并发时会丢更新。
 
 工具压根不该并发（比如要独占某个资源），声明 `sequential: true`，它会单独跑，不和同一轮里的其他工具抢跑。
+
+### 加一个钩子
+
+不想写 JSON 的话，可以在进程里直接注册函数钩子。命令钩子和函数钩子走同一份结果：
+
+```typescript
+import { createHookRunner } from './hooks.ts'
+
+const hooks = createHookRunner([
+  {
+    event: 'PreToolUse',
+    matcher: /^run_bash$/,
+    handler: (input) => {
+      const command = (input.tool_input as { command?: string }).command ?? ''
+      if (command.includes('rm -rf')) return { decision: 'block', reason: '不许删仓库' }
+    },
+  },
+], { sessionId, cwd: workspace, defaultTimeoutMs: 10_000 })
+```
+
+把 `hooks` 传给 `runAgent` 的 `options.hooks`。`SessionStart` / `SessionEnd` / `UserPromptSubmit` 是命令行入口在回合外面触发的，只调用 `runAgent` 时不会自动跑这三个。
 
 ## License
 

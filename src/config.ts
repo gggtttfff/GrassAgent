@@ -33,6 +33,12 @@ const numericOption = (options: {
   )
 
 // 布尔型环境变量:接受 1/0、true/false、yes/no
+const optionalText = (label: string) =>
+  z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: `${label} 不能为空` }).optional(),
+  )
+
 const booleanOption = (defaultValue: boolean, label: string) =>
   z.preprocess(
     (value) => {
@@ -92,20 +98,75 @@ export const configSchema = z.object({
     error: 'ToolExecution 只能是 parallel 或 sequential',
   }).default('parallel'),
 
-  // 上下文压缩。未压缩的消息数超过 CompactThreshold 就把旧消息总结成摘要,
-  // 摘要 + 最近 CompactKeepRecent 条一起发给模型。
+  // 上下文压缩。估算 token 超过「窗口 - 预留」就把旧消息总结成摘要,
+  // 摘要 + 大约 CompactKeepRecentTokens 的最近消息一起发给模型。
   // 历史本身不会被删掉,只是发给模型的内容变短了。
-  CompactThreshold: numericOption({
-    minimum: 4, maximum: 10_000, defaultValue: 50, label: 'CompactThreshold',
+  // 默认值和 src/compaction.ts 的常量是同一组,那边不能被这里依赖。
+  ContextWindow: numericOption({
+    minimum: 4_096, maximum: 2_000_000, defaultValue: 128_000, label: 'ContextWindow',
   }),
-  CompactKeepRecent: numericOption({
-    minimum: 1, maximum: 5_000, defaultValue: 20, label: 'CompactKeepRecent',
+  CompactReserveTokens: numericOption({
+    minimum: 256, maximum: 1_000_000, defaultValue: 16_384, label: 'CompactReserveTokens',
   }),
+  CompactKeepRecentTokens: numericOption({
+    minimum: 256, maximum: 1_000_000, defaultValue: 20_000, label: 'CompactKeepRecentTokens',
+  }),
+
+  // 钩子配置文件。留空则用工作区下的 .grass/hooks.json,文件不存在就等于没配钩子。
+  HooksPath: z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: 'HooksPath 不能为空' }).optional(),
+  ),
+  // 命令钩子的默认超时。单个钩子可以在 JSON 里用 timeoutMs 覆盖。
+  HookTimeoutMs: numericOption({
+    minimum: 100, maximum: 600_000, defaultValue: 10_000, label: 'HookTimeoutMs',
+  }),
+
+  // 启动时是否识别项目里 opencode、cursor、claude、kiro 的规则和提示词。
+  // 关掉之后系统提示词里只有 Grass 自己的那一段。
+  LoadProjectInstructions: booleanOption(true, 'LoadProjectInstructions'),
+
+  // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
+  ExecutionWorld: z.enum(['local', 'remote'], {
+    error: 'ExecutionWorld 只能是 local 或 remote',
+  }).default('local'),
+  SandboxControlUrl: z.preprocess(
+    emptyToUndefined,
+    z.url({ error: '控制面地址必须是合法 URL' }).optional(),
+  ),
+  SandboxImage: optionalText('SandboxImage'),
+  SandboxRepoUrl: optionalText('SandboxRepoUrl'),
+  SandboxCredentialRef: optionalText('SandboxCredentialRef'),
+  SandboxId: optionalText('SandboxId'),
+  SandboxTtlMs: numericOption({
+    minimum: 1000, maximum: 86_400_000, defaultValue: 1_800_000, label: 'SandboxTtlMs',
+  }),
+  SandboxCpu: numericOption({ minimum: 1, maximum: 32, defaultValue: 1, label: 'SandboxCpu' }),
+  SandboxMemoryMb: numericOption({
+    minimum: 128, maximum: 65_536, defaultValue: 1024, label: 'SandboxMemoryMb',
+  }),
+  SandboxDiskMb: numericOption({
+    minimum: 1, maximum: 1_048_576, defaultValue: 10_240, label: 'SandboxDiskMb',
+  }),
+  SandboxNetworkAllowlist: z.string().default(''),
+  SandboxKeep: booleanOption(false, 'SandboxKeep'),
 }).check(z.refine(
-  (config) => config.CompactKeepRecent < config.CompactThreshold,
+  (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
-    path: ['CompactKeepRecent'],
-    message: 'CompactKeepRecent 必须小于 CompactThreshold,否则压缩后没有可摘要的旧消息',
+    path: ['CompactKeepRecentTokens'],
+    message: 'CompactKeepRecentTokens 与 CompactReserveTokens 之和必须小于 ContextWindow,否则压缩腾不出空间',
+  },
+)).check(z.refine(
+  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxControlUrl),
+  {
+    path: ['SandboxControlUrl'],
+    message: '远程执行世界必须配置控制面地址',
+  },
+)).check(z.refine(
+  (config) => config.ExecutionWorld !== 'remote' || Boolean(config.SandboxId) || Boolean(config.SandboxImage),
+  {
+    path: ['SandboxImage'],
+    message: '远程执行世界必须配置镜像,或提供已有的 SandboxId 挂回',
   },
 ))
 
@@ -140,8 +201,24 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SessionId: `${ENV_PREFIX}SESSION_ID`,
   CommandTimeoutMs: `${ENV_PREFIX}COMMAND_TIMEOUT_MS`,
   ToolExecution: `${ENV_PREFIX}TOOL_EXECUTION`,
-  CompactThreshold: `${ENV_PREFIX}COMPACT_THRESHOLD`,
-  CompactKeepRecent: `${ENV_PREFIX}COMPACT_KEEP_RECENT`,
+  ContextWindow: `${ENV_PREFIX}CONTEXT_WINDOW`,
+  CompactReserveTokens: `${ENV_PREFIX}COMPACT_RESERVE_TOKENS`,
+  CompactKeepRecentTokens: `${ENV_PREFIX}COMPACT_KEEP_RECENT_TOKENS`,
+  HooksPath: `${ENV_PREFIX}HOOKS_PATH`,
+  HookTimeoutMs: `${ENV_PREFIX}HOOK_TIMEOUT_MS`,
+  LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
+  ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
+  SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
+  SandboxImage: `${ENV_PREFIX}SANDBOX_IMAGE`,
+  SandboxRepoUrl: `${ENV_PREFIX}SANDBOX_REPO_URL`,
+  SandboxCredentialRef: `${ENV_PREFIX}SANDBOX_CREDENTIAL_REF`,
+  SandboxId: `${ENV_PREFIX}SANDBOX_ID`,
+  SandboxTtlMs: `${ENV_PREFIX}SANDBOX_TTL_MS`,
+  SandboxCpu: `${ENV_PREFIX}SANDBOX_CPU`,
+  SandboxMemoryMb: `${ENV_PREFIX}SANDBOX_MEMORY_MB`,
+  SandboxDiskMb: `${ENV_PREFIX}SANDBOX_DISK_MB`,
+  SandboxNetworkAllowlist: `${ENV_PREFIX}SANDBOX_NETWORK_ALLOWLIST`,
+  SandboxKeep: `${ENV_PREFIX}SANDBOX_KEEP`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

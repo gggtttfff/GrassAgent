@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -77,6 +79,11 @@ async function runCliWithInput(
   })
 
   return { exitCode, output }
+}
+
+function quoteShell(value: string): string {
+  if (process.platform === 'win32') return `"${value.replace(/"/g, '""')}"`
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 test('非交互模式能跑完整个回合并正常退出', async () => {
@@ -179,6 +186,247 @@ test('/sessions 列出会话', async () => {
   }
 })
 
+test('UserPromptSubmit 可以拦住输入,退出时会跑 SessionEnd', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-hooks-'))
+  const scriptPath = path.join(directory, 'hook.mjs')
+  const hooksPath = path.join(directory, 'hooks.json')
+  const markerPath = path.join(directory, 'ended.txt')
+  const command = `${quoteShell(process.execPath)} ${quoteShell(scriptPath)}`
+  await writeFile(scriptPath, `
+    import { writeFileSync } from 'node:fs'
+    let raw = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', (chunk) => { raw += chunk })
+    process.stdin.on('end', () => {
+      const input = JSON.parse(raw || '{}')
+      if (input.hook_event_name === 'UserPromptSubmit') {
+        process.stderr.write('已被测试钩子拦截')
+        process.exit(2)
+      }
+      if (input.hook_event_name === 'SessionEnd') {
+        writeFileSync(process.env.GRASS_TEST_MARKER, 'ended')
+      }
+    })
+  `)
+  await writeFile(hooksPath, JSON.stringify({
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command, timeoutMs: 5000 }] }],
+    SessionEnd: [{ hooks: [{ type: 'command', command, timeoutMs: 5000 }] }],
+  }))
+
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('这条不该发给模型\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_HOOKS_PATH: hooksPath,
+      GRASS_TEST_MARKER: markerPath,
+    })
+    assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('已被测试钩子拦截'), `应显示钩子拒绝原因,实际: ${output.slice(-400)}`)
+    assert.ok(!output.includes('回复'), '被拦截的输入不该发给模型')
+    assert.equal(await readFile(markerPath, 'utf8'), 'ended')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('模型提问时，下一行是回答，不会另开一轮', async () => {
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      requests.push(Buffer.concat(chunks).toString('utf-8'))
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      if (requests.length === 1) {
+        response.end(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
+            'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      response.end(
+        'data: {"choices":[{"delta":{"content":"已按你的选择继续"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    // 空行要被跳过，真正的回答才回给模型
+    const { exitCode, output } = await runCliWithInput('帮我选\n\n用 typescript\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('? 用哪种语言'), `应显示问题,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('已按你的选择继续'), `回答之后应继续回合,实际: ${output.slice(-400)}`)
+    assert.equal(requests.length, 2, `回答不该再开一轮用户消息,实际请求数 ${requests.length}`)
+    const followUp = JSON.parse(requests[1]) as {
+      messages: Array<{ role: string; content?: string | null }>
+    }
+    const toolMessage = followUp.messages.find((message) => message.role === 'tool')
+    assert.equal(toolMessage?.content, '用 typescript')
+    const userMessages = followUp.messages.filter((message) => message.role === 'user')
+    assert.equal(userMessages.length, 1)
+    assert.equal(userMessages[0].content, '帮我选')
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
+test('没有人回答时回合仍能结束并退出', async () => {
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    request.on('data', () => {})
+    request.on('end', () => {
+      requests.push('hit')
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      if (requests.length === 1) {
+        response.end(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
+            'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      response.end(
+        'data: {"choices":[{"delta":{"content":"按现有信息继续"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('帮我选\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `没人回答也不能挂死,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.ok(output.includes('按现有信息继续'), `模型应在无回答后继续,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('用户无法回答提问'), '无用户可答时要记日志')
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
+test('管道里的下一行在本轮结束后继续，而不是被丢掉', async () => {
+  let requests = 0
+  const server = createServer((request, response) => {
+    request.on('data', () => {})
+    request.on('end', () => {
+      requests += 1
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      response.end(
+        'data: {"choices":[{"delta":{"content":"回复完毕"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('第一句\n第二句\n', mockEnvironment(port))
+    assert.equal(exitCode, 0, `应跑完两轮再退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
+    assert.equal(requests, 2, '第二行应再开一轮')
+    assert.equal(output.split('回复完毕').length - 1, 2)
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+  }
+})
+
+test('会话可以导出再导进另一个库', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-port-'))
+  const mock = await startMockServer()
+  try {
+    const exported = await runCliWithInput('/export pack.json\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'source.db'),
+      GRASSAGENT_SESSION_ID: 'come-and-go',
+      GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS: '0',
+    })
+    assert.equal(exported.exitCode, 0, exported.output.slice(-400))
+    assert.ok(exported.output.includes('已导出'), exported.output.slice(-400))
+    const bundle = JSON.parse(await readFile(path.join(directory, 'pack.json'), 'utf8')) as {
+      sessions: Array<{ id: string }>
+    }
+    assert.equal(bundle.sessions[0]?.id, 'come-and-go')
+
+    const imported = await runCliWithInput('/import pack.json\n/sessions\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'target.db'),
+      GRASSAGENT_SESSION_ID: 'stay-here',
+      GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS: '0',
+    })
+    assert.equal(imported.exitCode, 0, imported.output.slice(-500))
+    assert.ok(imported.output.includes('新增 1'), imported.output.slice(-500))
+    assert.ok(imported.output.includes('come-and-go'), imported.output.slice(-500))
+    assert.ok(!imported.output.includes('回复'), '导入导出不该发给模型')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('始终生效的项目规则会发给模型,提示词不会', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-rules-cli-'))
+  await writeFile(path.join(directory, 'AGENTS.md'), 'UNIQUE_RULE 先写测试')
+  await mkdir(path.join(directory, '.opencode', 'commands'), { recursive: true })
+  await writeFile(path.join(directory, '.opencode', 'commands', 'test.md'), 'UNIQUE_PROMPT 跑全部测试')
+
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      requests.push(Buffer.concat(chunks).toString('utf8'))
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      response.end(
+        'data: {"choices":[{"delta":{"content":"看过了"},"finish_reason":"stop"}]}\n\n' +
+          'data: [DONE]\n\n',
+      )
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliWithInput('/instructions\n看一下\n', {
+      ...mockEnvironment(port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('AGENTS.md'), output.slice(-500))
+    assert.ok(output.includes('/test'), output.slice(-500))
+    assert.equal(requests.length, 1)
+    const body = JSON.parse(requests[0] ?? '{}') as {
+      messages: Array<{ role: string; content?: string }>
+    }
+    const system = body.messages.find((message) => message.role === 'system')?.content ?? ''
+    assert.ok(system.includes('UNIQUE_RULE 先写测试'), '始终生效的规则要进系统提示词')
+    assert.equal(system.includes('UNIQUE_PROMPT 跑全部测试'), false)
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('普通输入照常发给模型', async () => {
   const mock = await startMockServer()
   try {
@@ -204,7 +452,10 @@ test('非交互模式遇到 ask_user 会兜底,不挂住进程', async () => {
     const { exitCode, output } = await runCliWithInput('开始任务\n', mockEnvironment(mock.port))
 
     assert.equal(exitCode, 0, `进程不应卡在等待回答,实际退出码 ${exitCode}`)
-    assert.ok(output.includes('非交互模式'), `应该给出无法提问的兜底,实际: ${output.slice(-500)}`)
+    assert.ok(
+      output.includes('当前没有用户可以回答'),
+      `应该给出无法提问的兜底,实际: ${output.slice(-500)}`,
+    )
     assert.ok(output.includes('已根据已有信息继续'), '收到兜底结果后应继续回合')
   } finally {
     await mock.close()

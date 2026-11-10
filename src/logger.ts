@@ -8,6 +8,7 @@
 import { Writable } from 'node:stream'
 import pino, { type Logger } from 'pino'
 import type { AgentConfig } from './config.ts'
+import { parseJson, stringifyJson } from './jsonSafety.ts'
 
 export type { Logger }
 
@@ -19,6 +20,13 @@ const REDACT_PATHS = [
   '*.apiKey',
   'req.headers.authorization',
   'headers.authorization',
+  'token',
+  '*.token',
+  'credential',
+  '*.credential',
+  'credentialRef',
+  'gitToken',
+  'sandboxToken',
 ]
 
 export interface LoggerOptions {
@@ -91,7 +99,7 @@ const LEVEL_NAMES: Record<number, string> = {
 function formatPrettyLine(jsonLine: string): string {
   let parsed: Record<string, unknown>
   try {
-    parsed = JSON.parse(jsonLine) as Record<string, unknown>
+    parsed = parseJson(jsonLine) as Record<string, unknown>
   } catch {
     return jsonLine
   }
@@ -106,7 +114,7 @@ function formatPrettyLine(jsonLine: string): string {
   const reserved = new Set(['level', 'msg', 'time', 'pid', 'hostname', 'service'])
   const details = Object.entries(parsed)
     .filter(([key]) => !reserved.has(key))
-    .map(([key, value]) => `${key}=${typeof value === 'object' ? JSON.stringify(value) : String(value)}`)
+    .map(([key, value]) => `${key}=${typeof value === 'object' && value !== null ? stringifyJson(value) : String(value)}`)
 
   return `[${time}] ${level.toUpperCase().padEnd(5)} ${message}${details.length ? ' ' + details.join(' ') : ''}\n`
 }

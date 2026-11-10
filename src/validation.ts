@@ -12,6 +12,7 @@
 
 import { compile, type CoercingValidator } from '@earendil-works/pi-schema'
 import { formats } from '@earendil-works/pi-schema/formats'
+import { jsonValueProblem, stringifyJson } from './jsonSafety.ts'
 
 // 每个 schema 编译一次。工具 schema 是长生命周期的,
 // 用 WeakMap 让 schema 对象被回收时对应的 validator 一起回收。
@@ -73,6 +74,13 @@ export function validateToolArguments(
     }
   }
 
+  // 拷贝和校验都会往下走。过深的参数先拒掉,避免 structuredClone 或错误信息里的序列化把栈打穿。
+  const problem = jsonValueProblem(arguments_)
+  if (problem) {
+    const reason = problem === 'circular' ? '参数含有循环引用' : '参数嵌套过深'
+    return { ok: false, error: `工具 "${toolName}" ${reason},请简化后重新调用。` }
+  }
+
   // 拷贝一份再校验,避免工具修改参数时污染 transcript 里的原始记录
   const result = validator.parse(structuredClone(arguments_))
   if (result.ok) return { ok: true, value: result.value }
@@ -81,7 +89,7 @@ export function validateToolArguments(
     .map((validationError) => `  - ${formatValidationPath(validationError.path)}: ${validationError.message}`)
     .join('\n')
 
-  const error = `工具 "${toolName}" 参数校验失败。修正后重新调用。\n${details}\n\n收到的参数:\n${JSON.stringify(arguments_, null, 2)}`
+  const error = `工具 "${toolName}" 参数校验失败。修正后重新调用。\n${details}\n\n收到的参数:\n${stringifyJson(arguments_)}`
   return { ok: false, error }
 }
 

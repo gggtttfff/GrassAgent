@@ -32,3 +32,9 @@ coverage/
 
 # 临时验证脚本(写完跑完就删,别进版本库)
 scratch-*.ts
+
+# 会话导出。里面是对话内容,不要进版本库。
+.grass/grassagent-bundle.json
+# 工具输出的全文临时文件。可能很大,也不该进版本库。
+.grass/tmp/
+grassagent-bundle.json
