@@ -29,7 +29,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, discoverSkills, summarizeSkills, type SkillOrigin, type SkillRegistry } from './skills.ts'
+import { createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, discoverSkills, summarizeSkills, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -143,6 +143,7 @@ async function main() {
   // 识别失败和规则一样不挡启动,按「没有技能」处理。
   let skills: SkillRegistry | undefined
   let skillReport = '技能加载已关闭'
+  const skillNotices: string[] = []
   if (config.LoadSkills) {
     try {
       const skillOrigin = describeSkillOrigin(config, world)
@@ -160,6 +161,8 @@ async function main() {
       systemPrompt = appendPromptSection(systemPrompt, skillCatalog.promptSection)
       skills = createSkillRegistry(skillCatalog.skills)
       skillReport = summarizeSkills(skillCatalog.skills)
+      // 同名冲突这类问题要让用户看见,不然技能凭空消失,没人知道为什么
+      skillNotices.push(...describeDisabledSkills(skillCatalog.skills))
     } catch (error) {
       skillReport = '识别技能失败,本次不加载技能'
       logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
@@ -543,6 +546,7 @@ async function main() {
 
   tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。')
   if (instructionNotice) tui.printNotice(instructionNotice)
+  for (const message of skillNotices) tui.printNotice(message)
   for (const message of sessionNotices) tui.printNotice(message)
   tui.start()
 

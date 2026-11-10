@@ -35,6 +35,8 @@ export interface Skill {
   truncated: boolean
   source: SkillSource
   origin: SkillOrigin
+  /** 被禁用时写明原因。禁用的技能不进索引,load_skill 也取不到。 */
+  disabledReason?: string
 }
 
 export interface SkillCatalog {
@@ -169,12 +171,11 @@ export async function discoverSkills(options: {
   logger?: SkillLog
 }): Promise<SkillCatalog> {
   const logger = options.logger ?? noopLog
-  const skills: Skill[] = []
-  const takenNames = new Set<string>()
+  const collected: Skill[] = []
   const maxDepth = options.origin.kind === 'remote' ? REMOTE_WALK_DEPTH : LOCAL_WALK_DEPTH
 
   for (const root of SKILL_ROOTS) {
-    if (skills.length >= MAX_SKILLS) {
+    if (collected.length >= MAX_SKILLS) {
       logger.warn({ maxSkills: MAX_SKILLS }, '技能数量到上限,其余不再扫描')
       break
     }
@@ -182,26 +183,59 @@ export async function discoverSkills(options: {
       files: options.files,
       origin: options.origin,
       maxDepth,
-      skills,
-      takenNames,
+      skills: collected,
       logger,
     })
   }
+
+  // 同名技能全部禁用:挑一个留下的话,用户改到哪份都没法确定自己用的是哪份。
+  // 全部禁用并告警,让人自己决定留哪一份。
+  const skills = disableDuplicatedSkills(collected, logger)
 
   skills.sort((left, right) => left.name.localeCompare(right.name))
   logger.info({ skillCount: skills.length, origin: options.origin.label }, '技能已识别')
   return { skills, promptSection: renderSkillSection(skills) }
 }
 
-export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
-  const byExactName = new Map(skills.map((skill) => [skill.name, skill]))
-  const byLowerCaseName = new Map<string, Skill>()
+/**
+ * 同名(不分大小写)的技能全部禁用,并把各自的来源和路径写进禁用原因。
+ */
+function disableDuplicatedSkills(skills: Skill[], logger: SkillLog): Skill[] {
+  const groups = new Map<string, Skill[]>()
   for (const skill of skills) {
+    const key = skill.name.toLowerCase()
+    const group = groups.get(key)
+    if (group) group.push(skill)
+    else groups.set(key, [skill])
+  }
+
+  const result: Skill[] = []
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      result.push(group[0])
+      continue
+    }
+    const detail = group
+      .map((skill) => `${skill.relativePath}(来源:${skill.origin.label})`)
+      .join('、')
+    const reason = `存在 ${group.length} 个同名技能,已全部禁用:${detail}`
+    logger.warn({ name: group[0]?.name, count: group.length, detail }, '同名技能已全部禁用')
+    for (const skill of group) result.push({ ...skill, disabledReason: reason })
+  }
+  return result
+}
+
+export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
+  // 被禁用的技能不进注册表:模型问 load_skill 时找不到它,就不会拿一份来路不明的正文
+  const usable = skills.filter((skill) => !skill.disabledReason)
+  const byExactName = new Map(usable.map((skill) => [skill.name, skill]))
+  const byLowerCaseName = new Map<string, Skill>()
+  for (const skill of usable) {
     const key = skill.name.toLowerCase()
     if (!byLowerCaseName.has(key)) byLowerCaseName.set(key, skill)
   }
   return {
-    names: () => skills.map((skill) => skill.name),
+    names: () => usable.map((skill) => skill.name),
     // 模型偶尔会把名字写成 /foo 或大小写不一致,这里兜一下
     find: (name) => {
       const trimmed = name.trim().replace(/^\//, '')
@@ -212,14 +246,22 @@ export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
 }
 
 export function renderSkillSection(skills: readonly Skill[]): string {
-  if (skills.length === 0) return ''
+  const usable = skills.filter((skill) => !skill.disabledReason)
+  if (usable.length === 0) return ''
   return [
     '## 可用技能',
     '下面是打包好的多步流程,正文没有放进上下文。',
     '任务和某条描述对得上时,先调用 load_skill 取全文,再按正文执行;不要凭名字猜步骤。',
     '没被点名、描述也对不上的技能不要用。',
-    ...skills.map((skill) => `- ${skill.name}(来源:${skill.origin.label}): ${skill.description}`),
+    ...usable.map((skill) => `- ${skill.name}(来源:${skill.origin.label}): ${skill.description}`),
   ].join('\n')
+}
+
+/** 被禁用的技能和原因。启动时打给用户看,免得技能凭空消失。 */
+export function describeDisabledSkills(skills: readonly Skill[]): string[] {
+  return skills
+    .filter((skill) => skill.disabledReason)
+    .map((skill) => `技能 ${skill.name} 已禁用:${skill.disabledReason}`)
 }
 
 /** load_skill 回给模型的文本:正文 + 附件目录提示。 */
@@ -243,8 +285,13 @@ export function formatSkillForModel(skill: Skill): string {
 }
 
 export function summarizeSkills(skills: readonly Skill[]): string {
-  if (skills.length === 0) return '项目里没有找到技能'
-  return `已识别技能 ${skills.length} 个:${skills.map((skill) => skill.name).join('、')}`
+  const usable = skills.filter((skill) => !skill.disabledReason)
+  const disabled = skills.length - usable.length
+  if (usable.length === 0) {
+    return disabled > 0 ? `技能全部被禁用(${disabled} 个)` : '项目里没有找到技能'
+  }
+  const suffix = disabled > 0 ? `,另有 ${disabled} 个同名冲突被禁用` : ''
+  return `已识别技能 ${usable.length} 个:${usable.map((skill) => skill.name).join('、')}${suffix}`
 }
 
 interface CollectContext {
@@ -252,7 +299,6 @@ interface CollectContext {
   origin: SkillOrigin
   maxDepth: number
   skills: Skill[]
-  takenNames: Set<string>
   logger: SkillLog
 }
 
@@ -303,10 +349,8 @@ async function loadSkill(
     context.logger.warn({ path: filePath, name }, '技能没有描述,已跳过')
     return
   }
-  if (context.takenNames.has(name)) {
-    context.logger.warn({ path: filePath, name }, '技能名重复,保留先扫到的那个')
-    return
-  }
+  // 同名的先都留着,扫完再一起判断要不要全禁。
+  // 这里提前丢掉一个的话,就看不出是同名冲突,只当它不存在。
   const normalizedBody = body.replaceAll(NUL_CHARACTER, '').trim()
   if (!normalizedBody) {
     context.logger.warn({ path: filePath, name }, '技能正文是空的,已跳过')
@@ -314,7 +358,6 @@ async function loadSkill(
   }
 
   const truncated = normalizedBody.length > MAX_SKILL_BODY_CHARS
-  context.takenNames.add(name)
   context.skills.push({
     name,
     description,

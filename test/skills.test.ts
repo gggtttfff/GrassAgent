@@ -7,6 +7,7 @@ import {
   createLocalSkillFiles,
   createSkillRegistry,
   createWorldSkillFiles,
+  describeDisabledSkills,
   discoverSkills,
   type SkillLog,
   type SkillOrigin,
@@ -120,7 +121,7 @@ test('Cursor 那种 >- 折叠描述能解析成一句话', async () => {
   }
 })
 
-test('同名技能按根的顺序取第一个,并记下被忽略的那个', async () => {
+test('同名技能全部禁用,并说明各自的来源和路径', async () => {
   const workspace = await makeWorkspace()
   const log = captureLog()
   try {
@@ -140,10 +141,48 @@ test('同名技能按根的顺序取第一个,并记下被忽略的那个', asyn
     ].join('\n'))
 
     const catalog = await scanLocalSkills(workspace, log)
-    assert.equal(catalog.skills.length, 1)
-    assert.equal(catalog.skills[0]?.source, 'grass')
-    assert.equal(catalog.skills[0]?.description, '自己的审查流程')
-    assert.ok(log.warnings.some((message) => message.includes('技能名重复')))
+    assert.equal(catalog.skills.length, 2)
+    // 两份都在,但都被禁用
+    for (const skill of catalog.skills) {
+      assert.match(skill.disabledReason ?? '', /存在 2 个同名技能/)
+      assert.match(skill.disabledReason ?? '', /\.grass\/skills\/review/)
+      assert.match(skill.disabledReason ?? '', /\.cursor\/skills\/review/)
+    }
+    // 禁用之后不进索引,模型也取不到
+    assert.equal(catalog.promptSection, '')
+    const registry = createSkillRegistry(catalog.skills)
+    assert.equal(registry.names().length, 0)
+    assert.equal(registry.find('review'), undefined)
+    assert.ok(log.warnings.some((message) => message.includes('同名技能已全部禁用')))
+
+    const notices = describeDisabledSkills(catalog.skills)
+    assert.equal(notices.length, 2)
+    assert.match(notices[0] ?? '', /技能 review 已禁用/)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('大小写不同的同名技能也算冲突', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    await writeSkill(workspace, '.grass/skills/Review', [
+      '---',
+      'name: Review',
+      'description: 大写的那个',
+      '---',
+      '正文。',
+    ].join('\n'))
+    await writeSkill(workspace, '.cursor/skills/review', [
+      '---',
+      'name: review',
+      'description: 小写的那个',
+      '---',
+      '正文。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace)
+    assert.equal(catalog.skills.every((skill) => Boolean(skill.disabledReason)), true)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
   }
