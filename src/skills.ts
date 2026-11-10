@@ -42,6 +42,8 @@ export interface Skill {
    * 这类技能不进索引,注册成斜杠命令。
    */
   commandOnly: boolean
+  /** 技能目录下的附件。模型按名字用 read_file 读。 */
+  attachments: string[]
 }
 
 export interface SkillCatalog {
@@ -100,6 +102,10 @@ const MAX_SKILL_BODY_CHARS = 24_000
 const MAX_SKILLS = 64
 const MAX_DESCRIPTION_CHARS = 200
 const SKILL_FILE_NAME = 'skill.md'
+
+// 附件只列名字,数量和体积都要有上限,不然工具输出会被撑大
+const MAX_ATTACHMENTS = 20
+const MAX_ATTACHMENT_BYTES = 256 * 1024
 
 // 本地目录树浅一点没关系,远程每层目录都是一次往返。
 const LOCAL_WALK_DEPTH = 6
@@ -303,9 +309,11 @@ export function formatSkillForModel(skill: Skill): string {
     `来源:${skill.origin.label}`,
     `正文:${skill.relativePath}`,
     `附件目录:${skill.directoryPath}(脚本、模板、参考文档在这里,用 read_file 按需读,不要整目录读)`,
-    '',
-    skill.body,
   ]
+  if (skill.attachments.length > 0) {
+    lines.push(`附件:${skill.attachments.join('、')}`)
+  }
+  lines.push('', skill.body)
   if (skill.truncated) {
     lines.push(
       '',
@@ -390,6 +398,7 @@ async function loadSkill(
   }
 
   const truncated = normalizedBody.length > MAX_SKILL_BODY_CHARS
+  const attachments = await collectAttachments(parentOf(filePath), context)
   context.skills.push({
     name,
     description,
@@ -400,7 +409,30 @@ async function loadSkill(
     source,
     origin: context.origin,
     commandOnly: isCommandOnly(data),
+    attachments,
   })
+}
+
+/**
+ * 技能目录下的附件。
+ *
+ * 只列名字:模型按名字自己 read_file。列太细会把工具输出撑大,
+ * 而且模型真正要读哪个文件,它读完正文就知道了。
+ */
+async function collectAttachments(directory: string, context: CollectContext): Promise<string[]> {
+  if (!directory) return []
+  const entries = await listEntries(directory, context)
+  const files: string[] = []
+  for (const entry of entries) {
+    if (SKIP_DIRECTORY_NAMES.has(entry.name)) continue
+    // SKILL.md 本身不算附件
+    if (entry.name.toLowerCase() === SKILL_FILE_NAME) continue
+    if (entry.type !== 'file') continue
+    // 超大的文件多半是数据集,列出来也没法用
+    if (entry.size !== undefined && entry.size > MAX_ATTACHMENT_BYTES) continue
+    files.push(`${directory}/${entry.name}`)
+  }
+  return files.sort().slice(0, MAX_ATTACHMENTS)
 }
 
 /**

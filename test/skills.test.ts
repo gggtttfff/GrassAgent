@@ -306,6 +306,35 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
   }
 })
 
+test('附件列在技能目录里,超大和超量的不进清单', async () => {
+  const workspace = await makeWorkspace()
+  try {
+    const skillDirectory = path.join(workspace, '.grass', 'skills', 'demo')
+    await fs.mkdir(skillDirectory, { recursive: true })
+    await fs.writeFile(
+      path.join(skillDirectory, 'SKILL.md'),
+      ['---', 'name: demo', 'description: 带附件的技能', '---', '正文。'].join('\n'),
+    )
+    await fs.writeFile(path.join(skillDirectory, 'run.sh'), 'echo hi')
+    await fs.writeFile(path.join(skillDirectory, 'notes.md'), '说明')
+    await fs.writeFile(path.join(skillDirectory, 'huge.bin'), Buffer.alloc(300 * 1024))
+
+    const catalog = await scanLocalSkills(workspace)
+    const skill = catalog.skills[0]
+    assert.deepEqual(skill?.attachments, [
+      '.grass/skills/demo/notes.md',
+      '.grass/skills/demo/run.sh',
+    ])
+
+    const tools = await builtinTools({ workspace, skills: createSkillRegistry(catalog.skills) })
+    const loadSkill = tools.find((tool) => tool.name === 'load_skill')
+    const result = await loadSkill?.execute({ name: 'demo' })
+    assert.match(result ?? '', /附件:\.grass\/skills\/demo\/notes\.md、\.grass\/skills\/demo\/run\.sh/)
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('只读技能不进索引,注册成斜杠命令', async () => {
   const workspace = await makeWorkspace()
   try {
