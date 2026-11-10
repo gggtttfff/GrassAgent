@@ -308,6 +308,68 @@ test('远程世界的技能从沙盒里读,来源标出主机', async () => {
   }
 })
 
+test('环境不匹配的技能被跳过,匹配的留下', async () => {
+  const workspace = await makeWorkspace()
+  const log = captureLog()
+  try {
+    await writeSkill(workspace, '.grass/skills/cloud-only', [
+      '---',
+      'name: cloud-only',
+      'description: 只在云端跑',
+      'environments:',
+      '  - cloud',
+      '---',
+      '正文。',
+    ].join('\n'))
+    await writeSkill(workspace, '.grass/skills/not-here', [
+      '---',
+      'name: not-here',
+      'description: 本地禁用',
+      'disabled-environments:',
+      '  - local',
+      '---',
+      '正文。',
+    ].join('\n'))
+    await writeSkill(workspace, '.grass/skills/ide-only', [
+      '---',
+      'name: ide-only',
+      'description: 只在 IDE 里',
+      'metadata:',
+      '  surfaces:',
+      '    - ide',
+      '---',
+      '正文。',
+    ].join('\n'))
+    await writeSkill(workspace, '.grass/skills/local-ok', [
+      '---',
+      'name: local-ok',
+      'description: 本地能用',
+      'environments:',
+      '  - local',
+      '  - cloud',
+      'metadata:',
+      '  surfaces:',
+      '    - cli',
+      '---',
+      '正文。',
+    ].join('\n'))
+
+    const catalog = await scanLocalSkills(workspace, log)
+    const usable = catalog.skills.filter((skill) => !skill.skippedReason).map((skill) => skill.name)
+    assert.deepEqual(usable, ['local-ok'])
+    assert.match(catalog.skills.find((skill) => skill.name === 'cloud-only')?.skippedReason ?? '', /只在 cloud 环境可用/)
+    assert.match(catalog.skills.find((skill) => skill.name === 'not-here')?.skippedReason ?? '', /local 环境被显式禁用/)
+    assert.match(catalog.skills.find((skill) => skill.name === 'ide-only')?.skippedReason ?? '', /只在 ide 界面可用/)
+
+    // 跳过的技能不进索引,模型也取不到
+    assert.equal(catalog.promptSection.includes('cloud-only'), false)
+    assert.equal(createSkillRegistry(catalog.skills).find('cloud-only'), undefined)
+    assert.ok(log.warnings.some((message) => message.includes('技能环境不匹配')))
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
 test('描述按句子边界截断,索引里标出被截断', async () => {
   const workspace = await makeWorkspace()
   try {

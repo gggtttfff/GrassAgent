@@ -29,7 +29,7 @@ import {
   formatInstructionReport,
   summarizeInstructions,
 } from './projectInstructions.ts'
-import { commandOnlySkills, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
+import { commandOnlySkills, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, isUsableCommandName, summarizeSkills, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -164,6 +164,7 @@ async function main() {
       skillReport = summarizeSkills(skillCatalog.skills)
       // 同名冲突这类问题要让用户看见,不然技能凭空消失,没人知道为什么
       skillNotices.push(...describeDisabledSkills(skillCatalog.skills))
+      skillNotices.push(...describeSkippedSkills(skillCatalog.skills))
     } catch (error) {
       skillReport = '识别技能失败,本次不加载技能'
       logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')

@@ -2,10 +2,15 @@
 // SKILL.md、规则文件开头的 YAML 头 —— 只认这一小撮语法。
 //
 // 完整 YAML 解析要引依赖,而这些文件是各家工具写给人看的,
-// 实际用到的只有 `key: value`、`key:` 加 `  - item`、以及 `key: >-` 折叠块。
-// 自己解析够用,坏行跳过也不会把整份文件废掉。
+// 实际用到的只有 `key: value`、`key:` 加 `  - item`、`key: >-` 折叠块,
+// 以及 `key:` 下再嵌一层的映射。自己解析够用,坏行跳过也不会把整份文件废掉。
 
-export type FrontmatterValue = string | boolean | string[]
+export type FrontmatterValue = string | boolean | string[] | FrontmatterMapping
+
+/** 嵌套一层的映射。比如 metadata.surfaces。 */
+export interface FrontmatterMapping {
+  [key: string]: string | boolean | string[]
+}
 
 /**
  * 拆出 `---` 包围的头和正文。没有头时整篇都是正文。行尾统一成 \n。
@@ -30,60 +35,143 @@ export function splitFrontmatter(text: string): {
   return { data: parseFrontmatterYaml(raw), body, bodyStartLine: headerLines + 3 }
 }
 
+interface Token {
+  /** 缩进空格数 */
+  indent: number
+  /** 去掉缩进后的内容 */
+  content: string
+  /** 空行。块标量里要留着,别的场合直接跳过。 */
+  blank: boolean
+}
+
 export function parseFrontmatterYaml(raw: string): Record<string, FrontmatterValue> {
-  const data: Record<string, FrontmatterValue> = {}
-  let listKey: string | undefined
-  let block: { key: string; folded: boolean; lines: string[] } | undefined
+  const tokens = tokenize(raw)
+  const baseIndent = tokens.find((token) => !token.blank)?.indent ?? 0
+  const parsed = parseMapping(tokens, 0, baseIndent)
+  return parsed.value
+}
 
-  const flushBlock = () => {
-    if (!block) return
-    data[block.key] = collapseBlock(block.lines, block.folded)
-    block = undefined
-  }
-
+function tokenize(raw: string): Token[] {
+  const tokens: Token[] = []
   for (const line of raw.split('\n')) {
-    // 块标量:后续缩进行都属于上一个 key,缩进消失才算结束
-    if (block) {
-      if (!line.trim()) {
-        block.lines.push('')
-        continue
-      }
-      if (/^\s/.test(line)) {
-        block.lines.push(line)
-        continue
-      }
-      flushBlock()
-    }
-    if (!line.trim() || line.trim().startsWith('#')) continue
-    const listItem = /^\s+-\s+(.*)$/.exec(line)
-    if (listItem && listKey) {
-      const current = data[listKey]
-      const items = Array.isArray(current) ? current : []
-      const value = unquote(listItem[1].trim())
-      if (value) items.push(value)
-      data[listKey] = items
+    if (!line.trim()) {
+      tokens.push({ indent: 0, content: '', blank: true })
       continue
     }
-    const field = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line)
-    if (!field) continue
-    const key = field[1]
-    const value = field[2].trim()
-    if (!value) {
-      listKey = key
-      data[key] = []
-      continue
-    }
-    listKey = undefined
-    // `>-` `>+` `|` `|-` 都是块标量,`>` 折叠成空格,`|` 保留换行
-    const blockMarker = /^([>|])[+-]?$/.exec(value)
-    if (blockMarker) {
-      block = { key, folded: blockMarker[1] === '>', lines: [] }
-      continue
-    }
-    data[key] = parseScalar(key, value)
+    if (line.trim().startsWith('#')) continue
+    const indent = line.length - line.trimStart().length
+    tokens.push({ indent, content: line.trim(), blank: false })
   }
-  flushBlock()
-  return data
+  return tokens
+}
+
+interface MappingResult {
+  value: Record<string, FrontmatterValue>
+  next: number
+}
+
+function parseMapping(tokens: Token[], start: number, indent: number): MappingResult {
+  const data: Record<string, FrontmatterValue> = {}
+  let position = start
+  while (position < tokens.length) {
+    const token = tokens[position]!
+    if (token.blank) {
+      position++
+      continue
+    }
+    if (token.indent < indent) break
+    if (token.indent > indent) {
+      // 缩进更深却不属于任何键,说明结构坏了,跳过这一行继续
+      position++
+      continue
+    }
+    const field = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(token.content)
+    if (!field) {
+      position++
+      continue
+    }
+    const key = field[1]!
+    const rest = field[2]!.trim()
+
+    // 块标量:`>` 折叠成空格,`|` 保留换行
+    const blockMarker = /^([>|])[+-]?$/.exec(rest)
+    if (blockMarker) {
+      const collected = collectBlock(tokens, position + 1, indent)
+      data[key] = collapseBlock(collected.lines, blockMarker[1] === '>')
+      position = collected.next
+      continue
+    }
+
+    if (rest) {
+      data[key] = parseScalar(key, rest)
+      position++
+      continue
+    }
+
+    // 冒号后面没值:看下面有没有更深的一层,决定是嵌套映射还是列表
+    const nested = parseNested(tokens, position + 1, indent)
+    data[key] = nested.value
+    position = nested.next
+  }
+  return { value: data, next: position }
+}
+
+interface NestedResult {
+  value: string[] | FrontmatterMapping
+  next: number
+}
+
+function parseNested(tokens: Token[], start: number, indent: number): NestedResult {
+  let position = start
+  // 找到下一段有效内容,空行不算
+  while (position < tokens.length && tokens[position]!.blank) position++
+  const first = tokens[position]
+  if (!first || first.indent <= indent) {
+    // 没有更深的一层,空的列表
+    return { value: [], next: start }
+  }
+
+  // 列表项:`- item`
+  if (/^- /.test(first.content)) {
+    const items: string[] = []
+    while (position < tokens.length) {
+      const token = tokens[position]!
+      if (token.blank) {
+        position++
+        continue
+      }
+      if (token.indent <= indent) break
+      const item = /^- (.*)$/.exec(token.content)
+      if (!item) break
+      const value = unquote(item[1]!.trim())
+      if (value) items.push(value)
+      position++
+    }
+    return { value: items, next: position }
+  }
+
+  // 嵌套映射
+  const parsed = parseMapping(tokens, start, first.indent)
+  return { value: parsed.value as FrontmatterMapping, next: parsed.next }
+}
+
+function collectBlock(tokens: Token[], start: number, indent: number): { lines: string[]; next: number } {
+  const lines: string[] = []
+  let position = start
+  while (position < tokens.length) {
+    const token = tokens[position]!
+    if (token.blank) {
+      lines.push('')
+      position++
+      continue
+    }
+    if (token.indent <= indent) break
+    lines.push(token.content)
+    position++
+  }
+  // 收尾的空行不算块的内容
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return { lines, next: position }
 }
 
 function parseScalar(key: string, value: string): FrontmatterValue {
@@ -112,17 +200,10 @@ function unquote(value: string): string {
   return value
 }
 
-// 块标量的内容整体缩进了一级,先按最小缩进量削平再折叠。
+// 折叠块里相邻的非空行用空格连起来,空行分隔段落。
 function collapseBlock(lines: string[], folded: boolean): string {
-  const indents = lines
-    .filter((line) => line.trim())
-    .map((line) => /^\s*/.exec(line)?.[0].length ?? 0)
-  const sharedIndent = indents.length > 0 ? Math.min(...indents) : 0
-  const stripped = lines.map((line) => line.slice(Math.min(sharedIndent, line.length)))
-  while (stripped.length > 0 && !(stripped[stripped.length - 1] ?? '').trim()) stripped.pop()
-  if (!folded) return stripped.join('\n').trim()
-  // 折叠:同一段里的换行变空格,空行分隔段落
-  return stripped
+  if (!folded) return lines.join('\n').trim()
+  return lines
     .join('\n')
     .split(/\n\s*\n/)
     .map((paragraph) => paragraph.split('\n').map((line) => line.trim()).filter(Boolean).join(' '))

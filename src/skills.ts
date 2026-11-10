@@ -10,7 +10,7 @@
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import type { ExecutionWorld } from './executionWorld.ts'
-import { splitFrontmatter } from './frontmatter.ts'
+import { splitFrontmatter, type FrontmatterValue } from './frontmatter.ts'
 import { createPathGuard, type PathGuard } from './pathGuard.ts'
 
 export type SkillSource = 'grass' | 'cursor' | 'claude' | 'kiro' | 'opencode'
@@ -48,6 +48,8 @@ export interface Skill {
   attachments: string[]
   /** 正文的二级标题和它们在文件里的行号。正文被截断时靠它定位。 */
   headings: SkillHeading[]
+  /** 因为环境不匹配被跳过时的原因。跳过的技能不进索引。 */
+  skippedReason?: string
 }
 
 /** 技能正文里的一个标题。行号是 SKILL.md 文件里的行号,read_file 对得上。 */
@@ -116,6 +118,10 @@ const SKILL_FILE_NAME = 'skill.md'
 // 附件只列名字,数量和体积都要有上限,不然工具输出会被撑大
 const MAX_ATTACHMENTS = 20
 const MAX_ATTACHMENT_BYTES = 256 * 1024
+
+// GrassAgent 跑在本地终端上。技能声明别的环境就装不进来。
+const GRASS_ENVIRONMENT = 'local'
+const GRASS_SURFACE = 'cli'
 
 // 本地目录树浅一点没关系,远程每层目录都是一次往返。
 const LOCAL_WALK_DEPTH = 6
@@ -246,10 +252,15 @@ function disableDuplicatedSkills(skills: Skill[], logger: SkillLog): Skill[] {
   return result
 }
 
+/** 技能能不能用。禁用、只读、环境不匹配都算不能用。 */
+function isUsableSkill(skill: Skill): boolean {
+  return !skill.disabledReason && !skill.skippedReason
+}
+
 export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
   // 被禁用的技能不进注册表:模型问 load_skill 时找不到它,就不会拿一份来路不明的正文。
   // 只允许用户手敲的技能同样不进——模型不能自己调它们。
-  const usable = skills.filter((skill) => !skill.disabledReason && !skill.commandOnly)
+  const usable = skills.filter((skill) => isUsableSkill(skill) && !skill.commandOnly)
   const byExactName = new Map(usable.map((skill) => [skill.name, skill]))
   const byLowerCaseName = new Map<string, Skill>()
   for (const skill of usable) {
@@ -268,7 +279,7 @@ export function createSkillRegistry(skills: readonly Skill[]): SkillRegistry {
 }
 
 export function renderSkillSection(skills: readonly Skill[]): string {
-  const usable = skills.filter((skill) => !skill.disabledReason && !skill.commandOnly)
+  const usable = skills.filter((skill) => isUsableSkill(skill) && !skill.commandOnly)
   if (usable.length === 0) return ''
   return [
     '## 可用技能',
@@ -289,9 +300,16 @@ export function describeDisabledSkills(skills: readonly Skill[]): string[] {
     .map((skill) => `技能 ${skill.name} 已禁用:${skill.disabledReason}`)
 }
 
+/** 因为环境不匹配被跳过的技能。 */
+export function describeSkippedSkills(skills: readonly Skill[]): string[] {
+  return skills
+    .filter((skill) => skill.skippedReason)
+    .map((skill) => `技能 ${skill.name} 已跳过:${skill.skippedReason}`)
+}
+
 /** 只允许用户手敲的技能。 */
 export function commandOnlySkills(skills: readonly Skill[]): Skill[] {
-  return skills.filter((skill) => !skill.disabledReason && skill.commandOnly)
+  return skills.filter((skill) => isUsableSkill(skill) && skill.commandOnly)
 }
 
 /** 技能名能不能当斜杠命令名。带斜杠或空格的名字在补全列表里会出问题。 */
@@ -344,12 +362,17 @@ export function formatSkillForModel(skill: Skill): string {
 }
 
 export function summarizeSkills(skills: readonly Skill[]): string {
-  const usable = skills.filter((skill) => !skill.disabledReason)
-  const disabled = skills.length - usable.length
+  const usable = skills.filter((skill) => isUsableSkill(skill))
+  const disabled = skills.filter((skill) => skill.disabledReason).length
+  const skipped = skills.filter((skill) => skill.skippedReason).length
   if (usable.length === 0) {
-    return disabled > 0 ? `技能全部被禁用(${disabled} 个)` : '项目里没有找到技能'
+    if (disabled > 0 || skipped > 0) return `技能都不可用(禁用 ${disabled} 个,跳过 ${skipped} 个)`
+    return '项目里没有找到技能'
   }
-  const suffix = disabled > 0 ? `,另有 ${disabled} 个同名冲突被禁用` : ''
+  const notes: string[] = []
+  if (disabled > 0) notes.push(`${disabled} 个同名冲突被禁用`)
+  if (skipped > 0) notes.push(`${skipped} 个环境不匹配被跳过`)
+  const suffix = notes.length > 0 ? `,另有${notes.join('、')}` : ''
   return `已识别技能 ${usable.length} 个:${usable.map((skill) => skill.name).join('、')}${suffix}`
 }
 
@@ -419,6 +442,12 @@ async function loadSkill(
 
   const truncated = normalizedBody.length > MAX_SKILL_BODY_CHARS
   const attachments = await collectAttachments(parentOf(filePath), context)
+  // 环境不匹配的技能仍然收进来,但标记成跳过。
+  // 这样 /skills 还能看到它存在过,不至于凭空消失。
+  const skippedReason = checkEnvironment(data)
+  if (skippedReason) {
+    context.logger.warn({ path: filePath, name, reason: skippedReason }, '技能环境不匹配,已跳过')
+  }
   context.skills.push({
     name,
     description,
@@ -432,7 +461,42 @@ async function loadSkill(
     commandOnly: isCommandOnly(data),
     attachments,
     headings: collectHeadings(normalizedBody, bodyStartLine),
+    skippedReason,
   })
+}
+
+/**
+ * 环境是否匹配。
+ *
+ * GrassAgent 跑在本地终端上,所以运行环境算 local,界面算 cli。
+ * 技能声明了别的环境就别装进来——云端专用的技能在这里跑不了。
+ */
+function checkEnvironment(data: Record<string, FrontmatterValue>): string | undefined {
+  const environments = stringListOf(data.environments)
+  if (environments.length > 0 && !environments.includes(GRASS_ENVIRONMENT)) {
+    return `只在 ${environments.join('、')} 环境可用`
+  }
+  const disabledEnvironments = stringListOf(data['disabled-environments'])
+  if (disabledEnvironments.includes(GRASS_ENVIRONMENT)) {
+    return `${GRASS_ENVIRONMENT} 环境被显式禁用`
+  }
+  const surfaces = stringListOf(nestedValue(data, 'surfaces'))
+  if (surfaces.length > 0 && !surfaces.includes(GRASS_SURFACE)) {
+    return `只在 ${surfaces.join('、')} 界面可用`
+  }
+  return undefined
+}
+
+function stringListOf(value: FrontmatterValue | undefined): string[] {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  return []
+}
+
+function nestedValue(data: Record<string, FrontmatterValue>, key: string): FrontmatterValue | undefined {
+  const mapping = data.metadata
+  if (!mapping || typeof mapping !== 'object' || Array.isArray(mapping)) return undefined
+  return mapping[key]
 }
 
 /**
