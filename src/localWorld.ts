@@ -151,11 +151,11 @@ export async function runArgv(
   let spawnError: Error | undefined
   const timeout = setTimeout(() => {
     timedOut = true
-    child.kill('SIGTERM')
+    stopProcessTree(child)
   }, request.timeoutMs)
   const onAbort = (): void => {
     aborted = true
-    child.kill('SIGTERM')
+    stopProcessTree(child)
   }
   if (signal) {
     if (signal.aborted) onAbort()
@@ -191,6 +191,26 @@ export async function runArgv(
   }
 }
 
+/**
+ * Windows 上 bash -c 会变成 cmd.exe,sleep 是 cmd 的子进程。
+ * child.kill 只结束 cmd,管道要等 sleep 自己退出。taskkill /t 把整棵进程树杀掉。
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+function stopProcessTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform === 'win32' && child.pid !== undefined) {
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    killer.unref()
+    killer.once('error', () => {
+      child.kill()
+    })
+    return
+  }
+  child.kill('SIGTERM')
+}
+
 function commandForPlatform(argv: readonly string[]): { file: string; args: string[] } {
   if (process.platform === 'win32' && argv[0] === 'bash' && argv[1] === '-c') {
     return {
@@ -211,10 +231,6 @@ function fileAccessError(error: unknown, filePath: string): Error {
   return error as Error
 }
 
-/**
- * 把 exec 结果收成和原来 run_bash 一样的文本。超长输出在世界里已经截过。
- * 作者：Pieory 创建日期：2025-07-18
- */
 /**
  * 把 exec 结果收成和原来 run_bash 一样的文本。
  * stdout/stderr 在执行时已经按世界截过,这里不再写第二份临时文件。

@@ -178,7 +178,8 @@ test('docker 参数和克隆命令不携带令牌或密钥,失败时删掉未保
             assert.ok(mount)
             tokenFile = mount.slice(0, mount.indexOf(':/run/grass/token:ro'))
             const info = await stat(tokenFile)
-            assert.equal(info.mode & 0o777, 0o600)
+            // Windows 没有 POSIX 权限位,Node 报出来的是 0666。0600 只在控制面所在的 Linux 上有意义。
+            if (process.platform !== 'win32') assert.equal(info.mode & 0o777, 0o600)
             const token = await readFile(tokenFile, 'utf-8')
             assert.equal(argv.join('\n').includes(token), false)
             return { exitCode: 0, stdout: 'container\n', stderr: '' }

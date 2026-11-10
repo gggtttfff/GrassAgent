@@ -127,7 +127,8 @@ test('超长命令输出只把尾部留在内存里', async () => {
   try {
     const world = await createLocalWorld({ workspace })
     const result = await world.exec({
-      argv: ['bash', '-c', 'node -e "process.stdout.write(\'a\'.repeat(400000))"'],
+      // 直接跑 node,避免 Windows 把 bash -c 译成 cmd 后引号把脚本吃掉、stdout 变空。
+      argv: [process.execPath, '-e', "process.stdout.write('a'.repeat(400000))"],
       cwd: world.workspaceRoot,
       timeoutMs: 5000,
     })
