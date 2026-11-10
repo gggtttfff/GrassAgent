@@ -9,7 +9,6 @@ import * as path from 'node:path'
 import { Writable } from 'node:stream'
 import ssh2 from 'ssh2'
 import { createSshBackend } from '../src/sandbox/sshBackend.ts'
-import { REMOTE_DAEMON_PORT } from '../src/sandbox/sshDeploy.ts'
 import { createLogger } from '../src/logger.ts'
 
 // SSH 后端的测试。
@@ -70,10 +69,9 @@ async function startFakeRemote(): Promise<FakeRemote> {
       // 隧道用 forwardOut,服务端这边收到的是 tcpip 请求。
       // 把通道接到冒充的 daemon 上,数据双向转发。
       client.on('tcpip', (acceptTcpip, rejectTcpip, info) => {
-        // 部署时 daemon 用的是固定端口,这里转到假 daemon 的真实端口上
-        const targetPort = info.destPort === REMOTE_DAEMON_PORT ? daemonPort : info.destPort
+        // 端口是 daemon 自己挑的,日志里报的就是假 daemon 的真实端口,直接连
         const channel = acceptTcpip()
-        const socket = connect(targetPort, info.destIP)
+        const socket = connect(info.destPort, info.destIP)
         // 记下来,关闭时要一起掐掉,不然进程退不出去
         forwardedSockets.push(socket)
         socket.on('connect', () => {
@@ -168,6 +166,13 @@ async function startFakeRemote(): Promise<FakeRemote> {
             })
             return
           }
+          if (info.command.includes('daemon.log')) {
+            // 部署会从日志里读实际监听的端口
+            stream.write(`daemon listening http://127.0.0.1:${daemonPort}\n`)
+            stream.exit(0)
+            stream.end()
+            return
+          }
           // 别的命令:启动 daemon 的 nohup 之类,回成功就行
           stream.write('')
           stream.exit(0)
@@ -247,7 +252,8 @@ test('SSH 后端:创建沙盒后能通过隧道转发调用', { timeout: 40_000 
       username: 'dev',
       privateKeyPath: keyPath,
       knownHostsPath: path.join(directory, 'known_hosts'),
-      remoteWorkspace: path.join(directory, 'workspace'),
+      // 远程是 Linux,工作区用 POSIX 路径。部署会把它建出来。
+      remoteWorkspace: '/tmp/grass-sb-workspace',
       logger: silentLogger,
     })
 

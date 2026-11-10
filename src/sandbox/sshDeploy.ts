@@ -28,11 +28,8 @@ const DAEMON_SOURCES = [
   'src/approvalGate.ts',
 ] as const
 
-/** 远程 daemon 监听的端口。远程只绑回环,端口不对外发布。 */
-export const REMOTE_DAEMON_PORT = 8765
-
 export type RemoteDaemon = {
-  /** 远程 daemon 的回环端口。隧道要转到这里。 */
+  /** 远程 daemon 的回环端口。由系统分配,隧道要转到这里。 */
   port: number
   /** 远程上的工作目录。销毁时要清掉。 */
   remoteDirectory: string
@@ -60,23 +57,35 @@ export type DeployOptions = {
 export async function deployRemoteDaemon(options: DeployOptions): Promise<RemoteDaemon> {
   const remoteRoot = options.remoteRoot ?? '/tmp'
   const remoteDirectory = `${remoteRoot}/grass-${options.sandboxId}`
-  await mkdirRemote(options.client, remoteDirectory, options.logger)
-
-  // 源码先传过去。传的是目录结构,不是 tar 包——
-  // tar 要远程有 tar,这里只是几个文本文件。
-  const root = projectRoot()
   const client = options.client
   const logger = options.logger
-  for (const relative of DAEMON_SOURCES) {
-    const content = await readFile(path.join(root, relative), 'utf-8')
-    const remotePath = `${remoteDirectory}/${relative}`
-    await mkdirRemote(client, path.posix.dirname(remotePath), logger)
-    await putFile(client, remotePath, content, logger)
-  }
 
-  // 令牌写在远程的 0600 文件里。daemon 每次调用都读它比对。
-  await putFile(client, `${remoteDirectory}/token`, options.token, logger)
-  await chmodRemote(client, `${remoteDirectory}/token`, 0o600, logger)
+  // 整次部署只用一条 SFTP 会话。
+  // 每个操作单开一个会话的话,11 个文件加上建目录要握手二十多次,
+  // 实测真实机器上要 40 秒。
+  const remote = await openRemoteFiles(client)
+  try {
+    // 工作区要先有,daemon 起来时会对它做 realpath。不存在就直接失败。
+    await remote.mkdir(options.remoteWorkspace)
+    await remote.mkdir(remoteDirectory)
+
+    // 源码逐个传。传的是目录结构,不是 tar 包——
+    // tar 要远程有 tar,这里只是几个文本文件。
+    const root = projectRoot()
+    for (const relative of DAEMON_SOURCES) {
+      const content = await readFile(path.join(root, relative), 'utf-8')
+      const remotePath = `${remoteDirectory}/${relative}`
+      await remote.mkdir(path.posix.dirname(remotePath))
+      await remote.write(remotePath, content)
+    }
+
+    // 令牌写在远程的 0600 文件里。daemon 每次调用都读它比对。
+    await remote.write(`${remoteDirectory}/token`, options.token)
+    await remote.chmod(`${remoteDirectory}/token`, 0o600)
+  } finally {
+    remote.close()
+  }
+  logger?.debug({ remoteDirectory, fileCount: DAEMON_SOURCES.length }, '远程源码已就位')
 
   // 远程的 Node 版本要够。type stripping 是 24.3 才默认开启的。
   const nodeVersion = await probeNodeVersion(client, logger)
@@ -85,26 +94,38 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
   }
 
   const daemonPath = `${remoteDirectory}/src/sandbox/daemon.ts`
+  const logPath = `${remoteDirectory}/daemon.log`
+  const pidPath = `${remoteDirectory}/daemon.pid`
   const startCommand = [
     'nohup node',
     shellQuote(daemonPath),
     '--serve',
     '--host', '127.0.0.1',
-    '--port', String(REMOTE_DAEMON_PORT),
+    // 端口交给系统挑。写死的话同一台机器上两个沙盒必然抢端口。
+    '--port', '0',
     '--token-file', shellQuote(`${remoteDirectory}/token`),
     '--workspace', shellQuote(options.remoteWorkspace),
     '--advertised-root', '/workspace',
     '--disk-mb', String(options.diskMb),
-    `> ${shellQuote(`${remoteDirectory}/daemon.log`)} 2>&1 &`,
+    `> ${shellQuote(logPath)} 2>&1 &`,
+    // 记下 PID。按进程名杀容易误伤,按 PID 精准。
+    `echo $! > ${shellQuote(pidPath)}`,
   ].join(' ')
 
   await runRemote(client, startCommand, logger)
-  await waitForDaemon(client, options.token, logger)
+  const port = await discoverDaemonPort(client, logPath, logger)
+  await waitForDaemon(client, port, options.token, logger)
 
   return {
-    port: REMOTE_DAEMON_PORT,
+    port,
     remoteDirectory,
     stop: async () => {
+      // 先按 PID 精准杀,再按路径兜底。两条都失败也不能挡住清理。
+      await runRemote(
+        client,
+        `if [ -f ${shellQuote(pidPath)} ]; then kill "$(cat ${shellQuote(pidPath)})" 2>/dev/null || true; fi`,
+        logger,
+      ).catch(() => undefined)
       await runRemote(
         client,
         `pkill -f ${shellQuote(daemonPath)} || true`,
@@ -120,6 +141,39 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
 }
 
 /**
+ * 从 daemon 日志里读出它实际监听的端口。
+ *
+ * daemon 用 `--port 0` 启动时由系统分配端口,起来后会打一行
+ * `daemon listening http://127.0.0.1:PORT`。读那一行就知道端口。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+async function discoverDaemonPort(
+  client: Client,
+  logPath: string,
+  logger?: Logger,
+): Promise<number> {
+  const deadline = Date.now() + 20_000
+  let lastLog = ''
+  while (Date.now() < deadline) {
+    const output = await runRemote(client, `cat ${shellQuote(logPath)} 2>/dev/null || true`, logger)
+    lastLog = output
+    const matched = output.match(/daemon listening http:\/\/127\.0\.0\.1:(\d+)/)
+    if (matched) {
+      const port = Number(matched[1])
+      logger?.info({ port }, '远程 daemon 已监听')
+      return port
+    }
+    // daemon 起不来会把原因写进日志,别干等到超时
+    if (/Error|error:|EADDR|ENOENT|Cannot find/.test(output)) {
+      throw new Error(`远程 daemon 启动失败: ${output.trim().slice(-400)}`)
+    }
+    await delay(300)
+  }
+  throw new Error(`远程 daemon 没有报出监听端口: ${lastLog.trim().slice(-400) || '(日志为空)'}`)
+}
+
+/**
  * 等远程 daemon 起来。
  *
  * 用 health 调用探活,不用 sleep 猜时间。
@@ -128,6 +182,7 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
  */
 async function waitForDaemon(
   client: Client,
+  port: number,
   token: string,
   logger?: Logger,
 ): Promise<void> {
@@ -137,7 +192,7 @@ async function waitForDaemon(
     const output = await runRemote(
       client,
       [
-        `curl -sS -m 5 -X POST http://127.0.0.1:${REMOTE_DAEMON_PORT}/call`,
+        `curl -sS -m 5 -X POST http://127.0.0.1:${port}/call`,
         `-H 'content-type: application/json'`,
         `-H 'authorization: Bearer ${token}'`,
         `--data '{"version":1,"kind":"health"}'`,
@@ -228,29 +283,41 @@ export function runRemote(
 }
 
 /**
- * 在远程建目录。目录已存在不算错。
+ * 一条 SFTP 会话,部署期间反复用。
  *
- * 走 SFTP 的 mkdir,不用 shell 的 `mkdir -p`——后者在远程不一定有,
- * 而且参数要过 shell 就有注入面。
- *
- * SFTP 的 mkdir 不递归,父目录不存在会直接失败。所以从根往下逐级建:
- * 已经存在的跳过,缺的补上。一个会话里建完整条路径,省得反复握手。
- *
- * 作者：Pieory 创建日期：2025-07-18
+ * 每个操作单开会话的话,建目录加传文件要握手二十多次,
+ * 真实机器上实测慢到 40 秒。一条会话做完快得多。
  */
-export async function mkdirRemote(
-  client: Client,
-  remotePath: string,
-  logger?: Logger,
-): Promise<void> {
+type RemoteFiles = {
+  mkdir: (remotePath: string) => Promise<void>
+  write: (remotePath: string, content: string) => Promise<void>
+  chmod: (remotePath: string, mode: number) => Promise<void>
+  close: () => void
+}
+
+async function openRemoteFiles(client: Client): Promise<RemoteFiles> {
   const sftp = await openSftp(client)
-  try {
-    for (const level of pathLevels(remotePath)) {
-      await sftpMkdir(sftp, level)
-    }
-    logger?.debug({ remotePath }, '远程目录已就绪')
-  } finally {
-    sftp.end()
+  // 建过的目录记下来,同一层不用反复建
+  const created = new Set<string>()
+  return {
+    async mkdir(remotePath: string) {
+      // SFTP 的 mkdir 不递归,父目录不存在会直接失败。
+      // 从根往下逐级建,已经有的跳过。
+      for (const level of pathLevels(remotePath)) {
+        if (created.has(level)) continue
+        await sftpMkdir(sftp, level)
+        created.add(level)
+      }
+    },
+    async write(remotePath: string, content: string) {
+      await sftpWrite(sftp, remotePath, content)
+    },
+    async chmod(remotePath: string, mode: number) {
+      await sftpChmod(sftp, remotePath, mode)
+    },
+    close() {
+      sftp.end()
+    },
   }
 }
 
@@ -285,6 +352,47 @@ function sftpMkdir(sftp: SFTPWrapper, remotePath: string): Promise<void> {
   })
 }
 
+/**
+ * 写远程文件。
+ *
+ * 走 SFTP 而不是 shell 重定向。shell 的 `cat > file` 要等通道关闭才收尾,
+ * 而 ssh2 的服务端 Session 通道在 CHANNEL_CLOSE 时不推 EOF——
+ * 靠它会一直挂着。SFTP 是独立协议,语义清楚。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+function sftpWrite(sftp: SFTPWrapper, remotePath: string, content: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.writeFile(remotePath, content, (writeError) => {
+      if (writeError) {
+        reject(new Error(`写远程文件失败 ${remotePath}: ${writeError.message}`))
+        return
+      }
+      resolve()
+    })
+  })
+}
+
+/**
+ * 改远程文件权限。
+ *
+ * SFTP 的权限位只在 POSIX 远程上有意义,Windows 上会被忽略——
+ * 那没关系,Windows 没有 POSIX 权限模型。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+function sftpChmod(sftp: SFTPWrapper, remotePath: string, mode: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.chmod(remotePath, mode, (chmodError) => {
+      if (chmodError) {
+        reject(new Error(`远程 chmod 失败 ${remotePath}: ${chmodError.message}`))
+        return
+      }
+      resolve()
+    })
+  })
+}
+
 function openSftp(client: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     client.sftp((error, sftp) => {
@@ -308,73 +416,6 @@ function openSftp(client: Client): Promise<SFTPWrapper> {
 function isAlreadyExists(error: Error & { code?: number }): boolean {
   if (error.code === 4) return true
   return /exist|already/i.test(error.message)
-}
-
-/**
- * 改远程文件的权限。
- *
- * 走 SFTP 的 chmod,不用 shell。SFTP 的权限位只在 POSIX 远程上有意义,
- * Windows 上会被忽略——那没关系,Windows 没有 POSIX 权限模型。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-export function chmodRemote(
-  client: Client,
-  remotePath: string,
-  mode: number,
-  logger?: Logger,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.sftp((error, sftp) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      sftp.chmod(remotePath, mode, (chmodError) => {
-        sftp.end()
-        if (chmodError) {
-          reject(new Error(`远程 chmod 失败 ${remotePath}: ${chmodError.message}`))
-          return
-        }
-        logger?.debug({ remotePath, mode }, '远程文件权限已设置')
-        resolve()
-      })
-    })
-  })
-}
-
-/**
- * 把一段文本写到远程文件。
- *
- * 走 SFTP 而不是 shell 重定向。shell 的 `cat > file` 要等通道关闭才收尾,
- * 而 ssh2 的服务端 Session 通道在 CHANNEL_CLOSE 时不推 EOF——
- * 靠它会一直挂着。SFTP 是独立协议,语义清楚。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-export function putFile(
-  client: Client,
-  remotePath: string,
-  content: string,
-  logger?: Logger,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    client.sftp((error, sftp) => {
-      if (error) {
-        reject(error)
-        return
-      }
-      sftp.writeFile(remotePath, content, (writeError) => {
-        sftp.end()
-        if (writeError) {
-          reject(new Error(`写远程文件失败 ${remotePath}: ${writeError.message}`))
-          return
-        }
-        logger?.debug({ remotePath, byteLength: Buffer.byteLength(content) }, '远程文件已写入')
-        resolve()
-      })
-    })
-  })
 }
 
 /**

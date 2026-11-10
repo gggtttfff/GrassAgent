@@ -141,6 +141,13 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
             stream.end()
             return
           }
+          if (info.command.includes('daemon.log')) {
+            // 部署从日志里读实际监听的端口
+            stream.write('daemon listening http://127.0.0.1:45678\n')
+            stream.exit(0)
+            stream.end()
+            return
+          }
           stream.write('')
           stream.exit(0)
           stream.end()
@@ -224,7 +231,7 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
       client: connection.client,
       sandboxId: 'test123',
       token: 'secret-token',
-      remoteWorkspace: '/home/dev/project',
+      remoteWorkspace: '/tmp/grass-test123/workspace',
       diskMb: 2048,
       logger: silentLogger,
     })
@@ -252,8 +259,9 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
     const startCommand = remote.commands.find((command) => command.includes('--serve'))
     assert.ok(startCommand, '应该有启动 daemon 的命令')
     assert.match(startCommand, /--host 127\.0\.0\.1/)
-    assert.match(startCommand, /--port 8765/)
-    assert.match(startCommand, /--workspace '\/home\/dev\/project'/)
+    // 端口写死会抢;交给系统分配,部署再从日志里读回来
+    assert.match(startCommand, /--port 0/)
+    assert.match(startCommand, /--workspace '\/tmp\/grass-test123\/workspace'/)
     assert.match(startCommand, /--advertised-root '\/workspace'|--advertised-root \/workspace/)
 
     // 文件和目录都走 SFTP,不该有 shell 重定向
