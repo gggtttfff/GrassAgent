@@ -145,6 +145,45 @@ test('非交互模式的输出没有 ANSI 控制序列', async () => {
   }
 })
 
+// 跑一次 CLI,但 stdin 保持打开一段时间再关。
+// 监视器报告要等回合结束之后才到,一写完就 EOF 会把监视器直接取消掉。
+async function runCliKeepingStdin(
+  input: string,
+  keepOpenMs: number,
+  environment: Record<string, string>,
+): Promise<{ exitCode: number; output: string }> {
+  const child = spawn(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', path.join('src', 'cli.ts')],
+    {
+      cwd: projectRoot,
+      env: { ...process.env, ...environment },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  )
+
+  let output = ''
+  child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString() })
+  child.stderr.on('data', (chunk: Buffer) => { output += chunk.toString() })
+
+  child.stdin.write(input)
+  const timer = setTimeout(() => child.stdin.end(), keepOpenMs)
+
+  const exitCode = await new Promise<number>((resolve) => {
+    const timeout = setTimeout(() => {
+      child.kill()
+      resolve(-1)
+    }, 20000)
+    child.on('exit', (code) => {
+      clearTimeout(timeout)
+      clearTimeout(timer)
+      resolve(code ?? 0)
+    })
+  })
+
+  return { exitCode, output }
+}
+
 // 斜杠命令的端到端测试。
 //
 // 关键断言:命令在本地执行,不发给模型。
@@ -269,6 +308,77 @@ test('/compact 手动压缩,历史保持完整', async () => {
     assert.ok(!output.includes('回复**'), '压缩不该产生普通回复')
   } finally {
     await mock.close()
+  }
+})
+
+test('监视器到点后能把状态推回上下文并开新一轮', async () => {
+  const monitorResponse =
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_mon","function":{"name":"monitor","arguments":"{\\"kind\\":\\"timer\\",\\"afterMs\\":150}"}}]}}]}\n\n' +
+    'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+    'data: [DONE]\n\n'
+
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8')
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+
+      // 标题是旁路请求,不能抢走编排好的回合
+      if (raw.includes('根据用户的话生成一个会话标题')) {
+        response.end('data: {"choices":[{"delta":{"content":"监视"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+        return
+      }
+      // monitor 要过审批模型,它也是一次独立请求,同样不占回合编号
+      if (raw.includes('你是权限审批')) {
+        response.end(
+          'data: {"choices":[{"delta":{"content":"decision: allow\\nreason: 测试放行"},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+
+      requests.push(raw)
+      // 第 1 轮让模型起监视器,第 2 轮收尾,第 3 轮才是监视器报告唤醒的那一轮
+      if (requests.length === 1) {
+        response.end(monitorResponse)
+        return
+      }
+      if (requests.length === 2) {
+        response.end('data: {"choices":[{"delta":{"content":"已启动监视器"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+        return
+      }
+      response.end('data: {"choices":[{"delta":{"content":"收到监视器报告"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliKeepingStdin('开始监视\n', 1500, mockEnvironment(port))
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('已启动监视器'), `第一轮应正常结束,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('收到监视器报告'), `监视器报告应该唤醒新一轮,实际: ${output.slice(-400)}`)
+    assert.equal(requests.length, 3, `应该跑三轮请求,实际 ${requests.length}`)
+
+    // 报告作为 user 消息进的历史,不是伪造的 tool_result
+    const reportTurn = JSON.parse(requests[2]!) as {
+      messages: Array<{ role: string; content: string }>
+    }
+    const userTexts = reportTurn.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => (typeof message.content === 'string' ? message.content : JSON.stringify(message.content)))
+    assert.ok(
+      userTexts.some((text) => text.includes('[monitor]')),
+      `监视器报告应该作为 user 消息进上下文,实际: ${JSON.stringify(userTexts).slice(0, 500)}`,
+    )
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
   }
 })
 

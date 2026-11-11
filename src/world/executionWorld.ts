@@ -45,6 +45,30 @@ export type ExecResult = {
   timedOut: boolean
 }
 
+/** 后台命令跑到什么程度了。 */
+export type BackgroundExecStatus = 'running' | 'exited' | 'killed' | 'failed'
+
+/**
+ * 一条后台命令的句柄。
+ *
+ * 拿到的瞬间命令已经起来了,但还没跑完。调用方靠 status / outputTail 轮询,
+ * 或者 await finished() 等它结束。tail 只保留最后一小段——
+ * 后台命令的输出可能无限长,不能一直往内存里堆。
+ */
+export interface BackgroundExec {
+  readonly id: string
+  status(): BackgroundExecStatus
+  /** 还没结束时是 null */
+  exitCode(): number | null
+  /** 输出尾部(stdout 和 stderr 合在一起),已按世界的上限截断 */
+  outputTail(): string
+  elapsedMs(): number
+  /** 杀掉整棵进程树。已经结束就什么都不做。 */
+  kill(): void
+  /** 结束时 resolve,不会 reject。 */
+  finished(): Promise<void>
+}
+
 /**
  * 目录里的一个条目。size 和 mtimeMs 让调用方能判断文件有没有变过。
  */
@@ -82,6 +106,13 @@ export interface ExecutionWorld {
   edit(filePath: string, edits: readonly TextEdit[]): Promise<string>
   /** 执行 argv。stdout/stderr 已经按这个世界的上限收过尾。作者：Pieory 创建日期：2025-07-18 */
   exec(request: ExecRequest, signal?: AbortSignal): Promise<ExecResult>
+  /**
+   * 起一条后台命令,立刻返回句柄。
+   *
+   * 可选:远程世界要走沙盒协议才能拿到增量输出,协议还没加,
+   * 所以那边不实现这个。调用方要按「世界不支持后台执行」兜底。
+   */
+  execBackground?(request: ExecRequest): Promise<BackgroundExec>
   /**
    * 运行时切换模式。远程世界要通知 daemon,失败就抛,不静默降级。
    * 审批由调用方负责——这个方法只回答「世界有没有真的切过去」。

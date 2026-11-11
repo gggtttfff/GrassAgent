@@ -10,6 +10,8 @@ import {
   EncodingError,
   PolicyDeniedError,
   isSandboxMode,
+  type BackgroundExec,
+  type BackgroundExecStatus,
   type DirectoryEntry,
   type ExecRequest,
   type ExecResult,
@@ -152,6 +154,23 @@ class LocalWorld implements ExecutionWorld {
   }
 
   /**
+   * 起一条后台命令。
+   *
+   * 只读模式照样拒绝:后台跑起来的命令更难拦,不能因为「看不见」就放行。
+   * 输出只留尾部,后台命令可能一直往外吐。
+   * 作者：Pieory 创建日期：2025-07-18
+   */
+  async execBackground(request: ExecRequest): Promise<BackgroundExec> {
+    if (this.policy.mode === 'read-only') {
+      throw new PolicyDeniedError('只读沙盒拒绝执行命令')
+    }
+    const cwd = this.policy.mode === 'danger-full-access'
+      ? path.resolve(request.cwd)
+      : await this.resolveInside(request.cwd)
+    return startBackgroundArgv(request, cwd)
+  }
+
+  /**
    * 运行时切换模式。
    *
    * policy 是活的对象,每次 read/write/exec 都重新读它,所以改字段立刻生效,
@@ -239,6 +258,75 @@ export async function runArgv(
     stderr,
     aborted,
     timedOut,
+  }
+}
+
+/**
+ * 后台命令最多留多少字符的输出。
+ *
+ * 前台命令结束时才交给模型,可以留全文;后台是会一直跑的,
+ * 只能留尾部,否则一条刷屏的命令能把进程撑爆。
+ */
+const BACKGROUND_TAIL_CHARS = 8 * 1024
+
+/**
+ * 起一条后台命令。和 runArgv 走同一个平台翻译,差别是不等它结束。
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+function startBackgroundArgv(request: ExecRequest, cwd: string): BackgroundExec {
+  const { file, args } = commandForPlatform(request.argv)
+  const startedAt = Date.now()
+  const child = spawn(file, args, {
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+
+  let tail = ''
+  let status: BackgroundExecStatus = 'running'
+  let exitCode: number | null = null
+
+  const appendTail = (chunk: string): void => {
+    if (status !== 'running') return
+    tail += chunk
+    if (tail.length > BACKGROUND_TAIL_CHARS) {
+      tail = tail.slice(tail.length - BACKGROUND_TAIL_CHARS)
+    }
+  }
+  child.stdout?.setEncoding('utf8')
+  child.stderr?.setEncoding('utf8')
+  child.stdout?.on('data', appendTail)
+  child.stderr?.on('data', appendTail)
+
+  const finished = new Promise<void>((resolve) => {
+    child.once('error', (error) => {
+      appendTail(`\n[启动失败] ${error.message}`)
+      status = 'failed'
+      resolve()
+    })
+    // close 而不是 exit:stdout/stderr 要等到 close 才收集完
+    child.once('close', (code) => {
+      if (status === 'running') {
+        status = 'exited'
+        exitCode = code ?? 1
+      }
+      resolve()
+    })
+  })
+
+  return {
+    id: `bg_${startedAt.toString(36)}`,
+    status: () => status,
+    exitCode: () => exitCode,
+    outputTail: () => tail,
+    elapsedMs: () => Date.now() - startedAt,
+    kill: () => {
+      if (status !== 'running') return
+      // 记成 killed 再杀:close 回调里看到不是 running 就不会覆盖成 exited
+      status = 'killed'
+      stopProcessTree(child)
+    },
+    finished: () => finished,
   }
 }
 

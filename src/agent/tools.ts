@@ -4,7 +4,7 @@
 // 文件和命令都交给 ExecutionWorld,工具自己不再碰 fs 或子进程。
 // 参数 schema 用 pi-schema 的 builders 写,类型和校验规则只有一处定义。
 
-import { obj, str, arr } from '@earendil-works/pi-schema'
+import { obj, str, arr, oneOf, opt, int, bool } from '@earendil-works/pi-schema'
 import { assertSkillAllowed, type ApprovalGate } from '../world/approvalGate.ts'
 import type { AgentTool } from './agent.ts'
 import type { ExecutionWorld } from '../world/executionWorld.ts'
@@ -12,6 +12,12 @@ import { formatExecResult, createLocalWorld } from '../world/localWorld.ts'
 import { describePathError } from '../core/pathGuard.ts'
 import { formatSkillForModel, type Skill, type SkillRegistry } from '../instructions/skills.ts'
 import { TextEditError } from '../core/textEdit.ts'
+import {
+  MAX_BLOCKING_WAIT_MS,
+  MAX_COMMAND_TIMEOUT_MS,
+  type MonitorKind,
+  type MonitorRegistry,
+} from './monitor.ts'
 import {
   findDangerousCommand,
   formatDangerousCommandRejection,
@@ -64,6 +70,26 @@ const loadSkillParameters = obj({
     minItems: 1,
     maxItems: 8,
   }),
+})
+
+const monitorParameters = obj({
+  kind: oneOf(['command', 'timer', 'sandbox'], {
+    description: 'command 跑命令;timer 纯定时;sandbox 沙盒和连接状态',
+  }),
+  command: opt(str({ description: 'kind=command 时要执行的 shell 命令' })),
+  afterMs: opt(int({
+    minimum: 0,
+    maximum: MAX_COMMAND_TIMEOUT_MS,
+    description: '多少毫秒后先报一次状态。不给就只有结束报告',
+  })),
+  timeoutMs: opt(int({
+    minimum: 1000,
+    maximum: MAX_COMMAND_TIMEOUT_MS,
+    description: '命令最多跑多久,到点直接杀掉',
+  })),
+  wait: opt(bool({
+    description: 'true 表示在本次调用内等到报告;默认后台,回合结束也会把结果推回来',
+  })),
 })
 
 // read_file:返回文件内容。超过 200 行或字节上限时只带尾部,全文在世界的临时区。
@@ -185,6 +211,86 @@ function buildRunBash(
         return describePathError(error)
       }
     },
+  }
+}
+
+// monitor:起一个监视器,过一会儿把状态报回来。
+//
+// 两种用法:
+//   - 默认后台:起完立刻返回,回合照常结束。到点或命令结束时由注册表回调出去,
+//     调用方负责把状态推回上下文并开新一轮。
+//   - wait=true:在本次调用内等到命令结束或到点,直接把状态当工具结果返回。
+//
+// 它会跑命令,所以和 run_bash 一样要过审批、过危险命令规则。
+function buildMonitor(
+  monitors: MonitorRegistry,
+  dangerousCommands: readonly DangerousCommandRule[],
+  rulesPath: string,
+): AgentTool {
+  return {
+    name: 'monitor',
+    description:
+      '监视一段时间内的状态,可选在若干毫秒后和结束时向模型报告.参数:' +
+      'kind(command 跑命令 / timer 纯定时 / sandbox 沙盒连接状态),' +
+      'command(命令,kind=command 必填),afterMs(多少毫秒后先报一次),' +
+      'timeoutMs(命令最长运行时间,到点杀掉),wait(true 则在本次调用内等到报告,默认后台)',
+    parameters: monitorParameters,
+    requiresApproval: true,
+    execute: async (args, signal) => {
+      const input = args as {
+        kind: MonitorKind
+        command?: string
+        afterMs?: number
+        timeoutMs?: number
+        wait?: boolean
+      }
+
+      if (input.kind === 'command') {
+        const command = input.command?.trim()
+        if (!command) return 'error: kind=command 时必须给 command'
+        // 后台跑的命令同样受危险命令规则约束,不能因为「看不见」就放行
+        const blocked = findDangerousCommand(dangerousCommands, command)
+        if (blocked) return formatDangerousCommandRejection(blocked, rulesPath)
+      }
+
+      let started
+      try {
+        started = await monitors.start({
+          kind: input.kind,
+          command: input.command,
+          afterMs: input.afterMs,
+          timeoutMs: input.timeoutMs,
+        })
+      } catch (error) {
+        return `error: ${(error as Error).message}`
+      }
+
+      if (!input.wait) return started.text
+      if (signal?.aborted) return 'error:aborted'
+
+      // 阻塞模式也要有上限:等太久不如让模型先干别的,监视器继续在后台跑。
+      const report = await raceWithTimeout(started.firstReport, MAX_BLOCKING_WAIT_MS)
+      if (report === undefined) {
+        return `等了 ${Math.round(MAX_BLOCKING_WAIT_MS / 1000)} 秒还没结束,监视器 ${started.id} 继续在后台跑,`
+          + '结束时会推给你。'
+      }
+      return report
+    },
+  }
+}
+
+/** 等到 promise 或超时。超时返回 undefined,并且不会留下定时器拖住进程。 */
+async function raceWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined
+  const timeoutPromise = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), timeoutMs)
+    // 阻塞等待不该成为进程退不出去的理由
+    timer.unref()
+  })
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -311,8 +417,12 @@ export async function builtinTools(options: {
   dangerousCommands?: readonly DangerousCommandRule[]
   /** 规则文件路径。只在拒绝时给模型看,让它知道去哪儿改。 */
   dangerousCommandsPath?: string
+  /** 监视器注册表。给了才注册 monitor 工具 */
+  monitors?: MonitorRegistry
 } = {}): Promise<AgentTool[]> {
   const world = options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() })
+  const dangerousCommands = options.dangerousCommands ?? []
+  const dangerousCommandsPath = options.dangerousCommandsPath ?? '危险命令规则文件'
   const tools = [
     buildReadFile(world),
     buildWriteFile(world),
@@ -321,10 +431,14 @@ export async function builtinTools(options: {
     buildRunBash(
       world,
       options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
-      options.dangerousCommands ?? [],
-      options.dangerousCommandsPath ?? '危险命令规则文件',
+      dangerousCommands,
+      dangerousCommandsPath,
     ),
   ]
+  // 没有注册表就没有后台报告的去处,注册一个只会失败的工具没意义
+  if (options.monitors) {
+    tools.push(buildMonitor(options.monitors, dangerousCommands, dangerousCommandsPath))
+  }
   // 一个技能都没有时不注册 load_skill:模型看见用不上的工具只会乱调
   if (options.skills && options.skills.names().length > 0) {
     tools.push(buildLoadSkill(options.skills, options.approval))

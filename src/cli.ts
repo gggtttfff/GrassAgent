@@ -8,6 +8,7 @@
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runAgent } from './agent/agent.ts'
+import { createMonitorRegistry } from './agent/monitor.ts'
 import { Tui } from './ui/tui.ts'
 import { builtinTools, replaceLoadSkillTool } from './agent/tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
@@ -307,7 +308,17 @@ async function main() {
     throw error
   }
 
-  // 工具的文件访问被限制在这个世界里。
+  // 监视器:后台命令和定时报告都归它管。真正的投递函数在回合循环建好之后才赋值,
+// 这里先用占位——监视器最早也要等工具被调用之后才会产生报告。
+let deliverMonitorReport: (text: string) => void = () => {}
+const monitors = createMonitorRegistry({
+  world,
+  workspaceRoot: world.workspaceRoot,
+  logger,
+  report: (text) => deliverMonitorReport(text),
+})
+
+// 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
   const fileTools = await builtinTools({
     world,
@@ -316,6 +327,7 @@ async function main() {
     approval,
     dangerousCommands,
     dangerousCommandsPath,
+    monitors,
   })
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
@@ -382,6 +394,9 @@ async function main() {
     sessionStore.close()
   }
   const shutdown = async (): Promise<void> => {
+    // 先关监视器:后台命令和定时器不该活到进程之外,
+    // 否则 Ctrl+C 退出后还有命令在跑。
+    monitors.cancelAll()
     if (sessionStarted) {
       sessionStarted = false
       try {
@@ -764,6 +779,105 @@ async function main() {
     config.Workspace,
   )
 
+  // 跑一个模型回合,把事件转发给 TUI。用户输入和监视器报告共用这一条。
+  // 中断、审批、钩子提示都在这里落到界面上,调用方只管把消息先进 context。
+  const runAgentTurn = async (ctrl: AbortController): Promise<void> => {
+    for await (const ev of runAgent(models.primary, context, tools, ctrl.signal, {
+      transport,
+      logger,
+      toolExecution: config.ToolExecution,
+      compactionModel: models.small,
+      approve,
+      hooks: hookRunner,
+      compaction: {
+        contextWindow: config.ContextWindow,
+        reserveTokens: config.CompactReserveTokens,
+        keepRecentTokens: config.CompactKeepRecentTokens,
+      },
+      // 只有本地世界才给工作区根:远程的路径在另一台机器上,
+      // 本机解析出来的结论是错的。全权限模式没有边界,
+      // 报 insideWorkspace=false 反而会误导钩子。
+      workspaceRoot: config.ExecutionWorld === 'remote'
+        || world.policy.mode === 'danger-full-access'
+        ? undefined
+        : config.Workspace,
+    })) {
+      switch (ev.type) {
+        case 'assistant_text': tui.printText(ev.delta); break
+        case 'tool_call': tui.printToolCall(ev.name, ev.args); break
+        case 'permission':
+          tui.printNotice(`${ev.allowed ? '审批通过' : '审批拒绝'} ${ev.name}: ${ev.reason}`)
+          break
+        case 'tool_result': tui.printToolResult(ev.name, ev.result); break
+        case 'hook_notice':
+          if (ev.level === 'error') tui.printError(ev.message)
+          else tui.printNotice(ev.message)
+          break
+        case 'turn_end':
+          // 收尾:把流式文本换成排好版的 markdown
+          tui.finishTurn()
+          if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
+          if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
+          if (ev.stopReason === 'error') tui.printError('[执行出错]')
+          break
+      }
+    }
+  }
+
+  // 监视器报告不是任何一次工具调用的结果——那次调用早就返回了。
+  // 所以它只能作为一条 user 消息塞回上下文,并单独开一轮。
+  // 忙的时候排队,空闲的时候再送。
+  const monitorReports: string[] = []
+  let monitorRoundRunning = false
+
+  const pumpMonitorReports = async (): Promise<void> => {
+    // 会话要结束了就不再开新回合,排队的报告直接丢(退出路径会记日志)
+    if (monitorRoundRunning || roundRunning || inputClosed) return
+    const report = monitorReports.shift()
+    if (!report) return
+
+    monitorRoundRunning = true
+    roundRunning = true
+    tui.setBusy(true)
+    const ctrl = new AbortController()
+    tui.onAbort(() => ctrl.abort())
+    try {
+      context.messages.push({ role: 'user', content: report })
+      await runAgentTurn(ctrl)
+      await sessionStore.sync(context.messages)
+    } catch (error) {
+      logger.error({ errorMessage: (error as Error).message }, '监视器报告回合失败')
+      tui.printError((error as Error).message)
+    } finally {
+      monitorRoundRunning = false
+      roundRunning = false
+      tui.setBusy(false)
+    }
+    // 监视器回合期间用户敲的行被拦在队列里,这时候没有 runInput 在跑,
+    // 不主动取走的话它会一直卡着,直到用户再敲一次。
+    const held = tui.takeNextHeldLine()
+    if (held !== undefined) {
+      void runInput(held)
+      return
+    }
+    // 这一轮里可能又攒了报告
+    if (monitorReports.length > 0) void pumpMonitorReports()
+  }
+
+  // 会话结束:监视器全部取消,排队的报告丢掉。
+  // 不在这里再跑一轮——用户已经看不着了,而且新回合还可能再起监视器。
+  const discardPendingMonitorReports = (): void => {
+    if (monitorReports.length > 0) {
+      logger.info({ pendingReports: monitorReports.length }, '会话结束,未送达的监视器报告已丢弃')
+      monitorReports.length = 0
+    }
+  }
+
+  deliverMonitorReport = (text: string): void => {
+    monitorReports.push(text)
+    void pumpMonitorReports()
+  }
+
   // 每轮：用户输入 → 斜杠命令 or runAgent → 事件转发到 TUI → 持久化。
   // 回合进行中到达的后续行先排队。提问会把其中一行当成回答，
   // 没被取走的行在本轮结束后按顺序再开一轮，而不是并发挤进来。
@@ -821,46 +935,7 @@ async function main() {
               logger,
             })
 
-            for await (const ev of runAgent(models.primary, context, tools, ctrl.signal, {
-              transport,
-              logger,
-              toolExecution: config.ToolExecution,
-              compactionModel: models.small,
-              approve,
-              hooks: hookRunner,
-              compaction: {
-                contextWindow: config.ContextWindow,
-                reserveTokens: config.CompactReserveTokens,
-                keepRecentTokens: config.CompactKeepRecentTokens,
-              },
-// 只有本地世界才给工作区根:远程的路径在另一台机器上,
-              // 本机解析出来的结论是错的。全权限模式没有边界,
-              // 报 insideWorkspace=false 反而会误导钩子。
-              workspaceRoot: config.ExecutionWorld === 'remote'
-                || world.policy.mode === 'danger-full-access'
-                ? undefined
-                : config.Workspace,
-            })) {
-              switch (ev.type) {
-                case 'assistant_text': tui.printText(ev.delta); break
-                case 'tool_call': tui.printToolCall(ev.name, ev.args); break
-                case 'permission':
-                  tui.printNotice(`${ev.allowed ? '审批通过' : '审批拒绝'} ${ev.name}: ${ev.reason}`)
-                  break
-                case 'tool_result': tui.printToolResult(ev.name, ev.result); break
-                case 'hook_notice':
-                  if (ev.level === 'error') tui.printError(ev.message)
-                  else tui.printNotice(ev.message)
-                  break
-                case 'turn_end':
-                  // 收尾:把流式文本换成排好版的 markdown
-                  tui.finishTurn()
-                  if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
-                  if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
-                  if (ev.stopReason === 'error') tui.printError('[执行出错]')
-                  break
-              }
-            }
+            await runAgentTurn(ctrl)
 
             const title = await titleTask
             if (title) tui.printNotice(`会话标题: ${title}`)
@@ -882,12 +957,18 @@ async function main() {
     // 输入已经读完且排队的行都跑完了,这才是能退的时候。
     // SessionEnd 要先跑完,不能在 exit 事件里 await。
     if (inputClosed) {
+      // 定时器和后台命令都不该活到会话之外
+      monitors.cancelAll()
+      discardPendingMonitorReports()
       await shutdown()
       // 不直接 process.exit:此时可能还有 HTTP socket 正在关闭,
       // 硬退会撞上 libuv 的 UV_HANDLE_CLOSING 断言(Windows 上尤其明显)。
       // 交给事件循环自己排空,没有存活句柄时进程自然结束。
       process.exitCode = 0
+      return
     }
+    // 交互模式:用户暂时没有新输入,把等待中的监视器报告送出去
+    void pumpMonitorReports()
   }
 
   tui.bindSubmit((text) => {

@@ -13,7 +13,7 @@ cli.ts                  唯一入口：拼装所有簇，自己不被任何模�
   ↓
 ui/         tui / theme / sessionPicker / nonInteractiveTerminal / lineQueue / slashCommands
   ↓
-agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands / approval
+agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands / approval / monitor
   ↓
 llm/        llm / protocol / messages / compaction / completeText / modelRoster / providers/
 instructions/ projectInstructions / skills
@@ -209,6 +209,16 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 
 **71. 三类模型不要串岗。** 标题和压缩摘要走小模型，对话和工具循环走主力模型，写文件和命令的放行走审批模型。什么时候压缩由 token 预算决定，不由小模型再否决一次。审批失败、抛错或结果无法解析时拒绝执行，不要默许。`world/approvalGate.ts` 管的是人要不要点头，和审批模型不是同一条路。
 
+**72. 监视器报告只能作为 user 消息进上下文。** 产生它的那次工具调用早就返回了，伪造成 `tool_result` 会破坏配对关系（约束 1）。所以带 `[monitor]` 标记当一条用户消息塞回去，由 `pumpMonitorReports` 单独开一轮。
+
+**73. 后台报告要排队，不能插进正在跑的回合。** `pumpMonitorReports` 见到 `roundRunning` 就先退出，队列里的报告等这一轮结束再送。用户输入处理完之后还要主动 `pumpMonitorReports()` 兜一次——报告是在回合中途到的，那时 pump 早退，没人会再触发它。
+
+**74. 监视器必须随会话结束清理。** `shutdown()` 和 stdin EOF 两条退出路径都要 `monitors.cancelAll()`：清定时器、杀掉后台命令。漏了的话 Ctrl+C 之后还有命令在跑，而且定时器会一直把进程吊住。
+
+**75. 后台命令的输出只留尾部。** 前台命令结束时才交给模型，可以留全文；后台是一直在跑的，`BACKGROUND_TAIL_CHARS`（8 KB）封顶，报告里再截到 2 KB。不封顶的话一条刷屏命令能把进程撑爆。
+
+**76. 远程世界没有后台执行能力，要明确报错。** `ExecutionWorld.execBackground` 是可选的，远程沙盒协议还没有增量输出和杀进程。`monitor` 工具遇到时返回「不支持后台执行」并提示改用 `run_bash`，不能假装能用——硬模拟只能把整条命令阻塞跑完，那就不是监视器了。`timer` 和 `sandbox` 两种在远程下照常可用。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -245,6 +255,10 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 - 远程挂回（`GRASSAGENT_SANDBOX_ID`）时以本次配置的模式为准，会影响同一个沙盒上的其他挂回者
 - 沙盒协议版本 2→3 不兼容，外部独立控制面（`npm run sandbox:control`）必须和客户端一起升级
 - 远程 daemon 启动瞬间是 workspace-write，配置的模式在创建后用一次 `setMode` 对齐。此时还没有任何工具调用，没有窗口期
+- 监视器不活在会话之外：Ctrl+C 或 stdin 读完就全部取消，后台命令一起杀掉。所以非交互模式下管道一关就看不到定时报告
+- 远程沙盒只支持 `timer` 和 `sandbox` 两种监视，`command` 要等沙盒协议支持增量输出和杀进程
+- 后台命令不参与 `mutatesFiles` 排队，它跑起来之后什么时候写文件是它自己的事
+- 监视器报告滚出上下文之后不会再回来；追加轮次也不会重发
 
 ## 测试
 
