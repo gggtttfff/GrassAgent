@@ -36,6 +36,7 @@ import {
   loadDangerousCommandsFile,
   type DangerousCommandRule,
 } from './agent/dangerousCommands.ts'
+import { createModelApprover } from './agent/approval.ts'
 import {
   appendPromptSection,
   discoverProjectInstructions,
@@ -59,15 +60,18 @@ import {
   matchPromptTemplate,
   type PromptTemplate,
 } from './instructions/prompts.ts'
-import { messagesArePaired } from './llm/messages.ts'
 import { compactContext } from './llm/compaction.ts'
+import { ensureSessionTitle } from './session/sessionTitle.ts'
+import { messagesArePaired } from './llm/messages.ts'
+import { buildModelRoster } from './llm/modelRoster.ts'
 import type { Model, Context } from './llm/llm.ts'
 
 /** 固定 system prompt */
 const SYSTEM_PROMPT =
   '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。' +
   '信息不足，或有多种做法必须由用户决定时，调用 ask_user 提问并等待回答。能从代码或命令里查到的不要问，一次只问一个问题。' +
-  '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。'
+  '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。' +
+  '写入、修改和执行命令会先经过权限审批。如果工具返回 permission denied，不要原样重试，向用户说明原因或改用更安全的做法。'
 
 async function main() {
   // --version 在加载配置之前处理。查版本不该要求先配好 API Key。
@@ -92,12 +96,16 @@ async function main() {
 
   const logger = createLoggerFromConfig(config)
 
-  const model: Model = {
-    apiKey: config.ApiKey,
-    model: config.Model,
-    baseUrl: config.BaseUrl,
-    maxTokens: config.MaxTokens,
-  }
+  // 三个模型各干各的:小模型起标题和判断压缩,主力模型对话,审批模型放行副作用。
+  const models = buildModelRoster(config)
+  logger.info({
+    primaryModel: models.primary.model,
+    smallModel: models.small.model,
+    approvalModel: models.approval.model,
+    primaryBaseUrl: models.primary.baseUrl,
+    smallBaseUrl: models.small.baseUrl,
+    approvalBaseUrl: models.approval.baseUrl,
+  }, '模型分工已就绪')
 
   // 传输层在进程内共享，保证并发闸门对所有请求生效
   const transport = createTransport({
@@ -108,6 +116,7 @@ async function main() {
     maxConcurrency: config.MaxConcurrency,
     logger,
   })
+  const approve = createModelApprover(models.approval, { transport, logger })
 
   // 会话存储:SQLite,多进程可同时读写同一个库。
   // 每个进程用独立 sessionId,各存各的会话,互不干扰。
@@ -445,7 +454,8 @@ async function main() {
       if (sessions.length === 0) return '还没有任何会话'
       const lines = sessions.map((session) => {
         const marker = session.id === sessionStore.sessionId ? '*' : ' '
-        return `${marker} ${session.id}  (${session.messageCount} 条消息)`
+        const title = session.title ? `${session.title} · ` : ''
+        return `${marker} ${title}${session.id}  (${session.messageCount} 条消息)`
       })
       return lines.join('\n')
     },
@@ -639,7 +649,8 @@ async function main() {
       // 空闲状态的 Ctrl+C 是退出进程,会把请求和会话收尾一起掐掉。
       tui.setBusy(true)
       try {
-        await compactContext(model, context, undefined, {
+        // 摘要走小模型,和自动压缩一致——压缩的活不该占主力模型。
+        await compactContext(models.small, context, undefined, {
           transport,
           logger,
           force: true,
@@ -800,17 +811,29 @@ async function main() {
               content: appendHookContext(effectiveText, promptEffect.additionalContext),
             })
 
-            for await (const ev of runAgent(model, context, tools, ctrl.signal, {
+            // 标题交给小模型,和主力模型的这一轮叠在一起跑,不挡回复。
+            const titleTask = ensureSessionTitle({
+              store: sessionStore,
+              model: models.small,
+              userText: text,
+              signal: ctrl.signal,
+              transport,
+              logger,
+            })
+
+            for await (const ev of runAgent(models.primary, context, tools, ctrl.signal, {
               transport,
               logger,
               toolExecution: config.ToolExecution,
+              compactionModel: models.small,
+              approve,
+              hooks: hookRunner,
               compaction: {
                 contextWindow: config.ContextWindow,
                 reserveTokens: config.CompactReserveTokens,
                 keepRecentTokens: config.CompactKeepRecentTokens,
               },
-              hooks: hookRunner,
-              // 只有本地世界才给工作区根:远程的路径在另一台机器上,
+// 只有本地世界才给工作区根:远程的路径在另一台机器上,
               // 本机解析出来的结论是错的。全权限模式没有边界,
               // 报 insideWorkspace=false 反而会误导钩子。
               workspaceRoot: config.ExecutionWorld === 'remote'
@@ -821,6 +844,9 @@ async function main() {
               switch (ev.type) {
                 case 'assistant_text': tui.printText(ev.delta); break
                 case 'tool_call': tui.printToolCall(ev.name, ev.args); break
+                case 'permission':
+                  tui.printNotice(`${ev.allowed ? '审批通过' : '审批拒绝'} ${ev.name}: ${ev.reason}`)
+                  break
                 case 'tool_result': tui.printToolResult(ev.name, ev.result); break
                 case 'hook_notice':
                   if (ev.level === 'error') tui.printError(ev.message)
@@ -835,6 +861,9 @@ async function main() {
                   break
               }
             }
+
+            const title = await titleTask
+            if (title) tui.printNotice(`会话标题: ${title}`)
 
             await sessionStore.sync(context.messages)
           }
@@ -862,7 +891,10 @@ async function main() {
     void runInput(text)
   })
 
-  tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。')
+  tui.printHeader(
+    `GrassAgent 已启动。对话 ${models.primary.model}，标题和压缩 ${models.small.model}，审批 ${models.approval.model}。` +
+      '输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。',
+  )
   if (instructionNotice) tui.printNotice(instructionNotice)
   for (const message of skillNotices) tui.printNotice(message)
   for (const message of sessionNotices) tui.printNotice(message)

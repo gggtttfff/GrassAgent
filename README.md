@@ -47,11 +47,14 @@ src/
     protocol.ts  Provider 协议 + 注册表
     messages.ts  内部消息模型（provider 无关）
     compaction.ts 压缩层：决定发给模型看哪一段，不改历史
+    completeText.ts 不带工具的一次性文本补全
+    modelRoster.ts 三个模型角色：小模型 / 主力模型 / 审批模型
     providers/   按厂商分文件：openai.ts 等
 
   agent/         回合循环与工具
     agent.ts     Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
     tools.ts     内置工具：read_file / write_file / edit / edit_batch / run_bash
+    approval.ts  审批模型判断写文件和命令能不能执行
     askUser.ts   向用户提问。工具本身不碰终端，怎么问由调用方注入
     hooks.ts     钩子运行时：命令 / 函数、拒绝、改写、超时
     hookConfig.ts 钩子配置：读取并校验 hooks.json
@@ -65,6 +68,7 @@ src/
   session/       会话持久化
     sessionStore.ts   SQLite 存储（node:sqlite，零依赖）
     sessionBundle.ts  会话包：把 SQLite 里的对话收成 JSON，再导回来
+    sessionTitle.ts   小模型生成会话标题
 
   ui/            终端界面
     tui.ts          组件树 + 差分渲染 + markdown 排版
@@ -366,8 +370,16 @@ echo "读一下 README.md" | npm start
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
 | `GRASSAGENT_API_KEY` | API 密钥（必填） | 无 |
-| `GRASSAGENT_MODEL` | 模型名称 | `gpt-4o-mini` |
-| `GRASSAGENT_BASE_URL` | API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_MODEL` | 主力模型，负责对话和解决问题 | `gpt-4o-mini` |
+| `GRASSAGENT_BASE_URL` | 主力模型 API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_SMALL_MODEL` | 小模型，负责标题和压缩摘要。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_SMALL_BASE_URL` | 小模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_SMALL_API_KEY` | 小模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_SMALL_MAX_TOKENS` | 小模型单次生成上限。留空则用 `GRASSAGENT_MAX_TOKENS` | 主力上限 |
+| `GRASSAGENT_APPROVAL_MODEL` | 审批模型，决定写文件和命令能不能执行。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_APPROVAL_BASE_URL` | 审批模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_APPROVAL_API_KEY` | 审批模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_APPROVAL_MAX_TOKENS` | 审批模型单次生成上限 | `512` |
 | `GRASSAGENT_WORKSPACE` | 工作区沙箱根目录 | 进程启动目录 |
 | `GRASSAGENT_COMMAND_TIMEOUT_MS` | `run_bash` 超时（毫秒） | `3000` |
 | `GRASSAGENT_MAX_TOKENS` | 单次生成上限 | `4096` |
@@ -426,7 +438,9 @@ echo "读一下 README.md" | npm start
 
 管道输入时，回合进行中到达的下一行先排队。提问就用这一行当回答；没人问的话，本轮结束再按顺序开下一轮。输入已经结束（EOF）还在等回答时，工具返回「没有用户可以回答」，模型按现有信息继续，进程不会挂住。
 
-**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，先让模型把旧消息总结成结构化摘要（目标、约束、进展、决定、验证记录、下一步），之后发给模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**模型分工。** 三个角色不串岗。主力模型只负责对话和调用工具把问题解决掉。小模型负责给会话起标题，以及在需要压缩时写出摘要。审批模型只在写文件、改文件、执行命令之前决定放不放行；读文件仍只过路径沙箱。没单独配置的角色会继承主力模型，旧的单模型配置不用改也能跑。审批请求失败，或者结论解析不了，一律拒绝执行。
+
+**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，由小模型把旧消息总结成结构化摘要（目标、约束、进展、决定、验证记录、下一步），之后发给主力模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
 
 摘要里的**验证记录**不能省：什么检查跑过、什么失败了、为什么失败。丢掉的只能是过程，不能是依据——依据丢了，模型会推翻既定决策或者重犯旧错。`/compact` 手动触发时还能用参数引导摘要的重点，比如 `/compact 保留验证记录和每个决策的理由`。
 

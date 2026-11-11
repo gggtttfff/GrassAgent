@@ -13,11 +13,11 @@ cli.ts                  唯一入口：拼装所有簇，自己不被任何模�
   ↓
 ui/         tui / theme / sessionPicker / nonInteractiveTerminal / lineQueue / slashCommands
   ↓
-agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands
+agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands / approval
   ↓
-llm/        llm / protocol / messages / compaction / providers/
+llm/        llm / protocol / messages / compaction / completeText / modelRoster / providers/
 instructions/ projectInstructions / skills
-session/    sessionStore / sessionBundle
+session/    sessionStore / sessionBundle / sessionTitle
 sandbox/    daemon / docker·inProcess·ssh 后端 / 控制面 / remoteWorld
   ↓
 world/      executionWorld / localWorld / outputBound / approvalGate / modeSwitch
@@ -206,6 +206,8 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 **69. 提示模板命令不走本地命令表。** `.grass/prompts/*.md` 每份变成一条斜杠命令，但执行等价于「把展开后的正文当成一条用户消息发给模型」——这样钩子、会话存储、回合计数都不用另外接一遍。模板命令不进 `SlashCommandRegistry`，命令名和内置命令冲突时不注册（内置优先）。
 
 **70. 示例配置不要放在默认生效路径上。** `.grass/hooks.json` 是默认读取路径，把它放在那里等于默认启用——CLI 测试的 cwd 就是仓库根，会读到它，钩子脚本一跑就把测试搞挂。示例放 `.grass/hooks/hooks.example.json`，让用户自己拷过去。
+
+**71. 三类模型不要串岗。** 标题和压缩摘要走小模型，对话和工具循环走主力模型，写文件和命令的放行走审批模型。什么时候压缩由 token 预算决定，不由小模型再否决一次。审批失败、抛错或结果无法解析时拒绝执行，不要默许。`world/approvalGate.ts` 管的是人要不要点头，和审批模型不是同一条路。
 
 ## 已知取舍
 

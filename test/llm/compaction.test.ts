@@ -491,3 +491,12 @@ test('估算 token 时遇到嵌套过深的工具参数不会爆栈', () => {
   }
   assert.equal(Number.isFinite(estimateMessageTokens(message)), true)
 })
+
+test('还没有摘要时,发给模型的仍是完整历史', () => {
+  const messages = plainMessages(4)
+  const view = buildModelMessages(
+    { messages },
+    { summarizedCount: 0, summary: '' },
+  )
+  assert.deepEqual(view, messages)
+})
