@@ -12,7 +12,6 @@ import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Logger } from '../core/logger.ts'
-import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
 
 /** daemon 及其依赖。相对本仓库根目录。 */
 const DAEMON_SOURCES = [
@@ -34,6 +33,13 @@ export type RemoteDaemon = {
   port: number
   /** 远程上的工作目录。销毁时要清掉。 */
   remoteDirectory: string
+  /**
+   * 读 daemon.log 的尾部。
+   *
+   * 健康检查是走隧道做的,那边拿不到远程日志——失败时拼进错误里,
+   * 才不至于只剩一句「daemon 没起来」。
+   */
+  readLogTail: (maxChars?: number) => Promise<string>
   stop: () => Promise<void>
 }
 
@@ -115,11 +121,21 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
 
   await runRemote(client, startCommand, logger)
   const port = await discoverDaemonPort(client, logPath, logger)
-  await waitForDaemon(client, port, options.token, logger)
 
+  // 探活交给调用方走隧道做——那才是请求真正要过的路。
+  // 以前在这里用 curl 探,除了重复一次,还会把令牌放进远程的进程命令行,
+  // 同一台机器上任何人 ps 一下就能看到。
   return {
     port,
     remoteDirectory,
+    readLogTail: async (maxChars = 800) => {
+      const output = await runRemote(
+        client,
+        `cat ${shellQuote(logPath)} 2>/dev/null || true`,
+        logger,
+      )
+      return output.slice(-maxChars)
+    },
     stop: async () => {
       // 先按 PID 精准杀,再按路径兜底。两条都失败也不能挡住清理。
       await runRemote(
@@ -172,39 +188,6 @@ async function discoverDaemonPort(
     await delay(300)
   }
   throw new Error(`远程 daemon 没有报出监听端口: ${lastLog.trim().slice(-400) || '(日志为空)'}`)
-}
-
-/**
- * 等远程 daemon 起来。
- *
- * 用 health 调用探活,不用 sleep 猜时间。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-async function waitForDaemon(
-  client: Client,
-  port: number,
-  token: string,
-  logger?: Logger,
-): Promise<void> {
-  const deadline = Date.now() + 30_000
-  let lastError = ''
-  while (Date.now() < deadline) {
-    const output = await runRemote(
-      client,
-      [
-        `curl -sS -m 5 -X POST http://127.0.0.1:${port}/call`,
-        `-H 'content-type: application/json'`,
-        `-H 'authorization: Bearer ${token}'`,
-        `--data '{"version":${SANDBOX_PROTOCOL_VERSION},"kind":"health"}'`,
-      ].join(' '),
-      logger,
-    )
-    if (output.includes('"ok":true')) return
-    lastError = output.trim()
-    await delay(500)
-  }
-  throw new Error(`远程 daemon 没起来: ${lastError || '探活超时'}`)
 }
 
 /**

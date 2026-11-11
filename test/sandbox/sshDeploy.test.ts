@@ -137,7 +137,8 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
             return
           }
           if (info.command.includes('curl')) {
-            stream.write('{"ok":true,"version":1}\n')
+            // 探活已经改走隧道,远程再出现 curl 就是回退了
+            stream.write('unexpected-curl\n')
             stream.exit(0)
             stream.end()
             return
@@ -270,6 +271,19 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
       remote.commands.some((command) => command.includes('cat >')),
       false,
       '写文件应该走 SFTP,不该用 shell 重定向',
+    )
+
+    // 令牌只走 0600 文件。进命令行的话,同机任何人 ps 一下就看到了
+    assert.equal(
+      remote.commands.some((command) => command.includes('secret-token')),
+      false,
+      '令牌不能出现在远程命令行里',
+    )
+    // 探活改成走隧道,远程不该再跑 curl
+    assert.equal(
+      remote.commands.some((command) => command.includes('curl')),
+      false,
+      '探活应该走隧道,不该在远程跑 curl',
     )
 
     await rm(remoteRoot, { recursive: true, force: true })

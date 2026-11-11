@@ -192,6 +192,14 @@ export const configSchema = z.object({
   SandboxSshTimeoutMs: numericOption({
     minimum: 1_000, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshTimeoutMs',
   }),
+  // 等远程 daemon 健康的超时(毫秒)。
+  SandboxSshHealthTimeoutMs: numericOption({
+    minimum: 1_000, maximum: 120_000, defaultValue: 30_000, label: 'SandboxSshHealthTimeoutMs',
+  }),
+  // 单次沙盒调用的超时(毫秒)。exec 按命令自己的超时另算。
+  SandboxSshCallTimeoutMs: numericOption({
+    minimum: 1_000, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshCallTimeoutMs',
+  }),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
@@ -294,6 +302,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxSshKnownHostsPath: `${ENV_PREFIX}SANDBOX_SSH_KNOWN_HOSTS_PATH`,
   SandboxSshWorkspace: `${ENV_PREFIX}SANDBOX_SSH_WORKSPACE`,
   SandboxSshTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_TIMEOUT_MS`,
+  SandboxSshHealthTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_HEALTH_TIMEOUT_MS`,
+  SandboxSshCallTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_CALL_TIMEOUT_MS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

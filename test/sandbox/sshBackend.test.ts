@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { createServer, request as httpRequest } from 'node:http'
+import { createServer } from 'node:http'
 import { connect } from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -37,10 +37,11 @@ type FakeRemote = {
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
-async function startFakeRemote(): Promise<FakeRemote> {
+async function startFakeRemote(options: { daemonVersion?: number } = {}): Promise<FakeRemote> {
   const keyPair = utils.generateKeyPairSync('ed25519')
   const sockets: Array<{ destroy: () => void }> = []
   const forwardedSockets: Array<{ destroy: () => void }> = []
+  const daemonVersion = options.daemonVersion ?? SANDBOX_PROTOCOL_VERSION
 
   // 冒充远程 daemon:收 /call,回健康检查
   const daemonServer = createServer((request, response) => {
@@ -49,7 +50,7 @@ async function startFakeRemote(): Promise<FakeRemote> {
     request.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as { kind: string }
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ ok: true, version: SANDBOX_PROTOCOL_VERSION, kind: body.kind }))
+      response.end(JSON.stringify({ ok: true, version: daemonVersion, kind: body.kind }))
     })
   })
   await new Promise<void>((resolve) => daemonServer.listen(0, '127.0.0.1', () => resolve()))
@@ -155,16 +156,10 @@ async function startFakeRemote(): Promise<FakeRemote> {
             return
           }
           if (info.command.includes('curl')) {
-            // 探活打到真的 daemon 服务上
-            callDaemon(daemonPort, info.command).then((body) => {
-              stream.write(body)
-              stream.exit(0)
-              stream.end()
-            }, () => {
-              stream.write('')
-              stream.exit(1)
-              stream.end()
-            })
+            // 探活改走隧道了。远程再跑 curl 说明回退了,让它失败暴露出来
+            stream.write('unexpected-curl\n')
+            stream.exit(0)
+            stream.end()
             return
           }
           if (info.command.includes('daemon.log')) {
@@ -198,39 +193,6 @@ async function startFakeRemote(): Promise<FakeRemote> {
       setTimeout(resolve, 2000).unref?.()
     }),
   }
-}
-
-/**
- * 把 curl 命令行翻译成一次真实的 HTTP 请求,返回响应体。
- *
- * 假远程不需要真的调 curl——它只要把请求打到 daemon 上。
- *
- * 作者：Pieory 创建日期：2025-07-18
- */
-function callDaemon(port: number, command: string): Promise<string> {
-  const bodyMatch = command.match(/--data\s+'([^']*)'/)
-  const body = bodyMatch ? bodyMatch[1] : '{}'
-  const tokenMatch = command.match(/Bearer\s+(\S+)/)
-  return new Promise((resolve, reject) => {
-    const request = httpRequest({
-      host: '127.0.0.1',
-      port,
-      path: '/call',
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${tokenMatch ? tokenMatch[1] : ''}`,
-        'content-length': Buffer.byteLength(body),
-      },
-    }, (response) => {
-      let received = ''
-      response.on('data', (chunk: Buffer) => { received += chunk.toString() })
-      response.on('end', () => resolve(received))
-    })
-    request.on('error', reject)
-    // 声明了 content-length 就必须真的把体写出去,否则服务端一直等
-    request.end(body)
-  })
 }
 
 async function makeKeyFile(): Promise<{ keyPath: string; directory: string }> {
@@ -284,6 +246,42 @@ test('SSH 后端:创建沙盒后能通过隧道转发调用', { timeout: 40_000 
     assert.equal(result.version, SANDBOX_PROTOCOL_VERSION)
 
     await sandbox.destroy({ removeVolume: true })
+  } finally {
+    await remote.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('SSH 后端:daemon 协议版本对不上时创建失败', { timeout: 40_000 }, async () => {
+  const remote = await startFakeRemote({ daemonVersion: 999 })
+  const { keyPath, directory } = await makeKeyFile()
+  try {
+    const backend = createSshBackend({
+      host: '127.0.0.1',
+      port: remote.port,
+      username: 'dev',
+      privateKeyPath: keyPath,
+      knownHostsPath: path.join(directory, 'known_hosts'),
+      remoteWorkspace: '/tmp/grass-sb-version',
+      logger: silentLogger,
+    })
+
+    // 版本对不上重试也没用,要立刻失败并说明原因
+    await assert.rejects(
+      () => backend.provision({
+        sandboxId: 'sb-version',
+        token: 'test-token-123456',
+        image: '',
+        repoUrl: '',
+        credential: null,
+        cpu: 1,
+        memoryMb: 1024,
+        diskMb: 1024,
+        networkAllowlist: [],
+        keep: false,
+      }),
+      /健康检查失败.*999/,
+    )
   } finally {
     await remote.close()
     await rm(directory, { recursive: true, force: true })

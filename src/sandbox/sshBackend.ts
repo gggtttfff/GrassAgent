@@ -31,9 +31,26 @@ export type SshBackendOptions = {
   remoteWorkspace?: string
   /** 远程上放 daemon 源码的根目录。默认 /tmp。 */
   remoteRoot?: string
+  /** 等 daemon 健康的超时(毫秒)。 */
+  healthTimeoutMs?: number
+  /** 单次调用的超时(毫秒)。exec 按它自己的超时另算。 */
+  callTimeoutMs?: number
   timeoutMs?: number
   logger?: Logger
 }
+
+/** 健康检查固定 3 秒:它只是确认端口接得住请求,不该等太久。 */
+const HEALTH_CALL_TIMEOUT_MS = 3_000
+
+/** 等 daemon 健康的总时长。 */
+const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
+
+/** 普通调用的超时。exec 另外按它自己的 timeoutMs 放宽。 */
+const DEFAULT_CALL_TIMEOUT_MS = 30_000
+
+/** exec 在本机这一侧要留出往返和排队的时间。 */
+const EXEC_TIMEOUT_MARGIN_MS = 5_000
+const EXEC_TIMEOUT_CEILING_MS = 600_000
 
 /**
  * 创建 SSH 后端。
@@ -75,15 +92,15 @@ async function provision(
       dstPort: daemon.port,
       logger: options.logger,
     })
-    // 走一遍协议,确认远程 daemon 的版本对得上。
-    const health = await postCall(tunnel.localPort, request.token, {
-      version: SANDBOX_PROTOCOL_VERSION,
-      kind: 'health',
+    // 走一遍协议,确认远程 daemon 起来了、版本也对得上。
+    await waitForHealthy({
+      localPort: tunnel.localPort,
+      token: request.token,
+      daemon,
+      timeoutMs: options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
+      logger: options.logger,
     })
-    if (!health.ok || health.version !== SANDBOX_PROTOCOL_VERSION) {
-      throw new Error(`远端协议版本不符: ${health.ok ? health.version : health.error}`)
-    }
-    return runningFrom(client, daemon, tunnel, request)
+    return runningFrom(client, daemon, tunnel, request, options)
   } catch (error) {
     // 清理已经起来的部分。顺序反过来:先断隧道,再停 daemon,最后断连接。
     if (tunnel) await tunnel.close().catch(() => undefined)
@@ -112,7 +129,9 @@ function runningFrom(
   daemon: RemoteDaemon,
   tunnel: SshTunnel,
   request: ProvisionRequest,
+  options: SshBackendOptions,
 ): RunningSandbox {
+  const baseTimeoutMs = options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS
   return {
     sandboxId: request.sandboxId,
     // 模型看到的根固定是 /workspace,真实路径在远程那一侧。
@@ -120,7 +139,12 @@ function runningFrom(
     token: request.token,
     localWorkspace: daemon.remoteDirectory,
     keep: request.keep,
-    forward: (call) => postCall(tunnel.localPort, request.token, call),
+    forward: (call) => postCall(
+      tunnel.localPort,
+      request.token,
+      call,
+      callTimeoutMs(call, baseTimeoutMs),
+    ),
     destroy: async ({ removeVolume }) => {
       await tunnel.close().catch(() => undefined)
       await daemon.stop().catch(() => undefined)
@@ -129,6 +153,50 @@ function runningFrom(
       void removeVolume
     },
   }
+}
+
+/** exec 的超时管的是远程那条命令,本机这一侧要留出往返和排队的时间。 */
+function callTimeoutMs(call: SandboxCall, baseTimeoutMs: number): number {
+  if (call.kind !== 'exec') return baseTimeoutMs
+  return Math.min((call.timeoutMs ?? 3_000) + EXEC_TIMEOUT_MARGIN_MS, EXEC_TIMEOUT_CEILING_MS)
+}
+
+/**
+ * 等远程 daemon 健康。
+ *
+ * 走隧道探,和真实调用走同一条路——这样「能探通」就等于「能干活」。
+ * 端口已经从日志里读到了,正常情况第一次就成功;重试是给
+ * 「端口刚绑上、请求还没接住」留一点余量。
+ */
+async function waitForHealthy(options: {
+  localPort: number
+  token: string
+  daemon: RemoteDaemon
+  timeoutMs: number
+  logger?: Logger
+}): Promise<void> {
+  const deadline = Date.now() + options.timeoutMs
+  let lastError = '探活超时'
+  while (Date.now() < deadline) {
+    const health = await postCall(options.localPort, options.token, {
+      version: SANDBOX_PROTOCOL_VERSION,
+      kind: 'health',
+    }, HEALTH_CALL_TIMEOUT_MS)
+    if (health.ok && health.version === SANDBOX_PROTOCOL_VERSION) return
+    lastError = health.ok ? `远端协议版本 ${health.version}` : `${health.code}: ${health.error}`
+    // 版本对不上重试也没用,是两边代码不一样
+    if (!health.ok && health.code === 'version') break
+    await delay(300)
+  }
+  // 健康检查在隧道这一侧,拿不到远程日志。拼进来才好排查。
+  const logTail = await options.daemon.readLogTail().catch(() => '')
+  throw new Error(
+    `远程 daemon 健康检查失败: ${lastError}${logTail.trim() ? `; daemon.log 尾部: ${logTail.trim()}` : ''}`,
+  )
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
@@ -140,6 +208,7 @@ async function postCall(
   localPort: number,
   token: string,
   call: SandboxCall,
+  timeoutMs: number = DEFAULT_CALL_TIMEOUT_MS,
 ): Promise<SandboxResult> {
   let response: Response
   try {
@@ -150,6 +219,9 @@ async function postCall(
         authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(call),
+      // 隧道半死不活时 fetch 会一直挂着,工具调用就再也回不来了。
+      // 超时统一变成 unavailable,交给上层判断是不是要重连。
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
     return { ok: false, code: 'unavailable', error: 'sandbox unavailable' }

@@ -109,6 +109,8 @@ async function openInProcessControlPlane(
     password: config.SandboxSshPassword,
     knownHostsPath: config.SandboxSshKnownHostsPath,
     remoteWorkspace: config.SandboxSshWorkspace,
+    healthTimeoutMs: config.SandboxSshHealthTimeoutMs,
+    callTimeoutMs: config.SandboxSshCallTimeoutMs,
     timeoutMs: config.SandboxSshTimeoutMs,
   })
   const plane = createControlPlane({ backend, controlToken: config.SandboxControlToken })
