@@ -390,6 +390,8 @@ async function assertWorkspaceWritable(
       client,
       `test -w ${shellQuote(workspace)} && test -x ${shellQuote(workspace)}`,
       logger,
+      // 不可写的情况下面会换成带配置提示的报错,原始 ERROR 只是噪音
+      { quietFailure: true },
     )
   } catch {
     throw new Error(
@@ -539,7 +541,8 @@ export async function sweepOrphanDirectories(options: SweepOptions): Promise<str
 /** 远程进程还活着吗。挂回时用来判断要不要重新起 daemon。 */
 export async function pidIsAlive(client: Client, pid: number, logger?: Logger): Promise<boolean> {
   try {
-    await runRemote(client, `kill -0 ${pid}`, logger)
+    // 进程已经死掉时 kill -0 会非 0 退出,那是正常结果,不是错误
+    await runRemote(client, `kill -0 ${pid}`, logger, { quietFailure: true })
     return true
   } catch {
     return false
@@ -553,7 +556,8 @@ export async function remotePathExists(
   logger?: Logger,
 ): Promise<boolean> {
   try {
-    await runRemote(client, `test -e ${shellQuote(remotePath)}`, logger)
+    // 路径不存在时 test 会非 0 退出,那是正常结果
+    await runRemote(client, `test -e ${shellQuote(remotePath)}`, logger, { quietFailure: true })
     return true
   } catch {
     return false
@@ -617,6 +621,7 @@ export function runRemote(
   client: Client,
   command: string,
   logger?: Logger,
+  options: { quietFailure?: boolean } = {},
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     client.exec(command, (error, stream) => {
@@ -641,7 +646,11 @@ export function runRemote(
         const output = Buffer.concat(stdout).toString('utf-8')
         if (code !== 0) {
           const errorOutput = Buffer.concat(stderr).toString('utf-8')
-          logger?.error({ exitCode: code, command: command.slice(0, 200) }, '远程命令失败')
+          // 有些命令非 0 退出是正常结果(比如 kill -0 判断进程死没死)。
+          // 那种情况交给调用方判断,别打成错误把排查方向带偏。
+          if (!options.quietFailure) {
+            logger?.error({ exitCode: code, command: command.slice(0, 200) }, '远程命令失败')
+          }
           reject(new Error(`远程命令失败(${code}): ${errorOutput.trim() || output.trim()}`))
           return
         }
