@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
@@ -26,6 +26,19 @@ const silentLogger = createLogger({
   format: 'json',
   destination: new Writable({ write(_chunk, _encoding, callback) { callback() } }),
 })
+
+/**
+ * 这个测试文件专用的远程根目录。
+ *
+ * 不能和其他测试文件共用 /tmp:node:test 会并行跑多个文件,
+ * 两边同时部署同一份源码会抢同一个 hash 目录。
+ */
+const REMOTE_ROOT = '/tmp/grass-it-backend'
+
+/** 把远程 POSIX 路径换成假远程真正写盘的位置。 */
+function toLocalPath(remotePath: string): string {
+  return path.join(path.parse(process.cwd()).root, remotePath)
+}
 
 type FakeRemote = {
   port: number
@@ -108,14 +121,61 @@ async function startFakeRemote(options: { daemonVersion?: number } = {}): Promis
             }
             return true
           })
-          sftp.on('OPEN', (reqid, filename) => {
+          sftp.on('OPEN', (reqid, filename, flags) => {
             const handle = `h${handles.size}`
             handles.set(handle, filename)
+            // 只有「写打开」才清空文件。读打开也清空的话,readFile 永远读到空。
+            if (flags & 0x00000002) {
+              try {
+                writeFileSync(filename, '')
+              } catch {
+                sftp.status(reqid, 2)
+                return true
+              }
+            }
+            sftp.handle(reqid, Buffer.from(handle))
+            return true
+          })
+          sftp.on('STAT', (reqid, target) => {
+            // ssh2 的 readFile 会先 stat 一次拿文件大小,没有这个处理器就报 unsupported
             try {
-              writeFileSync(filename, '')
-              sftp.handle(reqid, Buffer.from(handle))
+              const stats = statSync(target)
+              sftp.attrs(reqid, {
+                mode: stats.isDirectory() ? 0o040755 : 0o100644,
+                uid: 0,
+                gid: 0,
+                size: stats.size,
+                atime: Math.floor(stats.atimeMs / 1000),
+                mtime: Math.floor(stats.mtimeMs / 1000),
+              })
             } catch {
               sftp.status(reqid, 2)
+            }
+            return true
+          })
+          sftp.on('READ', (reqid, handle, offset, length) => {
+            const target = handles.get(handle.toString())
+            if (!target) {
+              sftp.status(reqid, 4)
+              return true
+            }
+            try {
+              const content = readFileSync(target)
+              const slice = content.subarray(offset, offset + length)
+              // 读到头要回 EOF 状态,不然客户端会一直读下去
+              if (slice.length === 0) sftp.status(reqid, 1)
+              else sftp.data(reqid, slice)
+            } catch {
+              sftp.status(reqid, 4)
+            }
+            return true
+          })
+          sftp.on('RENAME', (reqid, from, to) => {
+            try {
+              renameSync(from, to)
+              sftp.status(reqid, 0)
+            } catch {
+              sftp.status(reqid, 4)
             }
             return true
           })
@@ -216,7 +276,8 @@ test('SSH 后端:创建沙盒后能通过隧道转发调用', { timeout: 40_000 
       privateKeyPath: keyPath,
       knownHostsPath: path.join(directory, 'known_hosts'),
       // 远程是 Linux,工作区用 POSIX 路径。部署会把它建出来。
-      remoteWorkspace: '/tmp/grass-sb-workspace',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-sb1`,
+      remoteRoot: REMOTE_ROOT,
       logger: silentLogger,
     })
 
@@ -249,6 +310,7 @@ test('SSH 后端:创建沙盒后能通过隧道转发调用', { timeout: 40_000 
   } finally {
     await remote.close()
     await rm(directory, { recursive: true, force: true })
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
   }
 })
 
@@ -262,7 +324,8 @@ test('SSH 后端:daemon 协议版本对不上时创建失败', { timeout: 40_000
       username: 'dev',
       privateKeyPath: keyPath,
       knownHostsPath: path.join(directory, 'known_hosts'),
-      remoteWorkspace: '/tmp/grass-sb-version',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-version`,
+      remoteRoot: REMOTE_ROOT,
       logger: silentLogger,
     })
 
@@ -285,6 +348,7 @@ test('SSH 后端:daemon 协议版本对不上时创建失败', { timeout: 40_000
   } finally {
     await remote.close()
     await rm(directory, { recursive: true, force: true })
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
   }
 })
 

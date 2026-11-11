@@ -24,8 +24,8 @@ export type SshConnectionConfig = {
   password: string | null
   /** known_hosts 的绝对路径。空则用 ~/.ssh/known_hosts。 */
   knownHostsPath: string
-  /** 远程工作区的真实路径。模型看到的是 /workspace,这里对应远程的真实目录。 */
-  remoteWorkspace: string
+  /** 远程工作区的真实路径。留空时由部署阶段用远程的 $HOME 推出来。 */
+  remoteWorkspace: string | null
   /** 连接和握手超时(毫秒)。 */
   timeoutMs: number
 }
@@ -70,7 +70,7 @@ export function resolveSshConfig(input: SshConfigInput): SshConnectionConfig {
   const knownHostsPath = input.knownHostsPath?.trim()
     ? path.resolve(expandHome(input.knownHostsPath.trim()))
     : path.join(os.homedir(), '.ssh', 'known_hosts')
-  const remoteWorkspace = input.remoteWorkspace?.trim() || '/workspace'
+  const remoteWorkspace = input.remoteWorkspace?.trim() || null
   const agentPath = input.agentPath?.trim() || defaultAgentPath()
 
   return {

@@ -188,7 +188,15 @@ export const configSchema = z.object({
   // known_hosts 文件。留空用 ~/.ssh/known_hosts。主机密钥变化时连接会被拒绝。
   SandboxSshKnownHostsPath: optionalText('SandboxSshKnownHostsPath'),
   // 远程工作区的真实路径。模型看到的是 /workspace,这里对应远程机器上的目录。
+  // 留空则用远程用户的 $HOME/grass-workspace。
   SandboxSshWorkspace: optionalText('SandboxSshWorkspace'),
+  // 远程上放 daemon 源码和沙盒目录的根。默认 /tmp。
+  SandboxSshRemoteRoot: z.preprocess(
+    emptyToUndefined,
+    z.string()
+      .regex(/^\/[^\0\r\n]*$/, { error: 'SandboxSshRemoteRoot 必须是绝对 POSIX 路径' })
+      .default('/tmp'),
+  ),
   SandboxSshTimeoutMs: numericOption({
     minimum: 1_000, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshTimeoutMs',
   }),
@@ -301,6 +309,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxSshPassword: `${ENV_PREFIX}SANDBOX_SSH_PASSWORD`,
   SandboxSshKnownHostsPath: `${ENV_PREFIX}SANDBOX_SSH_KNOWN_HOSTS_PATH`,
   SandboxSshWorkspace: `${ENV_PREFIX}SANDBOX_SSH_WORKSPACE`,
+  SandboxSshRemoteRoot: `${ENV_PREFIX}SANDBOX_SSH_REMOTE_ROOT`,
   SandboxSshTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_TIMEOUT_MS`,
   SandboxSshHealthTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_HEALTH_TIMEOUT_MS`,
   SandboxSshCallTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_CALL_TIMEOUT_MS`,

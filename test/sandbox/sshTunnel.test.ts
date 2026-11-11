@@ -53,7 +53,8 @@ test('SSH 配置把私钥路径展开成绝对路径', () => {
   })
   assert.equal(config.privateKeyPath, path.join(os.homedir(), '.ssh', 'id_ed25519'))
   assert.equal(config.port, 22)
-  assert.equal(config.remoteWorkspace, '/workspace')
+  // 不写死 /workspace:那个路径通常要 root 才建得出来。留给部署阶段用 $HOME 推。
+  assert.equal(config.remoteWorkspace, null)
 })
 
 test('SSH 配置缺主机或用户时报错', () => {

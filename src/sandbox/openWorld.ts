@@ -109,6 +109,7 @@ async function openInProcessControlPlane(
     password: config.SandboxSshPassword,
     knownHostsPath: config.SandboxSshKnownHostsPath,
     remoteWorkspace: config.SandboxSshWorkspace,
+    remoteRoot: config.SandboxSshRemoteRoot,
     healthTimeoutMs: config.SandboxSshHealthTimeoutMs,
     callTimeoutMs: config.SandboxSshCallTimeoutMs,
     timeoutMs: config.SandboxSshTimeoutMs,

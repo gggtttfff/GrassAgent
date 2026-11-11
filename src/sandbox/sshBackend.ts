@@ -82,7 +82,7 @@ async function provision(
       client,
       sandboxId: request.sandboxId,
       token: request.token,
-      remoteWorkspace: config.remoteWorkspace,
+      remoteWorkspace: config.remoteWorkspace ?? undefined,
       diskMb: request.diskMb,
       remoteRoot: options.remoteRoot,
       logger: options.logger,

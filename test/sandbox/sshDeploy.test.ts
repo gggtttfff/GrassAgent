@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -29,10 +29,26 @@ const silentLogger = createLogger({
   destination: new Writable({ write(_chunk, _encoding, callback) { callback() } }),
 })
 
+/** 把远程 POSIX 路径换成假远程真正写盘的位置。 */
+function toLocalPath(remotePath: string): string {
+  return path.join(path.parse(process.cwd()).root, remotePath)
+}
+
+/**
+ * 这个测试文件专用的远程根目录。
+ *
+ * 不能和其他测试文件共用 /tmp:node:test 会并行跑多个文件,
+ * 两边同时部署同一份源码时会抢同一个 hash 目录,
+ * 输的那边会留下临时目录。
+ */
+const REMOTE_ROOT = '/tmp/grass-it-deploy'
+
 type FakeRemote = {
   port: number
   /** 收到的命令。 */
   commands: string[]
+  /** 以写方式打开的文件路径。用来判断有没有重复上传。 */
+  writes: string[]
   /** 远程报的 Node 版本。 */
   nodeVersion: string
   close: () => Promise<void>
@@ -41,6 +57,7 @@ type FakeRemote = {
 async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<FakeRemote> {
   const keyPair = utils.generateKeyPairSync('ed25519')
   const commands: string[] = []
+  const writes: string[] = []
   const nodeVersion = options.nodeVersion ?? 'v24.22.2'
   const sockets: Array<{ destroy: () => void }> = []
 
@@ -86,14 +103,62 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
             }
             return true
           })
-          sftp.on('OPEN', (reqid, filename) => {
+          sftp.on('OPEN', (reqid, filename, flags) => {
             const handle = `h${handles.size}`
             handles.set(handle, filename)
+            // 只有「写打开」才清空文件。读打开也清空的话,readFile 永远读到空。
+            if (flags & 0x00000002) {
+              writes.push(filename)
+              try {
+                writeFileSync(filename, '')
+              } catch {
+                sftp.status(reqid, 2)
+                return true
+              }
+            }
+            sftp.handle(reqid, Buffer.from(handle))
+            return true
+          })
+          sftp.on('STAT', (reqid, target) => {
+            // ssh2 的 readFile 会先 stat 一次拿文件大小,没有这个处理器就报 unsupported
             try {
-              writeFileSync(filename, '')
-              sftp.handle(reqid, Buffer.from(handle))
+              const stats = statSync(target)
+              sftp.attrs(reqid, {
+                mode: stats.isDirectory() ? 0o040755 : 0o100644,
+                uid: 0,
+                gid: 0,
+                size: stats.size,
+                atime: Math.floor(stats.atimeMs / 1000),
+                mtime: Math.floor(stats.mtimeMs / 1000),
+              })
             } catch {
               sftp.status(reqid, 2)
+            }
+            return true
+          })
+          sftp.on('READ', (reqid, handle, offset, length) => {
+            const target = handles.get(handle.toString())
+            if (!target) {
+              sftp.status(reqid, 4)
+              return true
+            }
+            try {
+              const content = readFileSync(target)
+              const slice = content.subarray(offset, offset + length)
+              // 读到头要回 EOF 状态,不然客户端会一直读下去
+              if (slice.length === 0) sftp.status(reqid, 1)
+              else sftp.data(reqid, slice)
+            } catch {
+              sftp.status(reqid, 4)
+            }
+            return true
+          })
+          sftp.on('RENAME', (reqid, from, to) => {
+            try {
+              renameSync(from, to)
+              sftp.status(reqid, 0)
+            } catch {
+              sftp.status(reqid, 4)
             }
             return true
           })
@@ -165,6 +230,7 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
   return {
     port: address.port,
     commands,
+    writes,
     nodeVersion,
     close: () => new Promise<void>((resolve) => {
       // 连接还在时 close 不回调。掐掉底层 socket 再关。
@@ -225,45 +291,56 @@ test('路径拆成逐级前缀,SFTP mkdir 才能从根往下建', () => {
   assert.deepEqual(pathLevels('/a//b/'), ['/a', '/a/b'])
 })
 
-test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000 }, async () => {
+test('部署把源码放进共享目录,令牌单独放沙盒目录', { timeout: 30_000 }, async () => {
   const remote = await startFakeRemote()
   const connection = await connectTo(remote)
+  let daemon: Awaited<ReturnType<typeof deployRemoteDaemon>> | undefined
   try {
-    await deployRemoteDaemon({
+    daemon = await deployRemoteDaemon({
       client: connection.client,
       sandboxId: 'test123',
       token: 'secret-token',
-      remoteWorkspace: '/tmp/grass-test123/workspace',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-test123`,
+      remoteRoot: REMOTE_ROOT,
       diskMb: 2048,
       logger: silentLogger,
     })
 
+    // 源码按内容 hash 放共享目录,沙盒自己的东西单独一个目录
+    assert.match(daemon.sourceDirectory, /\/grass-daemon-[0-9a-f]{16}$/)
+    assert.equal(daemon.remoteDirectory, `${REMOTE_ROOT}/grass-sandbox-test123`)
+
     // SFTP 写的是真磁盘。daemon 源码和它的依赖都要传过去。
-    const remoteRoot = path.join(path.parse(process.cwd()).root, 'tmp', 'grass-test123')
-    const daemonContent = await readFile(path.join(remoteRoot, 'src', 'sandbox', 'daemon.ts'), 'utf-8')
+    const sourceRoot = toLocalPath(daemon.sourceDirectory)
+    const sandboxRoot = toLocalPath(daemon.remoteDirectory)
+    const daemonContent = await readFile(path.join(sourceRoot, 'src', 'sandbox', 'daemon.ts'), 'utf-8')
     // 用 fileURLToPath 而不是 url.pathname。Windows 上 pathname 是 /B:/...,
-// 去掉开头的斜杠恰好能用;Linux 上是 /home/..., 去掉就变成相对路径了。
+    // 去掉开头的斜杠恰好能用;Linux 上是 /home/..., 去掉就变成相对路径了。
     const localDaemonPath = fileURLToPath(new URL('../../src/sandbox/daemon.ts', import.meta.url))
     const localDaemon = await readFile(localDaemonPath, 'utf-8')
     assert.equal(daemonContent, localDaemon, '传过去的 daemon 源码要和本地一致')
 
     // 依赖也传了
     for (const dependency of ['world/executionWorld.ts', 'core/pathGuard.ts', 'world/localWorld.ts']) {
-      const exists = await stat(path.join(remoteRoot, 'src', dependency)).then(() => true, () => false)
+      const exists = await stat(path.join(sourceRoot, 'src', dependency)).then(() => true, () => false)
       assert.equal(exists, true, `${dependency} 应该传过去`)
     }
 
-    // 令牌单独放一个文件,内容对得上
-    const tokenContent = await readFile(path.join(remoteRoot, 'token'), 'utf-8')
+    // 完成标记最后写,内容是完整 hash。下次部署靠它判断要不要重传。
+    assert.match(await readFile(path.join(sourceRoot, '.complete'), 'utf-8'), /^[0-9a-f]{64}$/)
+
+    // 令牌单独放沙盒目录,内容对得上
+    const tokenContent = await readFile(path.join(sandboxRoot, 'token'), 'utf-8')
     assert.equal(tokenContent, 'secret-token')
 
-    // 启动命令要绑回环、指向传过去的路径、指定远程工作区
+    // 启动命令要绑回环、指向共享目录里的源码、指定远程工作区
     const startCommand = remote.commands.find((command) => command.includes('--serve'))
     assert.ok(startCommand, '应该有启动 daemon 的命令')
     assert.match(startCommand, /--host 127\.0\.0\.1/)
     // 端口写死会抢;交给系统分配,部署再从日志里读回来
     assert.match(startCommand, /--port 0/)
-    assert.match(startCommand, /--workspace '\/tmp\/grass-test123\/workspace'/)
+    assert.ok(startCommand.includes(daemon.sourceDirectory), 'daemon 应该从共享源码目录启动')
+    assert.ok(startCommand.includes(`${REMOTE_ROOT}/workspace-test123`), '应该指向配置的远程工作区')
     assert.match(startCommand, /--advertised-root '\/workspace'|--advertised-root \/workspace/)
 
     // 文件和目录都走 SFTP,不该有 shell 重定向
@@ -285,23 +362,65 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
       false,
       '探活应该走隧道,不该在远程跑 curl',
     )
-
-    await rm(remoteRoot, { recursive: true, force: true })
   } finally {
     await connection.cleanup()
     await remote.close()
+    // 断言失败也要清干净:假远程写的是真磁盘,留下的目录会让下次跑去重。
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
+  }
+})
+
+test('同一份源码第二次部署不重传', { timeout: 40_000 }, async () => {
+  const remote = await startFakeRemote()
+  const connection = await connectTo(remote)
+  let first: Awaited<ReturnType<typeof deployRemoteDaemon>> | undefined
+  let second: Awaited<ReturnType<typeof deployRemoteDaemon>> | undefined
+  try {
+    first = await deployRemoteDaemon({
+      client: connection.client,
+      sandboxId: 'reuse-a',
+      token: 'token-a-reuse',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-reuse`,
+      remoteRoot: REMOTE_ROOT,
+      diskMb: 1024,
+      logger: silentLogger,
+    })
+
+    // 第二个会话:源码内容没变,应该整个目录复用
+    remote.writes.length = 0
+    second = await deployRemoteDaemon({
+      client: connection.client,
+      sandboxId: 'reuse-b',
+      token: 'token-b-reuse',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-reuse`,
+      remoteRoot: REMOTE_ROOT,
+      diskMb: 1024,
+      logger: silentLogger,
+    })
+
+    assert.equal(second.sourceDirectory, first.sourceDirectory, '内容一样就该是同一个目录')
+    // 沙盒目录不同,互不干扰
+    assert.notEqual(second.remoteDirectory, first.remoteDirectory)
+    const sourceUploads = remote.writes.filter((written) => written.startsWith(first!.sourceDirectory))
+    assert.deepEqual(sourceUploads, [], '源码已就绪时一个文件都不该重传')
+  } finally {
+    await connection.cleanup()
+    await remote.close()
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
   }
 })
 
 test('清理走 stop.sh,命令行里不出现 daemon 路径', { timeout: 30_000 }, async () => {
   const remote = await startFakeRemote()
   const connection = await connectTo(remote)
+  let daemon: Awaited<ReturnType<typeof deployRemoteDaemon>> | undefined
   try {
-    const daemon = await deployRemoteDaemon({
+    daemon = await deployRemoteDaemon({
       client: connection.client,
       sandboxId: 'stopck',
       token: 'stop-check-token',
-      remoteWorkspace: '/tmp/grass-stopck/workspace',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-stopck`,
+      remoteRoot: REMOTE_ROOT,
       diskMb: 1024,
       logger: silentLogger,
     })
@@ -310,7 +429,13 @@ test('清理走 stop.sh,命令行里不出现 daemon 路径', { timeout: 30_000 
     const cleanupCommands = remote.commands.filter((command) => command.includes('rm -rf'))
     assert.equal(cleanupCommands.length, 1, '清理应该只有一条命令,半路断掉不会只做一半')
     const cleanup = cleanupCommands[0]!
-    assert.match(cleanup, /sh '\/tmp\/grass-stopck\/stop\.sh' '\/tmp\/grass-stopck'/)
+    // 只删沙盒目录。共享源码目录同机其他会话还在用,不能跟着删。
+    assert.ok(cleanup.includes(daemon.remoteDirectory), '清理要删沙盒目录')
+    assert.equal(
+      cleanup.includes(daemon.sourceDirectory),
+      false,
+      '共享源码目录不能删',
+    )
     // 关键:pkill 必须躲在脚本里。写进命令行的话,执行它的 shell
     // 自己的命令行里也有这串字符,pkill 会把 shell 一起杀掉。
     assert.equal(
@@ -322,15 +447,16 @@ test('清理走 stop.sh,命令行里不出现 daemon 路径', { timeout: 30_000 
     assert.equal(cleanup.includes('stop-check-token'), false)
 
     // 脚本内容要真的带兜底,并且点号拆开避免自匹配
-    const remoteRoot = path.join(path.parse(process.cwd()).root, 'tmp', 'grass-stopck')
-    const stopScript = await readFile(path.join(remoteRoot, 'stop.sh'), 'utf-8')
+    const stopScript = await readFile(
+      path.join(toLocalPath(daemon.remoteDirectory), 'stop.sh'),
+      'utf-8',
+    )
     assert.match(stopScript, /kill "\$pid"/)
     assert.match(stopScript, /pkill -f "\$dir\/src\/sandbox\/daemon\[\.\]ts"/)
-
-    await rm(remoteRoot, { recursive: true, force: true })
   } finally {
     await connection.cleanup()
     await remote.close()
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
   }
 })
 

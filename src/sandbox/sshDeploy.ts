@@ -8,10 +8,23 @@
 // 这套代码只用 Node 内置模块。
 
 import type { Client, SFTPWrapper } from 'ssh2'
+import { randomBytes } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Logger } from '../core/logger.ts'
+import {
+  computeSourceHash,
+  formatNodeVersion,
+  homeWorkspace,
+  MINIMUM_NODE_VERSION,
+  nodeVersionIsSupported,
+  parseNodeVersion,
+  sandboxDirectory,
+  sourceDirectory,
+  stagingDirectory,
+  type NodeVersion,
+} from './remoteLayout.ts'
 
 /** daemon 及其依赖。相对本仓库根目录。 */
 const DAEMON_SOURCES = [
@@ -69,8 +82,10 @@ const STOP_SCRIPT = [
 export type RemoteDaemon = {
   /** 远程 daemon 的回环端口。由系统分配,隧道要转到这里。 */
   port: number
-  /** 远程上的工作目录。销毁时要清掉。 */
+  /** 这个沙盒自己的目录。令牌、PID、日志都在这,销毁时清掉。 */
   remoteDirectory: string
+  /** 共享的源码目录。同一台机器上多个会话共用,销毁时不删。 */
+  sourceDirectory: string
   /**
    * 读 daemon.log 的尾部。
    *
@@ -85,7 +100,8 @@ export type DeployOptions = {
   client: Client
   sandboxId: string
   token: string
-  remoteWorkspace: string
+  /** 远程工作区的真实路径。留空则用远程的 $HOME/grass-workspace。 */
+  remoteWorkspace?: string
   diskMb: number
   /** 远程上放 daemon 源码的根目录。默认 /tmp。 */
   remoteRoot?: string
@@ -100,51 +116,56 @@ export type DeployOptions = {
  * 作者：Pieory 创建日期：2025-07-18
  */
 export async function deployRemoteDaemon(options: DeployOptions): Promise<RemoteDaemon> {
-  const remoteRoot = options.remoteRoot ?? '/tmp'
-  const remoteDirectory = `${remoteRoot}/grass-${options.sandboxId}`
-  const daemonPath = `${remoteDirectory}/src/sandbox/daemon.ts`
-  const logPath = `${remoteDirectory}/daemon.log`
-  const pidPath = `${remoteDirectory}/daemon.pid`
-  const stopPath = `${remoteDirectory}/stop.sh`
   const client = options.client
   const logger = options.logger
+  const remoteRoot = options.remoteRoot ?? '/tmp'
 
-  // 整次部署只用一条 SFTP 会话。
+  // 1. Node 版本先探。不合格就别传文件了——传完再失败白等几十秒。
+  const nodeVersion = await probeNodeVersion(client, logger)
+  if (!nodeVersionIsSupported(nodeVersion)) {
+    throw new Error(
+      `远程 Node ${formatNodeVersion(nodeVersion)} 太低,daemon 需要 ` +
+      `${formatNodeVersion(MINIMUM_NODE_VERSION)} 以上(type stripping 从那版起默认开启)`,
+    )
+  }
+
+  // 2. 源码一次读进内存。hash 和上传必须用同一份快照——
+  //    边读边传的话,中途改过的文件会让 hash 和实际内容对不上。
+  const sources = await readDaemonSources()
+  const { shortHash, fullHash } = computeSourceHash(sources)
+  const sourceDir = sourceDirectory(remoteRoot, shortHash)
+  const sandboxDir = sandboxDirectory(remoteRoot, options.sandboxId)
+  const tokenPath = `${sandboxDir}/token`
+  const logPath = `${sandboxDir}/daemon.log`
+  const pidPath = `${sandboxDir}/daemon.pid`
+  const stopPath = `${sandboxDir}/stop.sh`
+  const workspace = options.remoteWorkspace ?? await resolveRemoteWorkspace(client, logger)
+
+  // 3. 一条 SFTP 会话传完所有东西。
   // 每个操作单开一个会话的话,11 个文件加上建目录要握手二十多次,
   // 实测真实机器上要 40 秒。
   const remote = await openRemoteFiles(client)
   try {
     // 工作区要先有,daemon 起来时会对它做 realpath。不存在就直接失败。
-    await remote.mkdir(options.remoteWorkspace)
-    await remote.mkdir(remoteDirectory)
-
-    // 源码逐个传。传的是目录结构,不是 tar 包——
-    // tar 要远程有 tar,这里只是几个文本文件。
-    const root = projectRoot()
-    for (const relative of DAEMON_SOURCES) {
-      const content = await readFile(path.join(root, relative), 'utf-8')
-      const remotePath = `${remoteDirectory}/${relative}`
-      await remote.mkdir(path.posix.dirname(remotePath))
-      await remote.write(remotePath, content)
-    }
+    await createWorkspace(remote, workspace)
+    await remote.mkdir(sandboxDir)
+    await ensureSourceDirectory(remote, sourceDir, sources, fullHash, logger)
 
     // 令牌写在远程的 0600 文件里。daemon 每次调用都读它比对。
-    await remote.write(`${remoteDirectory}/token`, options.token)
-    await remote.chmod(`${remoteDirectory}/token`, 0o600)
+    await remote.write(tokenPath, options.token)
+    await remote.chmod(tokenPath, 0o600)
 
     // 清理脚本也提前放好。收尾时只执行它,不在命令行里拼 daemon 路径。
     await remote.write(stopPath, STOP_SCRIPT)
   } finally {
     remote.close()
   }
-  logger?.debug({ remoteDirectory, fileCount: DAEMON_SOURCES.length }, '远程源码已就位')
 
-  // 远程的 Node 版本要够。type stripping 是 24.3 才默认开启的。
-  const nodeVersion = await probeNodeVersion(client, logger)
-  if (nodeVersion && nodeVersion < 24) {
-    throw new Error(`远程 Node 版本 ${nodeVersion} 太低,daemon 需要 24.3 以上`)
-  }
+  // 4. SFTP 建得出目录不代表这个用户能写。报错要点名该改哪个配置。
+  await assertWorkspaceWritable(client, workspace, logger)
+  logger?.debug({ sourceDir, sandboxDir, sourceHash: shortHash }, '远程源码已就位')
 
+  const daemonPath = `${sourceDir}/src/sandbox/daemon.ts`
   const startCommand = [
     'nohup node',
     shellQuote(daemonPath),
@@ -152,8 +173,8 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
     '--host', '127.0.0.1',
     // 端口交给系统挑。写死的话同一台机器上两个沙盒必然抢端口。
     '--port', '0',
-    '--token-file', shellQuote(`${remoteDirectory}/token`),
-    '--workspace', shellQuote(options.remoteWorkspace),
+    '--token-file', shellQuote(tokenPath),
+    '--workspace', shellQuote(workspace),
     '--advertised-root', '/workspace',
     '--disk-mb', String(options.diskMb),
     `> ${shellQuote(logPath)} 2>&1 &`,
@@ -169,7 +190,8 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
   // 同一台机器上任何人 ps 一下就能看到。
   return {
     port,
-    remoteDirectory,
+    remoteDirectory: sandboxDir,
+    sourceDirectory: sourceDir,
     readLogTail: async (maxChars = 800) => {
       const output = await runRemote(
         client,
@@ -181,15 +203,18 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
     stop: async () => {
       // 杀进程和删目录放一条命令:中途断线的话至少不会只做一半。
       // 脚本自己带兜底,它失败了 `;` 后面的 rm 照样跑。
+      //
+      // 只删沙盒目录。共享源码目录同机其他会话还在用,
+      // 删了它们下次重启就找不到 daemon 源码了。
       await runRemote(
         client,
-        `sh ${shellQuote(stopPath)} ${shellQuote(remoteDirectory)}; rm -rf ${shellQuote(remoteDirectory)}`,
+        `sh ${shellQuote(stopPath)} ${shellQuote(sandboxDir)}; rm -rf ${shellQuote(sandboxDir)}`,
         logger,
       ).catch((error: unknown) => {
         // 连接已经断了的话这条命令根本跑不到。别把收尾卡住,
         // 残留目录交给下次启动的孤儿扫描。
         logger?.warn({
-          remoteDirectory,
+          sandboxDirectory: sandboxDir,
           errorMessage: (error as Error).message,
         }, '远程清理失败,留给下次启动扫描')
       })
@@ -231,17 +256,135 @@ async function discoverDaemonPort(
 }
 
 /**
- * 问远程的 Node 是什么版本。读不到就当未知,不拦。
+ * 问远程的 Node 是什么版本。
+ *
+ * 读不到就报错,不当未知放过——「不确定」和「够用」是两回事,
+ * 放过去的话失败会推到后面更晦涩的地方。
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
-async function probeNodeVersion(client: Client, logger?: Logger): Promise<number | null> {
+async function probeNodeVersion(client: Client, logger?: Logger): Promise<NodeVersion> {
+  let output: string
   try {
-    const output = await runRemote(client, 'node --version', logger)
-    const matched = output.trim().match(/^v(\d+)\./)
-    return matched ? Number(matched[1]) : null
+    output = await runRemote(client, 'node --version', logger)
+  } catch (error) {
+    throw new Error(
+      `远程没有可用的 node: ${(error as Error).message};` +
+      ` daemon 需要 ${formatNodeVersion(MINIMUM_NODE_VERSION)} 以上`,
+    )
+  }
+  const version = parseNodeVersion(output)
+  if (!version) {
+    throw new Error(`无法解析远程 Node 版本: ${output.trim().slice(0, 80) || '(空输出)'}`)
+  }
+  return version
+}
+
+/**
+ * 没配远程工作区时,用远程用户自己的 HOME。
+ *
+ * 不用 /workspace(通常要 root 才建得出来),也不用 /tmp
+ * (systemd 的 tmpfiles 会定期清理,用户的代码跟着一起没)。
+ */
+async function resolveRemoteWorkspace(client: Client, logger?: Logger): Promise<string> {
+  let home: string
+  try {
+    home = (await runRemote(client, 'printf %s "$HOME"', logger)).trim()
+  } catch (error) {
+    throw new Error(
+      `读不到远程的 $HOME: ${(error as Error).message}。` +
+      '请显式配置 GRASSAGENT_SANDBOX_SSH_WORKSPACE',
+    )
+  }
+  if (!home.startsWith('/')) {
+    throw new Error('远程没有可用的 $HOME,请显式配置 GRASSAGENT_SANDBOX_SSH_WORKSPACE')
+  }
+  return homeWorkspace(home)
+}
+
+/** 建工作区。失败要点名该改哪个配置,而不是把 SFTP 的原始错误甩给用户。 */
+async function createWorkspace(remote: RemoteFiles, workspace: string): Promise<void> {
+  try {
+    await remote.mkdir(workspace)
+  } catch (error) {
+    throw new Error(
+      `远程工作区 ${workspace} 建不出来: ${(error as Error).message}。` +
+      '把 GRASSAGENT_SANDBOX_SSH_WORKSPACE 指到当前用户可写的目录',
+    )
+  }
+}
+
+/** 建得出不等于写得了。这一条专门挡「路径存在但没有写权限」。 */
+async function assertWorkspaceWritable(
+  client: Client,
+  workspace: string,
+  logger?: Logger,
+): Promise<void> {
+  try {
+    await runRemote(
+      client,
+      `test -w ${shellQuote(workspace)} && test -x ${shellQuote(workspace)}`,
+      logger,
+    )
   } catch {
-    return null
+    throw new Error(
+      `远程工作区 ${workspace} 不可写。把 GRASSAGENT_SANDBOX_SSH_WORKSPACE 指到可写目录,` +
+      '不要用 /workspace 这种通常需要 root 的路径',
+    )
+  }
+}
+
+/** 把 daemon 和它的依赖一次读进内存。 */
+async function readDaemonSources(): Promise<Map<string, string>> {
+  const root = projectRoot()
+  const sources = new Map<string, string>()
+  for (const relative of DAEMON_SOURCES) {
+    sources.set(relative, await readFile(path.join(root, relative), 'utf-8'))
+  }
+  return sources
+}
+
+/**
+ * 保证共享源码目录里就是这份内容。
+ *
+ * 已经完整就一个字节都不用传——这是第二次启动能秒开的原因。
+ * 没完整就先传到临时目录,写完了整体改名过去:
+ * 直接往目标目录写的话,两个进程同时部署会把对方的文件覆盖成半截。
+ */
+async function ensureSourceDirectory(
+  remote: RemoteFiles,
+  sourceDir: string,
+  sources: ReadonlyMap<string, string>,
+  fullHash: string,
+  logger?: Logger,
+): Promise<void> {
+  const completed = await remote.read(`${sourceDir}/.complete`)
+  if (completed?.trim() === fullHash) {
+    logger?.debug({ sourceDir }, '远程源码已是最新,跳过上传')
+    return
+  }
+
+  const staging = stagingDirectory(sourceDir, randomBytes(8).toString('hex'))
+  try {
+    await remote.mkdir(staging)
+    // 排序后传,排障时日志顺眼
+    for (const relative of [...sources.keys()].sort()) {
+      const remotePath = `${staging}/${relative}`
+      await remote.mkdir(path.posix.dirname(remotePath))
+      await remote.write(remotePath, sources.get(relative) ?? '')
+    }
+    // .complete 最后写。它出现了就代表整个目录是完整的。
+    await remote.write(`${staging}/.complete`, fullHash)
+    await remote.rename(staging, sourceDir)
+  } catch (error) {
+    // 改名失败多半是别人抢先部署完了。只要内容一致就能直接用。
+    const winner = await remote.read(`${sourceDir}/.complete`).catch(() => null)
+    if (winner?.trim() === fullHash) {
+      logger?.info({ sourceDir }, '另一个部署先完成,复用它传的源码')
+      return
+    }
+    logger?.warn({ staging, sourceDir }, '上传远程源码失败,临时目录留给下次启动清理')
+    throw new Error(`上传远程源码失败 ${sourceDir}: ${(error as Error).message}`)
   }
 }
 
@@ -315,6 +458,9 @@ export function runRemote(
 type RemoteFiles = {
   mkdir: (remotePath: string) => Promise<void>
   write: (remotePath: string, content: string) => Promise<void>
+  /** 读文本。文件不存在或读不了返回 null,调用方按「没有」处理。 */
+  read: (remotePath: string) => Promise<string | null>
+  rename: (from: string, to: string) => Promise<void>
   chmod: (remotePath: string, mode: number) => Promise<void>
   close: () => void
 }
@@ -335,6 +481,12 @@ async function openRemoteFiles(client: Client): Promise<RemoteFiles> {
     },
     async write(remotePath: string, content: string) {
       await sftpWrite(sftp, remotePath, content)
+    },
+    async read(remotePath: string) {
+      return await sftpRead(sftp, remotePath)
+    },
+    async rename(from: string, to: string) {
+      await sftpRename(sftp, from, to)
     },
     async chmod(remotePath: string, mode: number) {
       await sftpChmod(sftp, remotePath, mode)
@@ -390,6 +542,38 @@ function sftpWrite(sftp: SFTPWrapper, remotePath: string, content: string): Prom
     sftp.writeFile(remotePath, content, (writeError) => {
       if (writeError) {
         reject(new Error(`写远程文件失败 ${remotePath}: ${writeError.message}`))
+        return
+      }
+      resolve()
+    })
+  })
+}
+
+/**
+ * 读远程文本文件。读不到返回 null——调用方用「文件在不在」做判断,
+ * 报错会把「还没有」和「坏掉了」混成一件事。
+ */
+function sftpRead(sftp: SFTPWrapper, remotePath: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    sftp.readFile(remotePath, (readError, data) => {
+      if (readError) {
+        resolve(null)
+        return
+      }
+      resolve(data.toString('utf-8'))
+    })
+  })
+}
+
+/**
+ * 改名。同一目录内的 rename 在 POSIX 上是原子的,
+ * 部署靠它把「写了一半的临时目录」和「可用的正式目录」一次切换过去。
+ */
+function sftpRename(sftp: SFTPWrapper, from: string, to: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    sftp.rename(from, to, (renameError) => {
+      if (renameError) {
+        reject(new Error(`远程改名失败 ${from} -> ${to}: ${renameError.message}`))
         return
       }
       resolve()
