@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   commandOnlySkills,
   createLocalSkillFiles,
@@ -29,6 +30,9 @@ import { openExecutionWorld } from '../../src/sandbox/openWorld.ts'
 async function makeWorkspace(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), 'grass-skills-'))
 }
+
+// 仓库根。技能是随仓库走的,这里拿来当工作区扫一遍。
+const repositoryRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 const localOrigin: SkillOrigin = { kind: 'local', label: '本地工作区' }
 const idleTimer: TimerFn = () => ({ refresh() {}, cancel() {} })
@@ -795,5 +799,26 @@ test('合并两个来源的技能:本地独有的留下,同名以远程为准', 
   } finally {
     await fs.rm(localWorkspace, { recursive: true, force: true })
     await fs.rm(remoteWorkspace, { recursive: true, force: true })
+  }
+})
+
+test('仓库自带的技能都能被扫到,frontmatter 写坏就报出来', async () => {
+  // 用真的仓库根当工作区:技能是随仓库走的,写坏了要在这里就暴露
+  const catalog = await scanLocalSkills(repositoryRoot)
+  const names = catalog.skills.map((skill) => skill.name).sort()
+
+  assert.ok(
+    names.includes('code-change-verify'),
+    `仓库自带的技能没扫到,实际扫到: ${names.join('、')}`,
+  )
+  assert.ok(names.includes('debug-systematically'))
+  assert.ok(names.includes('long-task-monitor'))
+  assert.ok(names.includes('session-and-context-management'))
+
+  // 每个技能都要有描述:描述是模型判断「什么时候该用」的唯一依据
+  for (const skill of catalog.skills) {
+    assert.ok(skill.description.length > 0, `技能 ${skill.name} 没有描述`)
+    assert.ok(!skill.disabledReason, `技能 ${skill.name} 被禁用:${skill.disabledReason}`)
+    assert.ok(!skill.skippedReason, `技能 ${skill.name} 被跳过:${skill.skippedReason}`)
   }
 })
