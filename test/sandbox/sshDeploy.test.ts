@@ -293,6 +293,47 @@ test('部署要传 daemon 源码,令牌单独放 0600 文件', { timeout: 30_000
   }
 })
 
+test('清理走 stop.sh,命令行里不出现 daemon 路径', { timeout: 30_000 }, async () => {
+  const remote = await startFakeRemote()
+  const connection = await connectTo(remote)
+  try {
+    const daemon = await deployRemoteDaemon({
+      client: connection.client,
+      sandboxId: 'stopck',
+      token: 'stop-check-token',
+      remoteWorkspace: '/tmp/grass-stopck/workspace',
+      diskMb: 1024,
+      logger: silentLogger,
+    })
+    await daemon.stop()
+
+    const cleanupCommands = remote.commands.filter((command) => command.includes('rm -rf'))
+    assert.equal(cleanupCommands.length, 1, '清理应该只有一条命令,半路断掉不会只做一半')
+    const cleanup = cleanupCommands[0]!
+    assert.match(cleanup, /sh '\/tmp\/grass-stopck\/stop\.sh' '\/tmp\/grass-stopck'/)
+    // 关键:pkill 必须躲在脚本里。写进命令行的话,执行它的 shell
+    // 自己的命令行里也有这串字符,pkill 会把 shell 一起杀掉。
+    assert.equal(
+      cleanup.includes('daemon.ts'),
+      false,
+      '清理命令行里不能出现 daemon 路径',
+    )
+    // 令牌不该跟着清理命令走
+    assert.equal(cleanup.includes('stop-check-token'), false)
+
+    // 脚本内容要真的带兜底,并且点号拆开避免自匹配
+    const remoteRoot = path.join(path.parse(process.cwd()).root, 'tmp', 'grass-stopck')
+    const stopScript = await readFile(path.join(remoteRoot, 'stop.sh'), 'utf-8')
+    assert.match(stopScript, /kill "\$pid"/)
+    assert.match(stopScript, /pkill -f "\$dir\/src\/sandbox\/daemon\[\.\]ts"/)
+
+    await rm(remoteRoot, { recursive: true, force: true })
+  } finally {
+    await connection.cleanup()
+    await remote.close()
+  }
+})
+
 test('远程命令的输出和退出码都要拿回来', { timeout: 20_000 }, async () => {
   const remote = await startFakeRemote()
   const connection = await connectTo(remote)

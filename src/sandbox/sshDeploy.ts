@@ -28,6 +28,44 @@ const DAEMON_SOURCES = [
   'src/world/approvalGate.ts',
 ] as const
 
+/**
+ * 远程的清理脚本。
+ *
+ * 为什么不直接在命令行里拼 `pkill -f <daemonPath>`:
+ * 执行那条命令的 `bash -c` 自己的命令行里也有同样的字符串,
+ * pkill 会把 shell 一起杀掉,后面的 `rm -rf` 就执行不到了——
+ * 实测会留下一堆孤儿目录。
+ *
+ * 脚本落成文件后,执行时命令行只有 `sh <stop.sh> <dir>`。
+ * 用数组拼而不是模板字符串:脚本里的 $ 不能被 TS 替换掉。
+ */
+const STOP_SCRIPT = [
+  '#!/bin/sh',
+  '# 清理这个沙盒的 daemon 和目录。$1 是沙盒目录。',
+  'dir="$1"',
+  'pidfile="$dir/daemon.pid"',
+  '',
+  '# 先按 PID 精准杀,再等它真的退出。',
+  'if [ -f "$pidfile" ]; then',
+  '  pid="$(cat "$pidfile" 2>/dev/null || true)"',
+  '  if [ -n "$pid" ]; then',
+  '    kill "$pid" 2>/dev/null || true',
+  '    n=0',
+  '    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 20 ]; do',
+  '      sleep 0.1',
+  '      n=$((n + 1))',
+  '    done',
+  '    kill -9 "$pid" 2>/dev/null || true',
+  '  fi',
+  'fi',
+  '',
+  '# 兜底:按路径杀。模式里的 [.] 把点号拆开,免得匹配到自己。',
+  'pkill -f "$dir/src/sandbox/daemon[.]ts" 2>/dev/null || true',
+  '',
+  'exit 0',
+  '',
+].join('\n')
+
 export type RemoteDaemon = {
   /** 远程 daemon 的回环端口。由系统分配,隧道要转到这里。 */
   port: number
@@ -64,6 +102,10 @@ export type DeployOptions = {
 export async function deployRemoteDaemon(options: DeployOptions): Promise<RemoteDaemon> {
   const remoteRoot = options.remoteRoot ?? '/tmp'
   const remoteDirectory = `${remoteRoot}/grass-${options.sandboxId}`
+  const daemonPath = `${remoteDirectory}/src/sandbox/daemon.ts`
+  const logPath = `${remoteDirectory}/daemon.log`
+  const pidPath = `${remoteDirectory}/daemon.pid`
+  const stopPath = `${remoteDirectory}/stop.sh`
   const client = options.client
   const logger = options.logger
 
@@ -89,6 +131,9 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
     // 令牌写在远程的 0600 文件里。daemon 每次调用都读它比对。
     await remote.write(`${remoteDirectory}/token`, options.token)
     await remote.chmod(`${remoteDirectory}/token`, 0o600)
+
+    // 清理脚本也提前放好。收尾时只执行它,不在命令行里拼 daemon 路径。
+    await remote.write(stopPath, STOP_SCRIPT)
   } finally {
     remote.close()
   }
@@ -100,9 +145,6 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
     throw new Error(`远程 Node 版本 ${nodeVersion} 太低,daemon 需要 24.3 以上`)
   }
 
-  const daemonPath = `${remoteDirectory}/src/sandbox/daemon.ts`
-  const logPath = `${remoteDirectory}/daemon.log`
-  const pidPath = `${remoteDirectory}/daemon.pid`
   const startCommand = [
     'nohup node',
     shellQuote(daemonPath),
@@ -137,22 +179,20 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
       return output.slice(-maxChars)
     },
     stop: async () => {
-      // 先按 PID 精准杀,再按路径兜底。两条都失败也不能挡住清理。
+      // 杀进程和删目录放一条命令:中途断线的话至少不会只做一半。
+      // 脚本自己带兜底,它失败了 `;` 后面的 rm 照样跑。
       await runRemote(
         client,
-        `if [ -f ${shellQuote(pidPath)} ]; then kill "$(cat ${shellQuote(pidPath)})" 2>/dev/null || true; fi`,
+        `sh ${shellQuote(stopPath)} ${shellQuote(remoteDirectory)}; rm -rf ${shellQuote(remoteDirectory)}`,
         logger,
-      ).catch(() => undefined)
-      await runRemote(
-        client,
-        `pkill -f ${shellQuote(daemonPath)} || true`,
-        logger,
-      ).catch(() => undefined)
-      await runRemote(
-        client,
-        `rm -rf ${shellQuote(remoteDirectory)}`,
-        logger,
-      ).catch(() => undefined)
+      ).catch((error: unknown) => {
+        // 连接已经断了的话这条命令根本跑不到。别把收尾卡住,
+        // 残留目录交给下次启动的孤儿扫描。
+        logger?.warn({
+          remoteDirectory,
+          errorMessage: (error as Error).message,
+        }, '远程清理失败,留给下次启动扫描')
+      })
     },
   }
 }
