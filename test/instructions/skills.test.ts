@@ -13,6 +13,7 @@ import {
   discoverSkills,
   formatCommandOnlySkill,
   isUsableCommandName,
+  mergeSkillCatalogs,
   SKILL_CACHE_RELATIVE_PATH,
   type SkillLog,
   type SkillOrigin,
@@ -50,7 +51,6 @@ async function scanLocalSkills(
 interface CapturedLog extends SkillLog {
   warnings: string[]
 }
-
 function captureLog(): CapturedLog {
   const warnings: string[] = []
   return {
@@ -747,5 +747,53 @@ test('一个技能都没有时不注册 load_skill', async () => {
     assert.equal(emptyRegistry.some((tool) => tool.name === 'load_skill'), false)
   } finally {
     await fs.rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('合并两个来源的技能:本地独有的留下,同名以远程为准', async () => {
+  const localWorkspace = await makeWorkspace()
+  const remoteWorkspace = await makeWorkspace()
+  try {
+    await fs.mkdir(path.join(localWorkspace, '.grass', 'skills', 'local-only'), { recursive: true })
+    await fs.writeFile(
+      path.join(localWorkspace, '.grass', 'skills', 'local-only', 'skill.md'),
+      '---\nname: local-only\ndescription: 只有本地有的技能\n---\n本地正文\n',
+      'utf-8',
+    )
+    await fs.mkdir(path.join(remoteWorkspace, '.grass', 'skills', 'shared'), { recursive: true })
+    await fs.writeFile(
+      path.join(remoteWorkspace, '.grass', 'skills', 'shared', 'skill.md'),
+      '---\nname: shared\ndescription: 两边都有的技能\n---\n远程正文\n',
+      'utf-8',
+    )
+    await fs.mkdir(path.join(localWorkspace, '.grass', 'skills', 'shared'), { recursive: true })
+    await fs.writeFile(
+      path.join(localWorkspace, '.grass', 'skills', 'shared', 'skill.md'),
+      '---\nname: shared\ndescription: 两边都有的技能\n---\n本地正文\n',
+      'utf-8',
+    )
+
+    const local = await discoverSkills({
+      files: await createLocalSkillFiles(localWorkspace),
+      origin: localOrigin,
+    })
+    // 远程这边用本地文件系统模拟,来源标成远程就够了
+    const remote = await discoverSkills({
+      files: await createLocalSkillFiles(remoteWorkspace),
+      origin: { kind: 'remote', label: '远程 dev@host' },
+    })
+    const merged = mergeSkillCatalogs(remote, local)
+    const names = merged.skills.map((skill) => skill.name).sort()
+    assert.deepEqual(names, ['local-only', 'shared'])
+    // 同名时远程优先
+    const shared = merged.skills.find((skill) => skill.name === 'shared')
+    assert.ok(shared)
+    assert.equal(shared!.origin.label, '远程 dev@host')
+    // 索引里两个都在
+    assert.ok(merged.promptSection.includes('local-only'))
+    assert.ok(merged.promptSection.includes('shared'))
+  } finally {
+    await fs.rm(localWorkspace, { recursive: true, force: true })
+    await fs.rm(remoteWorkspace, { recursive: true, force: true })
   }
 })

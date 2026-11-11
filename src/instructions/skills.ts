@@ -495,6 +495,38 @@ export function formatSkillForModel(skill: Skill): string {
   return lines.join('\n')
 }
 
+/**
+ * 合并两个来源的技能目录。
+ *
+ * 远程模式下本地和远程各扫一遍,同名时以 primary(远程)为准:
+ * 模型实际编辑的是远程工作区,那份更可信。
+ *
+ * 各自 disabled/skipped 的状态都保留——一个来源出问题不该让另一个的
+ * 同名技能也一起失效。
+ */
+export function mergeSkillCatalogs(
+  primary: SkillCatalog,
+  secondary: SkillCatalog,
+  logger?: SkillLog,
+): SkillCatalog {
+  const merged = new Map<string, Skill>()
+  for (const skill of secondary.skills) merged.set(skill.name.toLowerCase(), skill)
+  for (const skill of primary.skills) {
+    const key = skill.name.toLowerCase()
+    const existing = merged.get(key)
+    if (existing && !existing.disabledReason && !skill.disabledReason) {
+      logger?.info({
+        name: skill.name,
+        keptOrigin: skill.origin.label,
+        droppedOrigin: existing.origin.label,
+      }, '同名技能跨来源冲突,保留执行世界版本')
+    }
+    merged.set(key, skill)
+  }
+  const skills = [...merged.values()].sort((left, right) => left.name.localeCompare(right.name))
+  return { skills, promptSection: renderSkillSection(skills) }
+}
+
 export function summarizeSkills(skills: readonly Skill[]): string {
   const usable = skills.filter((skill) => isUsableSkill(skill))
   const disabled = skills.filter((skill) => skill.disabledReason).length
