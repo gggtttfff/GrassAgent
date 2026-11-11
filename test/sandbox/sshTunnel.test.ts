@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createHmac } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
 import * as os from 'node:os'
@@ -10,7 +11,9 @@ import ssh2 from 'ssh2'
 import {
   connectSsh,
   createHostVerifier,
+  findKnownHostFingerprints,
   keyFingerprint,
+  knownHostsHostName,
   loadKnownHosts,
   openSshTunnel,
 } from '../../src/sandbox/sshTunnel.ts'
@@ -65,19 +68,99 @@ test('主机密钥指纹用 SHA-256,和 OpenSSH 格式一致', () => {
   assert.equal(fingerprint, keyFingerprint(key))
 })
 
+test('known_hosts 按 OpenSSH 规则拼主机名', () => {
+  // 22 端口写裸主机名,其他端口要加方括号
+  assert.equal(knownHostsHostName('example.com', 22), 'example.com')
+  assert.equal(knownHostsHostName('example.com', 2222), '[example.com]:2222')
+  assert.equal(knownHostsHostName('8.148.215.202', 27208), '[8.148.215.202]:27208')
+})
+
 test('known_hosts 读出主机到指纹的映射', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-'))
   try {
-    const key = Buffer.from('host-key-bytes')
+    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
     const fingerprint = keyFingerprint(key)
     const knownHostsPath = path.join(directory, 'known_hosts')
     await writeFile(
       knownHostsPath,
-      `# 注释\nexample.com:22 ssh-ed25519 ${key.toString('base64')}\n`,
+      `# 注释\nexample.com ssh-ed25519 ${key.toString('base64')}\n`,
       'utf-8',
     )
     const known = loadKnownHosts(knownHostsPath, silentLogger)
-    assert.equal(known.get('example.com:22'), fingerprint)
+    assert.deepEqual([...findKnownHostFingerprints(known, 'example.com', 22)], [fingerprint])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('非标端口的 [host]:port 条目能命中,端口不同就是不同条目', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-port-'))
+  try {
+    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const fingerprint = keyFingerprint(key)
+    const knownHostsPath = path.join(directory, 'known_hosts')
+    await writeFile(
+      knownHostsPath,
+      `[example.com]:2222 ssh-ed25519 ${key.toString('base64')}\n`,
+      'utf-8',
+    )
+    const known = loadKnownHosts(knownHostsPath, silentLogger)
+    assert.deepEqual([...findKnownHostFingerprints(known, 'example.com', 2222)], [fingerprint])
+    // 22 端口是另一条记录,不能因为主机名一样就串过去
+    assert.equal(findKnownHostFingerprints(known, 'example.com', 22).size, 0)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('known_hosts 支持同主机多密钥、通配符和否定模式', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-mixed-'))
+  try {
+    const first = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const second = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const third = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const knownHostsPath = path.join(directory, 'known_hosts')
+    await writeFile(
+      knownHostsPath,
+      [
+        // 同一台机器两把钥匙
+        `example.com ssh-ed25519 ${first.toString('base64')}`,
+        `example.com ssh-rsa ${second.toString('base64')}`,
+        // 通配符 + 否定:bad 子域不该命中
+        `*.wild.example,!bad.wild.example ssh-ed25519 ${third.toString('base64')}`,
+      ].join('\n') + '\n',
+      'utf-8',
+    )
+    const known = loadKnownHosts(knownHostsPath, silentLogger)
+
+    const both = findKnownHostFingerprints(known, 'example.com', 22)
+    assert.equal(both.size, 2)
+    assert.ok(both.has(keyFingerprint(first)))
+    assert.ok(both.has(keyFingerprint(second)))
+
+    assert.equal(findKnownHostFingerprints(known, 'host.wild.example', 22).size, 1)
+    // 否定模式生效
+    assert.equal(findKnownHostFingerprints(known, 'bad.wild.example', 22).size, 0)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('哈希形式的 known_hosts 条目也能命中', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-hashed-'))
+  try {
+    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const fingerprint = keyFingerprint(key)
+    const salt = Buffer.from('0123456789abcdef')
+    const hash = createHmac('sha1', salt).update('[example.com]:2222').digest()
+    const knownHostsPath = path.join(directory, 'known_hosts')
+    await writeFile(
+      knownHostsPath,
+      `|1|${salt.toString('base64')}|${hash.toString('base64')} ssh-ed25519 ${key.toString('base64')}\n`,
+      'utf-8',
+    )
+    const known = loadKnownHosts(knownHostsPath, silentLogger)
+    assert.deepEqual([...findKnownHostFingerprints(known, 'example.com', 2222)], [fingerprint])
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -85,28 +168,34 @@ test('known_hosts 读出主机到指纹的映射', async () => {
 
 test('known_hosts 不存在时不报错,当作第一次连接', () => {
   const known = loadKnownHosts(path.join(os.tmpdir(), 'no-such-known-hosts-file'), silentLogger)
-  assert.equal(known.size, 0)
+  assert.equal(known.entries.length, 0)
+  assert.equal(known.hashed.length, 0)
 })
 
-test('首次连接接受主机并记下指纹,指纹变了拒绝', async () => {
+test('首次连接把指纹写回 known_hosts,下次连接仍然认得', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-hostkey-'))
   try {
+    const knownHostsPath = path.join(directory, 'known_hosts')
     const config = resolveSshConfig({
       host: 'example.com',
+      port: 2222,
       username: 'dev',
-      knownHostsPath: path.join(directory, 'known_hosts'),
+      knownHostsPath,
     })
-    const key = Buffer.from('first-key')
-    const verifier = createHostVerifier(config, silentLogger)
+    const hostKey = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
 
-    // 第一次:没人能证明对错,接受
-    assert.equal(verifier(key), true)
+    // 第一次:没人能证明对错,接受并落盘
+    assert.equal(createHostVerifier(config, silentLogger)(hostKey), true)
+    const written = await readFile(knownHostsPath, 'utf-8')
+    assert.match(written, /^\[example\.com\]:2222 ssh-ed25519 /m)
 
-    // 同一把钥匙再来一次:还是接受
-    assert.equal(verifier(key), true)
+    // 换一个新 verifier,相当于新进程:同一把钥匙还认得,不再 TOFU
+    const secondProcess = createHostVerifier(config, silentLogger)
+    assert.equal(secondProcess(hostKey), true)
 
     // 换成另一把:必须拒绝,不然就是中间人
-    assert.equal(verifier(Buffer.from('second-key')), false)
+    const otherKey = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    assert.equal(secondProcess(otherKey), false)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -213,7 +302,7 @@ test('SSH 服务能接受公钥认证', async () => {
       const knownHostsPath = path.join(directory, 'known_hosts')
       await writeFile(
         knownHostsPath,
-        `127.0.0.1:${host.port} ssh-ed25519 ${host.hostKey.toString('base64')}\n`,
+        `[127.0.0.1]:${host.port} ssh-ed25519 ${host.hostKey.toString('base64')}\n`,
         'utf-8',
       )
 
@@ -226,7 +315,10 @@ test('SSH 服务能接受公钥认证', async () => {
       })
       // known_hosts 里的指纹要和主机实际的公钥对得上
       const known = loadKnownHosts(knownHostsPath, silentLogger)
-      assert.equal(known.get(`127.0.0.1:${host.port}`), keyFingerprint(host.hostKey))
+      assert.deepEqual(
+        [...findKnownHostFingerprints(known, '127.0.0.1', host.port)],
+        [keyFingerprint(host.hostKey)],
+      )
 
       // 用这份配置去连:握手成功说明隧道这条路是通的
       const client = await connectSsh(config, { logger: silentLogger })
@@ -255,7 +347,8 @@ test('主机密钥对不上时连接被拒', async () => {
       const knownHostsPath = path.join(directory, 'known_hosts')
       await writeFile(
         knownHostsPath,
-        `127.0.0.1:${host.port} ssh-ed25519 ${publicSshBlob(wrongKeyPair.public).toString('base64')}\n`,        'utf-8',
+        `[127.0.0.1]:${host.port} ssh-ed25519 ${publicSshBlob(wrongKeyPair.public).toString('base64')}\n`,
+        'utf-8',
       )
 
       const config = resolveSshConfig({
@@ -282,12 +375,22 @@ test('主机密钥对不上时连接被拒', async () => {
   }
 })
 
-test('SSH 客户端的连接配置能带上主机校验', () => {
-  const config = resolveSshConfig({ host: 'example.com', username: 'dev' })
-  const verifier = createHostVerifier(config, silentLogger)
-  assert.equal(typeof verifier, 'function')
-  // 换成未知的钥匙会被拒
-  assert.equal(verifier(Buffer.from('unknown')), true)
+test('SSH 客户端的连接配置能带上主机校验', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-verify-'))
+  try {
+    const config = resolveSshConfig({
+      host: 'example.com',
+      username: 'dev',
+      // 必须指到临时文件。走默认路径的话 TOFU 会写进用户真正的 ~/.ssh/known_hosts
+      knownHostsPath: path.join(directory, 'known_hosts'),
+    })
+    const verifier = createHostVerifier(config, silentLogger)
+    assert.equal(typeof verifier, 'function')
+    // 没有任何记录时按 TOFU 放行
+    assert.equal(verifier(publicSshBlob(utils.generateKeyPairSync('ed25519').public)), true)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('隧道把 HTTP 原样送到远端,不解析不改写', { timeout: 30_000 }, async () => {

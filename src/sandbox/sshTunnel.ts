@@ -8,8 +8,9 @@
 // 否则 "Named export 'Client' not found"。
 import ssh2 from 'ssh2'
 import type { Client as SshClient, ConnectConfig } from 'ssh2'
-import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { createHash, createHmac } from 'node:crypto'
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
+import * as path from 'node:path'
 import { createServer, type Socket } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import type { Logger } from '../core/logger.ts'
@@ -142,8 +143,11 @@ export async function openSshTunnel(
  * 校验主机密钥。
  *
  * known_hosts 里有这个主机就按里面的比对,不一致直接拒绝。
- * 没有就按 TOFU 记下来——第一次连的时候没人能证明对错,
+ * 没有就按 TOFU 接受并写回文件——第一次连的时候没人能证明对错,
  * 但之后指纹变了必须炸,不然就是中间人。
+ *
+ * 写回是关键:只记在内存里的话,进程一退就忘了,下次又是 TOFU,
+ * 等于永远不会因为换钥匙而拒绝。
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
@@ -151,27 +155,33 @@ export function createHostVerifier(
   config: SshConnectionConfig,
   logger?: Logger,
 ): (key: Buffer) => boolean {
-  const expected = loadKnownHosts(config.knownHostsPath, logger)
-  const hostKey = `${config.host}:${config.port}`
+  const known = loadKnownHosts(config.knownHostsPath, logger)
+  const hostName = knownHostsHostName(config.host, config.port)
+  // 本次连接里刚放行的指纹。写回失败时,同一个进程内也不至于重新 TOFU。
+  const acceptedInSession = new Set<string>()
+
   return (key: Buffer): boolean => {
     const fingerprint = keyFingerprint(key)
-    const known = expected.get(hostKey)
-    if (!known) {
-      // 第一次见这个主机。记录指纹,以后变了会被拒。
+    const knownFingerprints = findKnownHostFingerprints(known, config.host, config.port)
+
+    if (knownFingerprints.has(fingerprint)) return true
+    if (acceptedInSession.has(fingerprint)) return true
+
+    // 文件里完全没有这个主机的记录,才是真正的第一次连接
+    if (knownFingerprints.size === 0 && acceptedInSession.size === 0) {
+      acceptedInSession.add(fingerprint)
+      appendKnownHost(config.knownHostsPath, hostName, key, logger)
       logger?.warn({ host: config.host, port: config.port, fingerprint }, '首次连接该主机,已记录主机密钥指纹')
-      expected.set(hostKey, fingerprint)
       return true
     }
-    if (known !== fingerprint) {
-      logger?.error({
-        host: config.host,
-        port: config.port,
-        expectedFingerprint: known,
-        actualFingerprint: fingerprint,
-      }, '主机密钥指纹变了,拒绝连接')
-      return false
-    }
-    return true
+
+    logger?.error({
+      host: config.host,
+      port: config.port,
+      knownFingerprints: [...knownFingerprints],
+      actualFingerprint: fingerprint,
+    }, '主机密钥指纹变了,拒绝连接')
+    return false
   }
 }
 
@@ -186,48 +196,201 @@ export function keyFingerprint(key: Buffer): string {
 }
 
 /**
- * 读 known_hosts,取出「主机:端口 -> 指纹」的映射。
+ * 主机在 known_hosts 里的写法。
  *
- * 文件不存在不算错——第一次连接就是这样。只关心本机要连的那几个主机,
- * 别的条目解析不出来就跳过。
+ * OpenSSH 的规则:22 端口写裸 host,非 22 端口写 [host]:port。
+ * 一律拼 host:port 的话,非标端口永远命中不了,校验就等于没有。
+ */
+export function knownHostsHostName(host: string, port: number): string {
+  return port === 22 ? host : `[${host}]:${port}`
+}
+
+/** known_hosts 里一条明文条目。patterns 保留 ! 否定前缀,匹配时统一判断。 */
+export type KnownHostsEntry = {
+  patterns: string[]
+  fingerprint: string
+}
+
+/** OpenSSH 的哈希主机名条目:HMAC-SHA1(salt, hostname) === hash。 */
+export type HashedHostEntry = {
+  salt: Buffer
+  hash: Buffer
+  fingerprint: string
+}
+
+export type KnownHosts = {
+  entries: KnownHostsEntry[]
+  hashed: HashedHostEntry[]
+}
+
+/**
+ * 读 known_hosts。
+ *
+ * 文件不存在不算错——第一次连接就是这样。解析不出来的行跳过。
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
-export function loadKnownHosts(
-  knownHostsPath: string,
-  logger?: Logger,
-): Map<string, string> {
-  const result = new Map<string, string>()
+export function loadKnownHosts(knownHostsPath: string, logger?: Logger): KnownHosts {
+  const known: KnownHosts = { entries: [], hashed: [] }
   let content: string
   try {
     content = readFileSync(knownHostsPath, 'utf-8')
   } catch {
-    return result
+    return known
   }
   for (const line of content.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed || trimmed.startsWith('#')) continue
+    // @cert-authority / @revoked 是标记行,不能当普通指纹比对
+    if (trimmed.startsWith('@')) continue
     const parts = trimmed.split(/\s+/)
     // 格式:主机列表 密钥类型 密钥内容
     if (parts.length < 3) continue
-    const keyType = parts[1]
-    const keyBase64 = parts[2]
-    if (keyType !== 'ssh-ed25519' && keyType !== 'ssh-rsa' && keyType !== 'ecdsa-sha2-nistp256') {
-      continue
-    }
-    let key: Buffer
-    try {
-      key = Buffer.from(keyBase64, 'base64')
-    } catch {
-      continue
-    }
+    const key = decodeBase64Key(parts[2]!)
+    if (!key) continue
     const fingerprint = keyFingerprint(key)
-    for (const host of parts[0].split(',')) {
-      result.set(host.trim(), fingerprint)
+    const hostField = parts[0]!
+    if (hostField.startsWith('|1|')) {
+      const hashed = parseHashedHost(hostField, fingerprint)
+      if (hashed) known.hashed.push(hashed)
+      continue
+    }
+    // 同一行可以用逗号列多个主机,带 ! 的是否定
+    known.entries.push({
+      patterns: hostField.split(',').map((pattern) => pattern.trim()).filter(Boolean),
+      fingerprint,
+    })
+  }
+  logger?.debug({
+    knownHostsPath,
+    entryCount: known.entries.length,
+    hashedCount: known.hashed.length,
+  }, '已读入 known_hosts')
+  return known
+}
+
+/**
+ * 找出 known_hosts 里登记给这个主机的全部指纹。
+ *
+ * 返回集合而不是单个值:同一台机器常常同时有 ed25519 和 rsa 两行。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+export function findKnownHostFingerprints(
+  known: KnownHosts,
+  host: string,
+  port: number,
+): Set<string> {
+  const candidates = hostCandidates(host, port)
+  const result = new Set<string>()
+  for (const entry of known.entries) {
+    if (entryMatches(entry.patterns, candidates)) result.add(entry.fingerprint)
+  }
+  for (const entry of known.hashed) {
+    if (candidates.some((candidate) => hashMatches(entry, candidate))) {
+      result.add(entry.fingerprint)
     }
   }
-  logger?.debug({ knownHostsPath, hostCount: result.size }, '已读入 known_hosts')
   return result
+}
+
+/**
+ * 候选主机名。
+ *
+ * 除了 OpenSSH 规范写法,也认旧版 Grass 写下的 host:port——
+ * 那些文件是历史遗留,不兼容的话用户会莫名其妙重新 TOFU 一次。
+ */
+function hostCandidates(host: string, port: number): string[] {
+  const canonical = knownHostsHostName(host, port)
+  const legacy = `${host}:${port}`
+  return canonical === legacy ? [canonical] : [canonical, legacy]
+}
+
+/** 一行里的多个模式:任一肯定模式命中、且没有否定模式命中,才算这一行匹配。 */
+function entryMatches(patterns: readonly string[], candidates: readonly string[]): boolean {
+  let positive = false
+  for (const pattern of patterns) {
+    const negative = pattern.startsWith('!')
+    const body = negative ? pattern.slice(1) : pattern
+    if (!candidates.some((candidate) => globMatches(body, candidate))) continue
+    if (negative) return false
+    positive = true
+  }
+  return positive
+}
+
+/** OpenSSH 的 known_hosts 支持 * 和 ? 通配。 */
+function globMatches(pattern: string, value: string): boolean {
+  if (!pattern.includes('*') && !pattern.includes('?')) return pattern === value
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.')
+  return new RegExp(`^${escaped}$`).test(value)
+}
+
+function hashMatches(entry: HashedHostEntry, candidate: string): boolean {
+  const computed = createHmac('sha1', entry.salt).update(candidate).digest()
+  return computed.equals(entry.hash)
+}
+
+/** 解析 |1|salt|hash 形式。salt 和 hash 都是 base64。 */
+function parseHashedHost(hostField: string, fingerprint: string): HashedHostEntry | null {
+  const parts = hostField.split('|')
+  // 开头的 | 会切出一个空串:['', '1', salt, hash]
+  if (parts.length !== 4 || parts[1] !== '1') return null
+  const salt = decodeBase64Key(parts[2]!)
+  const hash = decodeBase64Key(parts[3]!)
+  if (!salt || !hash) return null
+  return { salt, hash, fingerprint }
+}
+
+/** 解 base64 密钥内容。空串或解不出字节就当这一行坏了。 */
+function decodeBase64Key(base64: string): Buffer | null {
+  if (!base64) return null
+  const decoded = Buffer.from(base64, 'base64')
+  return decoded.length > 0 ? decoded : null
+}
+
+/**
+ * 把刚认识的主机密钥追加到 known_hosts。
+ *
+ * 密钥类型从 SSH wire format 头部解析——写错类型的行下次读进来照样能比指纹,
+ * 但 OpenSSH 自己读那份文件时会跳过,所以宁可不写也不要写错。
+ *
+ * 写失败不阻断连接:只 warn,下次连接会重新 TOFU 一遍。
+ */
+function appendKnownHost(
+  knownHostsPath: string,
+  hostName: string,
+  key: Buffer,
+  logger?: Logger,
+): void {
+  const keyType = sshKeyType(key)
+  if (!keyType) {
+    logger?.warn({ knownHostsPath }, '主机密钥类型解析不出来,没有写回 known_hosts')
+    return
+  }
+  const line = `${hostName} ${keyType} ${key.toString('base64')}\n`
+  try {
+    mkdirSync(path.dirname(knownHostsPath), { recursive: true, mode: 0o700 })
+    appendFileSync(knownHostsPath, line, { encoding: 'utf-8', mode: 0o600 })
+  } catch (error) {
+    logger?.warn({
+      knownHostsPath,
+      errorMessage: (error as Error).message,
+    }, '主机密钥指纹写不回 known_hosts')
+  }
+}
+
+/** SSH wire format 开头是长度前缀 + 算法名。 */
+function sshKeyType(key: Buffer): string | null {
+  if (key.length < 4) return null
+  const nameLength = key.readUInt32BE(0)
+  if (nameLength < 1 || nameLength > 64 || nameLength > key.length - 4) return null
+  const name = key.subarray(4, 4 + nameLength).toString('ascii')
+  // 算法名是可见 ASCII,带控制字符说明拿到的根本不是密钥
+  return /^[a-z0-9@.-]+$/i.test(name) ? name : null
 }
 
 /**
