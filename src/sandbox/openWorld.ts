@@ -112,6 +112,8 @@ async function openInProcessControlPlane(
     remoteRoot: config.SandboxSshRemoteRoot,
     healthTimeoutMs: config.SandboxSshHealthTimeoutMs,
     callTimeoutMs: config.SandboxSshCallTimeoutMs,
+    orphanMinimumAgeMs: config.SandboxSshOrphanAgeMs,
+    keepRetentionMs: config.SandboxSshKeepRetentionMs,
     timeoutMs: config.SandboxSshTimeoutMs,
   })
   const plane = createControlPlane({ backend, controlToken: config.SandboxControlToken })

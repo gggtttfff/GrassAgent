@@ -7,7 +7,7 @@
 
 import type { Logger } from '../core/logger.ts'
 import type { ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
-import { deployRemoteDaemon, type RemoteDaemon } from './sshDeploy.ts'
+import { deployRemoteDaemon, sweepOrphanDirectories, type RemoteDaemon } from './sshDeploy.ts'
 import { resolveSshConfig, type SshConnectionConfig } from './sshConfig.ts'
 import { connectSsh, openSshTunnel, type SshTunnel } from './sshTunnel.ts'
 import {
@@ -35,6 +35,10 @@ export type SshBackendOptions = {
   healthTimeoutMs?: number
   /** 单次调用的超时(毫秒)。exec 按它自己的超时另算。 */
   callTimeoutMs?: number
+  /** 残留目录至少这么旧才清理。太新可能在别的进程部署中。 */
+  orphanMinimumAgeMs?: number
+  /** keep 的沙盒目录保留这么久。 */
+  keepRetentionMs?: number
   timeoutMs?: number
   logger?: Logger
 }
@@ -47,6 +51,15 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 
 /** 普通调用的超时。exec 另外按它自己的 timeoutMs 放宽。 */
 const DEFAULT_CALL_TIMEOUT_MS = 30_000
+
+/** 残留目录的默认清理门槛:半小时。 */
+const DEFAULT_ORPHAN_MINIMUM_AGE_MS = 30 * 60 * 1000
+
+/** 远程根目录的默认值,和 deployRemoteDaemon 保持一致。 */
+const DEFAULT_REMOTE_ROOT = '/tmp'
+
+/** keep 的目录默认保留一周。 */
+const DEFAULT_KEEP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 
 /** exec 在本机这一侧要留出往返和排队的时间。 */
 const EXEC_TIMEOUT_MARGIN_MS = 5_000
@@ -78,12 +91,23 @@ async function provision(
   let daemon: RemoteDaemon | undefined
   let tunnel: SshTunnel | undefined
   try {
+    // 先把上次异常退出留下的目录清一遍。多会话共用一台机器时,
+    // 判断是否会误删在 shouldRemoveOrphan 里,这里只管调用。
+    await sweepOrphanDirectories({
+      client,
+      remoteRoot: options.remoteRoot ?? DEFAULT_REMOTE_ROOT,
+      minimumAgeMs: options.orphanMinimumAgeMs ?? DEFAULT_ORPHAN_MINIMUM_AGE_MS,
+      keepRetentionMs: options.keepRetentionMs ?? DEFAULT_KEEP_RETENTION_MS,
+      logger: options.logger,
+    })
+
     daemon = await deployRemoteDaemon({
       client,
       sandboxId: request.sandboxId,
       token: request.token,
       remoteWorkspace: config.remoteWorkspace ?? undefined,
       diskMb: request.diskMb,
+      keep: request.keep,
       remoteRoot: options.remoteRoot,
       logger: options.logger,
     })

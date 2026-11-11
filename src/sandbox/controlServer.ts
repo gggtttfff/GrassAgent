@@ -59,6 +59,8 @@ function sshBackendOptionsFromEnv(): SshBackendOptions {
     remoteRoot: process.env.GRASSAGENT_SANDBOX_SSH_REMOTE_ROOT,
     healthTimeoutMs: Number(process.env.GRASSAGENT_SANDBOX_SSH_HEALTH_TIMEOUT_MS || 30_000),
     callTimeoutMs: Number(process.env.GRASSAGENT_SANDBOX_SSH_CALL_TIMEOUT_MS || 30_000),
+    orphanMinimumAgeMs: Number(process.env.GRASSAGENT_SANDBOX_SSH_ORPHAN_AGE_MS || 1_800_000),
+    keepRetentionMs: Number(process.env.GRASSAGENT_SANDBOX_SSH_KEEP_RETENTION_MS || 604_800_000),
     timeoutMs: Number(process.env.GRASSAGENT_SANDBOX_SSH_TIMEOUT_MS || 30_000),
   }
 }

@@ -208,6 +208,15 @@ export const configSchema = z.object({
   SandboxSshCallTimeoutMs: numericOption({
     minimum: 1_000, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshCallTimeoutMs',
   }),
+  // 远程残留目录至少这么旧才清理。太新可能在别的进程部署中。
+  SandboxSshOrphanAgeMs: numericOption({
+    minimum: 60_000, maximum: 604_800_000, defaultValue: 1_800_000, label: 'SandboxSshOrphanAgeMs',
+  }),
+  // 带 keep 标记的沙盒目录保留多久。
+  SandboxSshKeepRetentionMs: numericOption({
+    minimum: 3_600_000, maximum: 31_536_000_000, defaultValue: 604_800_000,
+    label: 'SandboxSshKeepRetentionMs',
+  }),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
   {
@@ -313,6 +322,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxSshTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_TIMEOUT_MS`,
   SandboxSshHealthTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_HEALTH_TIMEOUT_MS`,
   SandboxSshCallTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_CALL_TIMEOUT_MS`,
+  SandboxSshOrphanAgeMs: `${ENV_PREFIX}SANDBOX_SSH_ORPHAN_AGE_MS`,
+  SandboxSshKeepRetentionMs: `${ENV_PREFIX}SANDBOX_SSH_KEEP_RETENTION_MS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

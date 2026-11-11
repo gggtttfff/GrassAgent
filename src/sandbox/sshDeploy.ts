@@ -13,6 +13,8 @@ import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Logger } from '../core/logger.ts'
+import { stringifyJson } from '../core/jsonSafety.ts'
+import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
 import {
   computeSourceHash,
   formatNodeVersion,
@@ -20,10 +22,16 @@ import {
   MINIMUM_NODE_VERSION,
   nodeVersionIsSupported,
   parseNodeVersion,
+  parseSweepListing,
   sandboxDirectory,
+  SANDBOX_STATE_FILE_NAME,
+  shouldRemoveOrphan,
   sourceDirectory,
   stagingDirectory,
+  sweepListingCommand,
   type NodeVersion,
+  type OrphanCandidate,
+  type SandboxState,
 } from './remoteLayout.ts'
 
 /** daemon 及其依赖。相对本仓库根目录。 */
@@ -103,6 +111,8 @@ export type DeployOptions = {
   /** 远程工作区的真实路径。留空则用远程的 $HOME/grass-workspace。 */
   remoteWorkspace?: string
   diskMb: number
+  /** 回收时保留沙盒目录,供挂回用。 */
+  keep?: boolean
   /** 远程上放 daemon 源码的根目录。默认 /tmp。 */
   remoteRoot?: string
   logger?: Logger
@@ -157,68 +167,88 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
 
     // 清理脚本也提前放好。收尾时只执行它,不在命令行里拼 daemon 路径。
     await remote.write(stopPath, STOP_SCRIPT)
+
+    // 4. SFTP 建得出目录不代表这个用户能写。报错要点名该改哪个配置。
+    await assertWorkspaceWritable(client, workspace, logger)
+    logger?.debug({ sourceDir, sandboxDir, sourceHash: shortHash }, '远程源码已就位')
+
+    const daemonPath = `${sourceDir}/src/sandbox/daemon.ts`
+    const startCommand = [
+      'nohup node',
+      shellQuote(daemonPath),
+      '--serve',
+      '--host', '127.0.0.1',
+      // 端口交给系统挑。写死的话同一台机器上两个沙盒必然抢端口。
+      '--port', '0',
+      '--token-file', shellQuote(tokenPath),
+      '--workspace', shellQuote(workspace),
+      '--advertised-root', '/workspace',
+      '--disk-mb', String(options.diskMb),
+      `> ${shellQuote(logPath)} 2>&1 &`,
+      // 记下 PID。按进程名杀容易误伤,按 PID 精准。
+      `echo $! > ${shellQuote(pidPath)}`,
+    ].join(' ')
+
+    await runRemote(client, startCommand, logger)
+    const port = await discoverDaemonPort(client, logPath, logger)
+    const pid = await readDaemonPid(remote, pidPath)
+
+    // state.json 是崩溃后唯一能说明「这个目录属于谁、还活不活」的东西。
+    // 孤儿扫描和挂回都靠它。
+    const state: SandboxState = {
+      schema: 1,
+      sandboxId: options.sandboxId,
+      workspace,
+      sourceHash: shortHash,
+      sourceDirectory: sourceDir,
+      port,
+      pid,
+      diskMb: options.diskMb,
+      protocolVersion: SANDBOX_PROTOCOL_VERSION,
+      keep: options.keep === true,
+      createdAt: new Date().toISOString(),
+    }
+    const statePath = `${sandboxDir}/${SANDBOX_STATE_FILE_NAME}`
+    await remote.write(statePath, stringifyJson(state))
+    await remote.chmod(statePath, 0o600)
+
+    // 探活交给调用方走隧道做——那才是请求真正要过的路。
+    // 以前在这里用 curl 探,除了重复一次,还会把令牌放进远程的进程命令行,
+    // 同一台机器上任何人 ps 一下就能看到。
+    return {
+      port,
+      remoteDirectory: sandboxDir,
+      sourceDirectory: sourceDir,
+      readLogTail: async (maxChars = 800) => {
+        const output = await runRemote(
+          client,
+          `cat ${shellQuote(logPath)} 2>/dev/null || true`,
+          logger,
+        )
+        return output.slice(-maxChars)
+      },
+      stop: async () => {
+        // 杀进程和删目录放一条命令:中途断线的话至少不会只做一半。
+        // 脚本自己带兜底,它失败了 `;` 后面的 rm 照样跑。
+        //
+        // 只删沙盒目录。共享源码目录同机其他会话还在用,
+        // 删了它们下次重启就找不到 daemon 源码了。
+        await runRemote(
+          client,
+          `sh ${shellQuote(stopPath)} ${shellQuote(sandboxDir)}; rm -rf ${shellQuote(sandboxDir)}`,
+          logger,
+        ).catch((error: unknown) => {
+          // 连接已经断了的话这条命令根本跑不到。别把收尾卡住,
+          // 残留目录交给下次启动的孤儿扫描。
+          logger?.warn({
+            sandboxDirectory: sandboxDir,
+            errorMessage: (error as Error).message,
+          }, '远程清理失败,留给下次启动扫描')
+        })
+      },
+    }
   } finally {
     remote.close()
-  }
-
-  // 4. SFTP 建得出目录不代表这个用户能写。报错要点名该改哪个配置。
-  await assertWorkspaceWritable(client, workspace, logger)
-  logger?.debug({ sourceDir, sandboxDir, sourceHash: shortHash }, '远程源码已就位')
-
-  const daemonPath = `${sourceDir}/src/sandbox/daemon.ts`
-  const startCommand = [
-    'nohup node',
-    shellQuote(daemonPath),
-    '--serve',
-    '--host', '127.0.0.1',
-    // 端口交给系统挑。写死的话同一台机器上两个沙盒必然抢端口。
-    '--port', '0',
-    '--token-file', shellQuote(tokenPath),
-    '--workspace', shellQuote(workspace),
-    '--advertised-root', '/workspace',
-    '--disk-mb', String(options.diskMb),
-    `> ${shellQuote(logPath)} 2>&1 &`,
-    // 记下 PID。按进程名杀容易误伤,按 PID 精准。
-    `echo $! > ${shellQuote(pidPath)}`,
-  ].join(' ')
-
-  await runRemote(client, startCommand, logger)
-  const port = await discoverDaemonPort(client, logPath, logger)
-
-  // 探活交给调用方走隧道做——那才是请求真正要过的路。
-  // 以前在这里用 curl 探,除了重复一次,还会把令牌放进远程的进程命令行,
-  // 同一台机器上任何人 ps 一下就能看到。
-  return {
-    port,
-    remoteDirectory: sandboxDir,
-    sourceDirectory: sourceDir,
-    readLogTail: async (maxChars = 800) => {
-      const output = await runRemote(
-        client,
-        `cat ${shellQuote(logPath)} 2>/dev/null || true`,
-        logger,
-      )
-      return output.slice(-maxChars)
-    },
-    stop: async () => {
-      // 杀进程和删目录放一条命令:中途断线的话至少不会只做一半。
-      // 脚本自己带兜底,它失败了 `;` 后面的 rm 照样跑。
-      //
-      // 只删沙盒目录。共享源码目录同机其他会话还在用,
-      // 删了它们下次重启就找不到 daemon 源码了。
-      await runRemote(
-        client,
-        `sh ${shellQuote(stopPath)} ${shellQuote(sandboxDir)}; rm -rf ${shellQuote(sandboxDir)}`,
-        logger,
-      ).catch((error: unknown) => {
-        // 连接已经断了的话这条命令根本跑不到。别把收尾卡住,
-        // 残留目录交给下次启动的孤儿扫描。
-        logger?.warn({
-          sandboxDirectory: sandboxDir,
-          errorMessage: (error as Error).message,
-        }, '远程清理失败,留给下次启动扫描')
-      })
-    },
   }
 }
 
@@ -385,6 +415,102 @@ async function ensureSourceDirectory(
     }
     logger?.warn({ staging, sourceDir }, '上传远程源码失败,临时目录留给下次启动清理')
     throw new Error(`上传远程源码失败 ${sourceDir}: ${(error as Error).message}`)
+  }
+}
+
+/** 读 daemon 的 PID。读不到就当 0,后面判断活不活自然会当它已经死了。 */
+async function readDaemonPid(remote: RemoteFiles, pidPath: string): Promise<number> {
+  const text = await remote.read(pidPath)
+  const matched = text?.trim().match(/^\d+$/)
+  return matched ? Number(matched[0]) : 0
+}
+
+export type SweepOptions = {
+  client: Client
+  remoteRoot: string
+  /** 目录至少这么旧才考虑删。太新可能在别的进程部署中。 */
+  minimumAgeMs: number
+  /** keep 的目录保留这么久。 */
+  keepRetentionMs: number
+  logger?: Logger
+}
+
+/**
+ * 清理上次异常退出留下的目录。
+ *
+ * 正常收尾时用不着它。真正的场景是进程被强杀、机器重启、
+ * 或者连接中途断了——那时候沙盒目录没人删,只会越积越多。
+ *
+ * 判断全在 shouldRemoveOrphan 里,这里只负责采集和动手。
+ */
+export async function sweepOrphanDirectories(options: SweepOptions): Promise<string[]> {
+  const { client, remoteRoot, logger } = options
+  let listing: string
+  try {
+    listing = await runRemote(client, sweepListingCommand(remoteRoot), logger)
+  } catch (error) {
+    // 扫描是锦上添花,它失败不该挡住本次部署
+    logger?.warn({ errorMessage: (error as Error).message }, '扫描远程残留目录失败,跳过')
+    return []
+  }
+
+  const nowMs = Date.now()
+  const nowSeconds = Math.floor(nowMs / 1000)
+  const removed: string[] = []
+  for (const line of parseSweepListing(listing)) {
+    const ageMs = Math.max(0, nowSeconds - line.modifiedSeconds) * 1000
+    if (ageMs < options.minimumAgeMs) continue
+
+    if (line.kind === 'staging') {
+      // 上传残留没有归属,过阈值就是垃圾
+      if (await removeRemoteDirectory(client, line.directory, logger)) {
+        removed.push(line.directory)
+      }
+      continue
+    }
+
+    const keptAt = line.state?.keptAt ? Date.parse(line.state.keptAt) : Number.NaN
+    const candidate: OrphanCandidate = {
+      directory: line.directory,
+      ageMs,
+      // 读不到 state.json 就绝不自动删——宁可留垃圾
+      stateReadable: line.state !== null,
+      keep: line.state?.keep === true,
+      keptAgeMs: Number.isFinite(keptAt) ? Math.max(0, nowMs - keptAt) : undefined,
+      pidAlive: line.pid !== null && await pidIsAlive(client, line.pid, logger),
+    }
+    if (!shouldRemoveOrphan(candidate, options)) continue
+    if (await removeRemoteDirectory(client, line.directory, logger)) {
+      removed.push(line.directory)
+    }
+  }
+
+  if (removed.length > 0) {
+    logger?.info({ removed, count: removed.length }, '已清理远程残留目录')
+  }
+  return removed
+}
+
+async function pidIsAlive(client: Client, pid: number, logger?: Logger): Promise<boolean> {
+  try {
+    await runRemote(client, `kill -0 ${pid}`, logger)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function removeRemoteDirectory(
+  client: Client,
+  directory: string,
+  logger?: Logger,
+): Promise<boolean> {
+  try {
+    await runRemote(client, `rm -rf ${shellQuote(directory)}`, logger)
+    return true
+  } catch (error) {
+    logger?.warn({ directory, errorMessage: (error as Error).message }, '删除远程残留目录失败')
+    return false
   }
 }
 

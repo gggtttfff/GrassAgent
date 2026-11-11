@@ -8,6 +8,7 @@
 // 混在一起的话,要么删不干净,要么把别人正在用的源码一起删了。
 
 import { createHash } from 'node:crypto'
+import { parseJson } from '../core/jsonSafety.ts'
 import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
 
 /** 共享源码目录的前缀。 */
@@ -98,6 +99,168 @@ export function formatNodeVersion(version: NodeVersion): string {
  */
 export function homeWorkspace(homeDirectory: string): string {
   return `${trimSlash(homeDirectory)}/grass-workspace`
+}
+
+/** 每沙盒目录里的状态文件。挂回和孤儿扫描都读它。 */
+export const SANDBOX_STATE_FILE_NAME = 'state.json'
+
+/**
+ * 一个沙盒的持久化状态。
+ *
+ * 进程崩了之后,这些是唯一能说明「这个目录属于谁、还活不活」的东西。
+ */
+export type SandboxState = {
+  schema: 1
+  sandboxId: string
+  workspace: string
+  sourceHash: string
+  sourceDirectory: string
+  port: number
+  pid: number
+  diskMb: number
+  protocolVersion: number
+  keep: boolean
+  createdAt: string
+  keptAt?: string
+}
+
+/** 解析 state.json。结构对不上就当没有——模型和用户都能改这个文件。 */
+export function parseSandboxState(text: string): SandboxState | null {
+  let parsed: unknown
+  try {
+    parsed = parseJson(text)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const state = parsed as Record<string, unknown>
+  if (state.schema !== 1) return null
+  if (typeof state.sandboxId !== 'string') return null
+  if (typeof state.workspace !== 'string') return null
+  if (typeof state.sourceDirectory !== 'string') return null
+  if (typeof state.port !== 'number') return null
+  return {
+    schema: 1,
+    sandboxId: state.sandboxId,
+    workspace: state.workspace,
+    sourceHash: typeof state.sourceHash === 'string' ? state.sourceHash : '',
+    sourceDirectory: state.sourceDirectory,
+    port: state.port,
+    pid: typeof state.pid === 'number' ? state.pid : 0,
+    diskMb: typeof state.diskMb === 'number' ? state.diskMb : 10_240,
+    protocolVersion: typeof state.protocolVersion === 'number' ? state.protocolVersion : 0,
+    keep: state.keep === true,
+    createdAt: typeof state.createdAt === 'string' ? state.createdAt : '',
+    keptAt: typeof state.keptAt === 'string' ? state.keptAt : undefined,
+  }
+}
+
+/** 扫描用的一个沙盒目录候选。 */
+export type OrphanCandidate = {
+  directory: string
+  /** 目录最后修改到现在过了多久。 */
+  ageMs: number
+  /** state.json 读不出来的目录,绝不自动删。 */
+  stateReadable: boolean
+  keep: boolean
+  /** keep 之后过了多久。没 keep 过就是 undefined。 */
+  keptAgeMs?: number
+  pidAlive: boolean
+}
+
+export type OrphanPolicy = {
+  /** 目录至少这么旧才考虑删。太新可能在别的进程部署中。 */
+  minimumAgeMs: number
+  /** keep 的目录保留这么久。 */
+  keepRetentionMs: number
+}
+
+/**
+ * 该不该删这个目录。
+ *
+ * 多会话共存时,唯一可靠的「活跃」证据是 PID 还活着。所以判断顺序是
+ * 一路放行:读不到状态、进程还活着、keep 没过期、目录太新,任一成立就先留着。
+ * 宁可漏删留垃圾,也不能把别人正在用的沙盒删了。
+ */
+export function shouldRemoveOrphan(
+  candidate: OrphanCandidate,
+  policy: OrphanPolicy,
+): boolean {
+  if (!candidate.stateReadable) return false
+  if (candidate.pidAlive) return false
+  if (candidate.keep && (candidate.keptAgeMs ?? 0) < policy.keepRetentionMs) return false
+  return candidate.ageMs >= policy.minimumAgeMs
+}
+
+/** 扫描输出的一行。字段用 tab 分隔,路径里有空格也不怕。 */
+export type SweepLine =
+  | { kind: 'sandbox'; directory: string; modifiedSeconds: number; pid: number | null; state: SandboxState | null }
+  | { kind: 'staging'; directory: string; modifiedSeconds: number }
+
+/**
+ * 解析扫描命令的输出。
+ *
+ * 格式和 sweepListingCommand 一一对应。坏行跳过——扫描是尽力而为,
+ * 一行看不懂不该让整次清理失败。
+ */
+export function parseSweepListing(output: string): SweepLine[] {
+  const lines: SweepLine[] = []
+  for (const raw of output.split('\n')) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    const fields = trimmed.split('\t')
+    const kind = fields[0]
+    if (kind === 'S') {
+      const directory = fields[1]
+      if (!directory) continue
+      const modifiedSeconds = Number(fields[2] ?? '0') || 0
+      const pidText = (fields[3] ?? '').trim()
+      const pid = /^\d+$/.test(pidText) ? Number(pidText) : null
+      const stateText = fields[4] ?? ''
+      lines.push({
+        kind: 'sandbox',
+        directory,
+        modifiedSeconds,
+        pid,
+        state: stateText ? parseSandboxState(stateText) : null,
+      })
+      continue
+    }
+    if (kind === 'T') {
+      const directory = fields[1]
+      if (!directory) continue
+      lines.push({
+        kind: 'staging',
+        directory,
+        modifiedSeconds: Number(fields[2] ?? '0') || 0,
+      })
+    }
+  }
+  return lines
+}
+
+/**
+ * 列出远程根目录下的沙盒目录和上传残留。
+ *
+ * 只做数据采集,删不删由 shouldRemoveOrphan 在 TypeScript 里判断——
+ * 把决策塞进 shell 就没法单测了。
+ */
+export function sweepListingCommand(remoteRoot: string): string {
+  const root = trimSlash(remoteRoot)
+  return [
+    `for dir in ${root}/grass-sandbox-*; do`,
+    '  [ -d "$dir" ] || continue',
+    '  modified="$(stat -c %Y "$dir" 2>/dev/null || stat -f %m "$dir" 2>/dev/null || echo 0)"',
+    '  pid="$(cat "$dir/daemon.pid" 2>/dev/null | tr -d " \\n")"',
+    '  state="$(cat "$dir/state.json" 2>/dev/null | tr -d "\\n")"',
+    '  printf "S\\t%s\\t%s\\t%s\\t%s\\n" "$dir" "$modified" "$pid" "$state"',
+    'done',
+    `for dir in ${root}/grass-daemon-*.tmp-*; do`,
+    '  [ -d "$dir" ] || continue',
+    '  modified="$(stat -c %Y "$dir" 2>/dev/null || stat -f %m "$dir" 2>/dev/null || echo 0)"',
+    '  printf "T\\t%s\\t%s\\n" "$dir" "$modified"',
+    'done',
+  ].join('\n')
 }
 
 function trimSlash(remotePath: string): string {

@@ -7,9 +7,13 @@ import {
   MINIMUM_NODE_VERSION,
   nodeVersionIsSupported,
   parseNodeVersion,
+  parseSandboxState,
+  parseSweepListing,
   sandboxDirectory,
+  shouldRemoveOrphan,
   sourceDirectory,
   stagingDirectory,
+  sweepListingCommand,
 } from '../../src/sandbox/remoteLayout.ts'
 
 // 远程目录布局的纯函数测试。
@@ -82,4 +86,97 @@ test('默认工作区放在用户的 HOME 下', () => {
   // 不用 /workspace(要 root)、也不用 /tmp(tmpfiles 会清),
   assert.equal(homeWorkspace('/root'), '/root/grass-workspace')
   assert.equal(homeWorkspace('/home/dev/'), '/home/dev/grass-workspace')
+})
+
+// ---- 残留目录清理 ----
+//
+// 这些判断错一次的代价是删掉别的会话正在用的沙盒,所以每条放行条件都单独测。
+
+const POLICY = { minimumAgeMs: 30 * 60_000, keepRetentionMs: 7 * 24 * 60 * 60_000 }
+
+function candidate(overrides: Partial<Parameters<typeof shouldRemoveOrphan>[0]> = {}) {
+  return {
+    directory: '/tmp/grass-sandbox-x',
+    ageMs: 60 * 60_000,
+    stateReadable: true,
+    keep: false,
+    keptAgeMs: undefined,
+    pidAlive: false,
+    ...overrides,
+  }
+}
+
+test('确实没人要的旧目录才删', () => {
+  assert.equal(shouldRemoveOrphan(candidate(), POLICY), true)
+})
+
+test('读不到 state.json 的目录绝不自动删', () => {
+  // 分不清是谁的,删了可能砸掉别人的会话
+  assert.equal(shouldRemoveOrphan(candidate({ stateReadable: false }), POLICY), false)
+})
+
+test('进程还活着的目录不删', () => {
+  assert.equal(shouldRemoveOrphan(candidate({ pidAlive: true }), POLICY), false)
+})
+
+test('太新的目录不删,可能在别的进程部署中', () => {
+  assert.equal(shouldRemoveOrphan(candidate({ ageMs: 60_000 }), POLICY), false)
+})
+
+test('keep 的目录在保留期内不删,过期才删', () => {
+  assert.equal(
+    shouldRemoveOrphan(candidate({ keep: true, keptAgeMs: 24 * 60 * 60_000 }), POLICY),
+    false,
+  )
+  assert.equal(
+    shouldRemoveOrphan(candidate({ keep: true, keptAgeMs: 30 * 24 * 60 * 60_000 }), POLICY),
+    true,
+  )
+})
+
+test('解析扫描输出:沙盒行和上传残留行', () => {
+  const state = JSON.stringify({
+    schema: 1,
+    sandboxId: 'abc',
+    workspace: '/root/grass-workspace',
+    sourceHash: 'deadbeef',
+    sourceDirectory: '/tmp/grass-daemon-deadbeef',
+    port: 40000,
+    pid: 1234,
+    diskMb: 1024,
+    protocolVersion: 2,
+    keep: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+  })
+  const output = [
+    ['S', '/tmp/grass-sandbox-abc', '1767225600', '1234', state].join('\t'),
+    ['T', '/tmp/grass-daemon-deadbeef.tmp-1-aa', '1767225600'].join('\t'),
+    // 坏行要跳过,不能让整次扫描失败
+    'garbage',
+    '',
+  ].join('\n')
+
+  const lines = parseSweepListing(output)
+  assert.equal(lines.length, 2)
+  const sandbox = lines[0]!
+  assert.equal(sandbox.kind, 'sandbox')
+  if (sandbox.kind !== 'sandbox') return
+  assert.equal(sandbox.directory, '/tmp/grass-sandbox-abc')
+  assert.equal(sandbox.pid, 1234)
+  assert.equal(sandbox.state?.keep, true)
+  assert.equal(sandbox.state?.port, 40000)
+  assert.equal(lines[1]!.kind, 'staging')
+})
+
+test('state.json 结构不对时当作没有', () => {
+  assert.equal(parseSandboxState('not json'), null)
+  assert.equal(parseSandboxState('{"schema":2}'), null)
+  // 缺必需字段
+  assert.equal(parseSandboxState('{"schema":1,"sandboxId":"a"}'), null)
+})
+
+test('扫描命令带远程根目录,不写死 /tmp', () => {
+  const command = sweepListingCommand('/var/lib/grass')
+  assert.ok(command.includes('/var/lib/grass/grass-sandbox-*'))
+  assert.ok(command.includes('/var/lib/grass/grass-daemon-*.tmp-*'))
 })
