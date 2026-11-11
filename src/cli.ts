@@ -883,7 +883,10 @@ async function main() {
     // SessionEnd 要先跑完,不能在 exit 事件里 await。
     if (inputClosed) {
       await shutdown()
-      process.exit(0)
+      // 不直接 process.exit:此时可能还有 HTTP socket 正在关闭,
+      // 硬退会撞上 libuv 的 UV_HANDLE_CLOSING 断言(Windows 上尤其明显)。
+      // 交给事件循环自己排空,没有存活句柄时进程自然结束。
+      process.exitCode = 0
     }
   }
 
