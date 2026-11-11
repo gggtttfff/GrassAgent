@@ -68,7 +68,8 @@ const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS sessions (
      id TEXT PRIMARY KEY,
      created_at INTEGER NOT NULL,
-     updated_at INTEGER NOT NULL
+     updated_at INTEGER NOT NULL,
+     title TEXT
    )`,
   `CREATE TABLE IF NOT EXISTS messages (
      session_id TEXT NOT NULL,
@@ -132,8 +133,29 @@ export class SessionStore {
     for (const statement of SCHEMA_STATEMENTS) {
       this.database.exec(statement)
     }
+    // 旧库的 sessions 表没有 title。IF NOT EXISTS 不会补列,这里单独加上。
+    this.ensureTitleColumn()
 
     this.ensureSessionRow()
+  }
+
+  /** 当前会话的标题。还没生成过就是 null */
+  getTitle(): string | null {
+    const rows = this.database
+      .prepare('SELECT title FROM sessions WHERE id = ?')
+      .all(this.currentSessionId) as Array<{ title: string | null }>
+    const title = rows[0]?.title?.trim()
+    return title ? title : null
+  }
+
+  /** 写下小模型生成的标题。空字符串忽略,避免把已有标题擦掉 */
+  setTitle(title: string): void {
+    if (this.closed) throw new Error('会话存储已关闭')
+    const trimmed = title.trim()
+    if (!trimmed) return
+    this.database
+      .prepare('UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?')
+      .run(trimmed, Date.now(), this.currentSessionId)
   }
 
   /** 当前会话的 ID */
@@ -422,6 +444,13 @@ export class SessionStore {
     this.database.close()
   }
 
+  // 旧库升级:sessions 原来没有 title 列。
+  private ensureTitleColumn(): void {
+    const columns = this.database.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>
+    if (columns.some((column) => column.name === 'title')) return
+    this.database.exec('ALTER TABLE sessions ADD COLUMN title TEXT')
+  }
+
   // 确保 sessions 表里有当前会话的行,方便外部工具查看有哪些会话
   private ensureSessionRow(): void {
     const now = Date.now()
@@ -449,16 +478,17 @@ export class SessionStore {
   listSessionDetails(): SessionDetail[] {
     const rows = this.database
       .prepare(
-        'SELECT s.id AS id, s.updated_at AS updatedAt, ' +
+        'SELECT s.id AS id, s.updated_at AS updatedAt, s.title AS title, ' +
           '(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS messageCount ' +
           'FROM sessions s ORDER BY s.updated_at DESC',
       )
-      .all() as Array<{ id: string; updatedAt: number; messageCount: number }>
+      .all() as Array<{ id: string; updatedAt: number; messageCount: number; title: string | null }>
 
     return rows.map((row) => ({
       id: row.id,
       updatedAt: row.updatedAt,
       messageCount: row.messageCount,
+      title: row.title?.trim() ? row.title.trim() : null,
     }))
   }
 }
@@ -482,6 +512,8 @@ export interface SessionDetail {
   updatedAt: number
   /** 消息条数 */
   messageCount: number
+  /** 小模型生成的标题。没有就是 null */
+  title: string | null
 }
 
 /**

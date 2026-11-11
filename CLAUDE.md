@@ -13,11 +13,11 @@ cli.ts                  唯一入口：拼装所有簇，自己不被任何模�
   ↓
 ui/         tui / theme / sessionPicker / nonInteractiveTerminal / lineQueue / slashCommands
   ↓
-agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands
+agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands / approval
   ↓
-llm/        llm / protocol / messages / compaction / providers/
+llm/        llm / protocol / messages / compaction / completeText / modelRoster / providers/
 instructions/ projectInstructions / skills
-session/    sessionStore / sessionBundle
+session/    sessionStore / sessionBundle / sessionTitle
 sandbox/    daemon / docker·inProcess·ssh 后端 / 控制面 / remoteWorld
   ↓
 world/      executionWorld / localWorld / outputBound / approvalGate / modeSwitch
@@ -192,6 +192,8 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 **62. 升级到全权限要人点头，配置写死不算。** `.env` 里写 `danger-full-access` 是用户本人授权，启动时用 `createStartupEscalationGate()` 放行并记 warn 日志；会话里用 `/mode` 切过去走 `askEscalation`，每次都问、不缓存。审批门按 `action.kind` 分支——`GRASSAGENT_APPROVE_SKILLS=allow` 只管技能，不该顺带放行升级。
 
 **63. Shift+Tab 只在只读和可写之间循环。** 升级到全权限要走 `/mode`：回合中途弹审批会跟 `ask_user` 抢同一个 `editor.onSubmit`。`/mode` 执行期间要 `tui.setBusy(true)`，否则空闲状态下的 Ctrl+C 会直接退进程。
+
+**64. 三类模型不要串岗。** 标题和压缩摘要走小模型，对话和工具循环走主力模型，写文件和命令的放行走审批模型。什么时候压缩由 token 预算决定，不由小模型再否决一次。审批失败、抛错或结果无法解析时拒绝执行，不要默许。`world/approvalGate.ts` 管的是人要不要点头，和审批模型不是同一条路。
 
 ## 已知取舍
 

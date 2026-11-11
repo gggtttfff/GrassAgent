@@ -24,7 +24,8 @@
 import { JsonSafetyError, stringifyJson } from '../core/jsonSafety.ts'
 import type { Context, CompactionState, Message } from './messages.ts'
 import type { Model } from './protocol.ts'
-import { stream, type StreamOptions } from './llm.ts'
+import type { StreamOptions } from './llm.ts'
+import { completeText } from './completeText.ts'
 import type { Transport } from '../core/transport.ts'
 import type { Logger } from '../core/logger.ts'
 
@@ -278,7 +279,9 @@ export function buildModelMessages(
   context: Context,
   compaction: CompactionState | null | undefined,
 ): Message[] {
-  if (!compaction) return context.messages
+  if (!compaction || compaction.summarizedCount <= 0 || !compaction.summary.trim()) {
+    return context.messages
+  }
   const fileLists = formatFileLists(compaction.readFiles ?? [], compaction.modifiedFiles ?? [])
   const summary = fileLists ? `${compaction.summary}\n\n${fileLists}` : compaction.summary
   return [
@@ -368,34 +371,28 @@ export async function compactContext(
     messages: [{ role: 'user', content: prompt }],
   }
 
-  let summary = ''
-  let failed = false
   const summaryOptions: StreamOptions = { signal, transport: options.transport, logger: options.logger }
-  for await (const event of stream(model, summaryContext, summaryOptions)) {
-    if (event.type === 'text_delta') {
-      summary += event.delta
-    } else if (event.type === 'error' || (event.type === 'done' && event.stopReason === 'aborted')) {
-      failed = true
-      break
-    }
-  }
+  const completion = await completeText(model, summaryContext, summaryOptions)
+  if (signal?.aborted) return
 
   // 兜底:压缩失败就保持原样,不用空摘要替换
-  if (failed || !summary.trim()) {
+  if (completion.failed || !completion.text.trim()) {
     options.logger?.warn(
       {
         summarizedCount,
         boundary,
         viewTokens,
-        reason: failed ? '请求失败' : '摘要为空',
+        model: model.model,
+        reason: completion.failed ? '请求失败' : '摘要为空',
       },
       '上下文压缩失败,保留原始消息',
     )
     return
   }
 
+  const summary = completion.text.trim()
   options.logger?.info(
-    { summarizedCount, boundary, viewTokens, summaryLength: summary.length },
+    { summarizedCount, boundary, viewTokens, summaryLength: summary.length, model: model.model },
     '上下文已压缩',
   )
 
