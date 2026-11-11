@@ -193,6 +193,20 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 
 **63. Shift+Tab 只在只读和可写之间循环。** 升级到全权限要走 `/mode`：回合中途弹审批会跟 `ask_user` 抢同一个 `editor.onSubmit`。`/mode` 执行期间要 `tui.setBusy(true)`，否则空闲状态下的 Ctrl+C 会直接退进程。
 
+**64. Stop 钩子要给「拉回标记」和「本轮改了什么」。** 钩子拿不到这两样就写不出能收手的验收脚本：`stop_hook_active` 告诉它本回合是不是已经被拉回过（不看这个会写成自己叫不醒自己的死循环），`changed_files` 告诉它这轮改了什么（空的就没什么可验收的）。`maxStopContinuations` 只是兜底，触发时只给用户一句警告，不算正常收尾。
+
+**65. Stop 钩子的 `additionalContext` 在没有拒绝时没人会读。** 回合到此为止，那段上下文没有落点。丢掉它必须记日志，否则用户以为钩子生效了。别的钩子事件（`PreToolUse` / `PostToolUse`）的 `additionalContext` 是接进上下文的，别混。
+
+**66. PreToolUse 钩子拿到的路径参数必须已经解析过符号链接。** 钩子要拦「不许写某个目录」，自己写 resolve + realpath 很容易漏掉软链那一层。工作区根由 `runAgent` 的 `workspaceRoot` 传进来，解析失败时 `insideWorkspace` 给 false。远程世界没有这个字段——路径在另一台机器上，本机解析出来的结论是错的。
+
+**67. 压缩的摘要里要留「验证记录」。** 丢掉的只能是过程，不能是依据：什么检查跑过、什么失败了、为什么失败，丢了就没法接着干。`SUMMARY_FORMAT` 里这一节不能省。
+
+**68. `/compact` 只改发给模型的视图，不动历史。** 和自动压缩同一套 `compactContext`，只是 `force: true` 跳过阈值判断，参数拼进摘要提示词引导重点。`context.messages` 始终是完整历史，会话存储和 `/resume` 恢复出来的都是全的。
+
+**69. 提示模板命令不走本地命令表。** `.grass/prompts/*.md` 每份变成一条斜杠命令，但执行等价于「把展开后的正文当成一条用户消息发给模型」——这样钩子、会话存储、回合计数都不用另外接一遍。模板命令不进 `SlashCommandRegistry`，命令名和内置命令冲突时不注册（内置优先）。
+
+**70. 示例配置不要放在默认生效路径上。** `.grass/hooks.json` 是默认读取路径，把它放在那里等于默认启用——CLI 测试的 cwd 就是仓库根，会读到它，钩子脚本一跑就把测试搞挂。示例放 `.grass/hooks/hooks.example.json`，让用户自己拷过去。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -252,13 +266,25 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 
 ## 斜杠命令
 
-`/clear`、`/new`、`/sessions`、`/resume`、`/export`、`/import`、`/instructions` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
+`/clear`、`/new`、`/sessions`、`/resume`、`/export`、`/import`、`/instructions`、`/compact`、`/mode` 在本地执行，不发给模型。输入 `/` 会弹出命令补全列表（pi-tui 的 `CombinedAutocompleteProvider`）。
 
 `/export` 把会话收成 `grassagent-bundle` JSON。默认写到工作区 `.grass/grassagent-bundle.json`，这个文件已在 `.gitignore` 里。`/import` 默认同 ID 跳过，`--replace` 覆盖。`/instructions` 只列出路径和生效方式，不把提示词再打印一遍。
 
 `/resume` 不带参数时弹会话选择器（`SelectList` + overlay），回车切换、Esc 取消。非交互模式没键盘，改成列出所有会话 ID 让人自己挑。
 
+`/compact` 手动压缩上下文，参数是摘要要重点保留的内容（如 `/compact 保留验证记录`）。只改发给模型的视图，历史不动。
+
+`/mode` 看当前沙盒模式或切换它，升级到全权限要过审批。
+
 命令实现在 `src/cli.ts` 里注册，`src/ui/slashCommands.ts` 只管解析和分发。
+
+## 提示模板
+
+工作区 `.grass/prompts/*.md` 每份变成一条斜杠命令。frontmatter 取 `description` 和 `argument-hint`，正文里的 `$ARGUMENTS` 换成全部参数、`$1`..`$9` 换成单个参数。
+
+执行等价于「把展开后的正文当成一条用户消息发给模型」，和手打进去完全一样——钩子、会话存储、回合计数都不用另外接。模板命令不进 `SlashCommandRegistry`，只进补全列表。命令名和内置命令冲突时跳过，内置优先。
+
+`src/instructions/prompts.ts` 负责扫描、解析、展开和匹配。
 
 ## 提交规范
 

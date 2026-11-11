@@ -29,7 +29,9 @@ import {
   appendHookContext,
   type HookEffect,
   type HookRunner,
+  type ResolvedHookPath,
 } from './hooks.ts'
+import { createPathGuard, type PathGuard } from '../core/pathGuard.ts'
 
 // 工具定义:name + 描述 + JSON Schema 参数 + execute 函数
 export type AgentTool = {
@@ -84,6 +86,11 @@ export async function* runAgent(
     hooks?: HookRunner
     /** Stop 钩子最多把回合拉回来几次。测试可以把它调小。 */
     maxStopContinuations?: number
+    /**
+     * 工作区根。给了就把路径参数解析成真实路径一并交给 PreToolUse 钩子,
+     * 钩子不用自己写 realpath。远程世界的路径不在本机,别给。
+     */
+    workspaceRoot?: string
   } = {},
 ): AsyncGenerator<AgentEvent> {
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]))
@@ -100,6 +107,12 @@ export async function* runAgent(
   const hooks = options.hooks
   let stopContinuations = 0
   const maxStopContinuations = options.maxStopContinuations ?? DEFAULT_MAX_STOP_CONTINUATIONS
+  // 本回合写过的文件。Stop 钩子用它判断「有没有改动」,不用再自己去查 git。
+  const changedFiles = new Set<string>()
+  // 路径解析器。建一次就够,realpath 有开销。建不出来(路径不存在等)时钩子拿不到解析结果。
+  const pathGuard = options.workspaceRoot
+    ? await createPathGuard(options.workspaceRoot).catch(() => undefined)
+    : undefined
 
   while (true) {
     // 0. 消息过多时先压缩旧消息。钩子可以否决这一次压缩,历史保持原样。
@@ -195,6 +208,7 @@ export async function* runAgent(
       const continued = yield* applyStopHook(context, text, hooks, signal, {
         stopContinuations,
         maxStopContinuations,
+        changedFiles: [...changedFiles],
         logger: options.logger,
       })
       if (continued === 'aborted') {
@@ -214,7 +228,7 @@ export async function* runAgent(
     //    argsInvalid 同理——空对象会让工具拿到 undefined 参数乱写
     //    钩子在校验之后、执行之前跑。它能拒绝,或给出一份新参数——新参数还要再校验一遍。
     const prepared = prepareToolCalls(toolCalls, toolMap)
-    const pre = await applyPreToolHooks(prepared, hooks, signal, options.logger)
+    const pre = await applyPreToolHooks(prepared, hooks, signal, options.logger, pathGuard)
     for (const notice of pre.notices) yield notice
     if (pre.aborted) {
       // 钩子还没跑完就被打断。工具一个都没执行,但每个 tool_call 仍要有 tool_result。
@@ -250,7 +264,7 @@ export async function* runAgent(
     //    顺序错了下次恢复会话会 400,API 要求每个 tool_call 有配对的 tool_result
     const results: ToolResultEntry[] = []
     const hookControl = { preventContinuation: pre.preventContinuation }
-    for await (const event of executeToolCalls(prepared, signal, options.toolExecution, hooks, hookControl)) {
+    for await (const event of executeToolCalls(prepared, signal, options.toolExecution, hooks, hookControl, changedFiles)) {
       if (event.type === 'tool_result') {
         results.push({ tool_use_id: event.id, content: event.result })
       }
@@ -446,6 +460,7 @@ async function* executeToolCalls(
   mode: 'parallel' | 'sequential' = 'parallel',
   hooks?: HookRunner,
   hookControl: { preventContinuation: boolean } = { preventContinuation: false },
+  changedFiles?: Set<string>,
 ): AsyncGenerator<AgentEvent> {
   const results: string[] = new Array(prepared.length)
 
@@ -464,6 +479,7 @@ async function* executeToolCalls(
   if (mode === 'sequential') {
     for (let index = 0; index < prepared.length; index++) {
       results[index] = await runOneTool(prepared[index], signal)
+      collectChangedFiles(prepared[index], results[index], changedFiles)
       yield* emitResult(index)
     }
     return
@@ -476,9 +492,30 @@ async function* executeToolCalls(
       results[index] = await runOneTool(prepared[index], signal)
     }))
     for (const index of segment) {
+      collectChangedFiles(prepared[index], results[index], changedFiles)
       yield* emitResult(index)
     }
   }
+}
+
+/**
+ * 记下这个工具实际改过的文件。
+ *
+ * 只认声明了 mutatesFiles 的工具,并且只认执行成功的——
+ * 报错的写入没落到磁盘上,记进去会让「有没有改动」的判断失真。
+ *
+ * 路径是模型给的那个(通常是相对路径)。绝对路径由钩子那边的
+ * resolved_paths 提供,两边靠原始写法对上号。
+ */
+function collectChangedFiles(
+  prepared: PreparedToolCall,
+  result: string,
+  changedFiles: Set<string> | undefined,
+): void {
+  if (!changedFiles) return
+  if (result.startsWith('error:')) return
+  const mutatedPaths = getMutatedFilePaths(prepared)
+  for (const mutatedPath of mutatedPaths) changedFiles.add(mutatedPath)
 }
 
 function noticesFrom(effect: HookEffect): AgentEvent[] {
@@ -499,7 +536,12 @@ async function* applyStopHook(
   assistantText: string,
   hooks: HookRunner | undefined,
   signal: AbortSignal | undefined,
-  options: { stopContinuations: number; maxStopContinuations: number; logger?: Logger },
+  options: {
+    stopContinuations: number
+    maxStopContinuations: number
+    changedFiles: string[]
+    logger?: Logger
+  },
 ): AsyncGenerator<AgentEvent, 'continue' | 'stop' | 'aborted'> {
   if (!hooks || signal?.aborted) return 'stop'
   if (options.stopContinuations >= options.maxStopContinuations) {
@@ -518,10 +560,27 @@ async function* applyStopHook(
     return 'stop'
   }
 
-  const effect = await hooks.run({ event: 'Stop', prompt: assistantText }, signal)
+  const effect = await hooks.run({
+    event: 'Stop',
+    prompt: assistantText,
+    // 已经拉回过就把这个标记给钩子:它该决定是再要求一次,还是放行。
+    // 不给这个标记的话,钩子脚本只能靠猜,容易写出死循环。
+    stopHookActive: options.stopContinuations > 0,
+    changedFiles: options.changedFiles,
+  }, signal)
   for (const notice of noticesFrom(effect)) yield notice
   if (effect.aborted) return 'aborted'
-  if (!effect.blocked) return 'stop'
+  if (!effect.blocked) {
+    // 没拒绝就意味着这一轮到此为止。钩子给的额外上下文没人会读了,
+    // 丢掉它得留个记录,不然用户以为钩子生效了。
+    if (effect.additionalContext) {
+      options.logger?.info(
+        { contextLength: effect.additionalContext.length },
+        'Stop 钩子返回了额外上下文,但没有拒绝本回合,内容未使用',
+      )
+    }
+    return 'stop'
+  }
 
   const reason = effect.reason ?? 'Stop 钩子要求继续'
   yield { type: 'hook_notice', level: 'warn', message: reason }
@@ -537,6 +596,7 @@ async function applyPreToolHooks(
   hooks: HookRunner | undefined,
   signal: AbortSignal | undefined,
   logger: Logger | undefined,
+  pathGuard: PathGuard | undefined,
 ): Promise<{ aborted: boolean; preventContinuation: boolean; notices: AgentEvent[] }> {
   const notices: AgentEvent[] = []
   if (!hooks) return { aborted: false, preventContinuation: false, notices }
@@ -552,6 +612,7 @@ async function applyPreToolHooks(
       toolName: item.name,
       toolInput: item.error ? item.modelArgs : item.args,
       toolUseId: item.id,
+      resolvedPaths: await resolveHookPaths(item, pathGuard, logger),
     }, signal)
     notices.push(...noticesFrom(effect))
     if (effect.aborted) return { aborted: true, preventContinuation, notices }
@@ -579,6 +640,53 @@ async function applyPreToolHooks(
   }
 
   return { aborted: false, preventContinuation, notices }
+}
+
+/**
+ * 把工具参数里的路径解析成真实路径,交给 PreToolUse 钩子。
+ *
+ * 钩子要拦「不许写某个目录」时,自己写 resolve + realpath 很容易漏掉软链那一层。
+ * 这里算好给它,钩子只要看 insideWorkspace 和 real。
+ *
+ * 只有声明了 mutatesFiles 的工具才有路径参数。没给工作区根(远程世界)时
+ * 返回空数组——本机解析不了远程的路径,硬算会给出错误结论。
+ */
+async function resolveHookPaths(
+  prepared: PreparedToolCall,
+  pathGuard: PathGuard | undefined,
+  logger: Logger | undefined,
+): Promise<ResolvedHookPath[] | undefined> {
+  if (!pathGuard) return undefined
+  const declared = prepared.tool?.mutatesFiles
+  if (!declared || declared.length === 0) return undefined
+
+  const args = prepared.args as Record<string, unknown>
+  const requestedPaths: string[] = []
+  for (const parameterName of declared) {
+    const value = args[parameterName]
+    if (typeof value === 'string' && value) requestedPaths.push(value)
+    else if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === 'string' && item) requestedPaths.push(item)
+      }
+    }
+  }
+  if (requestedPaths.length === 0) return undefined
+
+  const resolved: ResolvedHookPath[] = []
+  for (const requested of requestedPaths) {
+    try {
+      const real = await pathGuard.resolve(requested)
+      resolved.push({ requested, real, insideWorkspace: true })
+    } catch (error) {
+      // 解析失败就是越界(或者路径本身有问题)。真实路径给不出,
+      // 但 insideWorkspace=false 已经够钩子做判断了。
+      const message = (error as Error).message
+      logger?.debug({ requested, errorMessage: message }, '路径解析失败,按越界处理')
+      resolved.push({ requested, real: requested, insideWorkspace: false })
+    }
+  }
+  return resolved
 }
 
 async function applyPostToolHook(

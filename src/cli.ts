@@ -52,7 +52,15 @@ import {
   resolveBundlePath,
   writeBundleFile,
 } from './session/sessionBundle.ts'
+import {
+  discoverPromptTemplates,
+  expandPromptTemplate,
+  isUsablePromptCommandName,
+  matchPromptTemplate,
+  type PromptTemplate,
+} from './instructions/prompts.ts'
 import { messagesArePaired } from './llm/messages.ts'
+import { compactContext } from './llm/compaction.ts'
 import type { Model, Context } from './llm/llm.ts'
 
 /** 固定 system prompt */
@@ -613,6 +621,46 @@ async function main() {
 
   registerCommandOnlySkills(skillCatalog)
 
+  // /compact:手动压缩上下文。
+  //
+  // 自动压缩只在「已用 > 窗口 - 预留」时触发,用户没法主动压,
+  // 也没法引导摘要的重点。参数会拼进摘要提示词,比如
+  // /compact 保留验证记录和每个决策的理由。
+  //
+  // 只改发给模型的视图,历史不动——context.messages 始终是完整历史。
+  commandRegistry.register({
+    name: 'compact',
+    description: '手动压缩上下文,参数是摘要要重点保留的内容',
+    argumentHint: '[重点]',
+    execute: async (argument) => {
+      const guidance = argument.trim()
+      const before = context.compaction?.summarizedCount ?? 0
+      // 压缩要发一次 LLM 请求,期间不能算空闲——
+      // 空闲状态的 Ctrl+C 是退出进程,会把请求和会话收尾一起掐掉。
+      tui.setBusy(true)
+      try {
+        await compactContext(model, context, undefined, {
+          transport,
+          logger,
+          force: true,
+          guidance: guidance || undefined,
+        }, {
+          contextWindow: config.ContextWindow,
+          reserveTokens: config.CompactReserveTokens,
+          keepRecentTokens: config.CompactKeepRecentTokens,
+        })
+      } finally {
+        tui.setBusy(false)
+      }
+      const after = context.compaction?.summarizedCount ?? 0
+      if (after <= before) {
+        return '没有可压缩的历史,或压缩失败了(历史保持原样)'
+      }
+      logger.info({ before, after, guidance }, '上下文已手动压缩')
+      return `已压缩 ${after - before} 条消息到摘要。历史没有删除,只是发给模型的内容变短了。`
+    },
+  })
+
   // /mode:看当前模式,或者切一个。
   commandRegistry.register({
     name: 'mode',
@@ -664,13 +712,44 @@ async function main() {
     return `已切换到会话 ${targetSessionId}(${context.messages.length} 条消息)`
   }
 
+  // 提示模板。.grass/prompts/*.md 每份变成一条斜杠命令,
+  // 执行等价于把展开后的正文当成一条用户消息发给模型。
+  let promptTemplates: PromptTemplate[] = []
+  try {
+    promptTemplates = await discoverPromptTemplates(config.Workspace, {
+      warn: (object, message) => logger.warn(object, message),
+      info: (object, message) => logger.info(object, message),
+    })
+  } catch (error) {
+    logger.error({ errorMessage: (error as Error).message }, '识别提示模板失败,继续启动')
+  }
+  // 内置命令优先:名字撞上内置命令的模板不注册,免得把 /compact 之类顶掉。
+  const usableTemplates = promptTemplates.filter((template) => {
+    if (!isUsablePromptCommandName(template.name)) {
+      logger.warn({ name: template.name }, '提示模板的名字不能当命令名,已跳过')
+      return false
+    }
+    if (commandRegistry.find(template.name)) {
+      logger.warn({ name: template.name }, '提示模板的命令名和内置命令冲突,已跳过')
+      return false
+    }
+    return true
+  })
+
   // 命令名补全。交互模式才有意义——非交互模式没键盘。
   tui.setSlashCommands(
-    commandRegistry.all().map((command) => ({
-      name: command.name,
-      description: command.description,
-      argumentHint: command.argumentHint,
-    })),
+    [
+      ...commandRegistry.all().map((command) => ({
+        name: command.name,
+        description: command.description,
+        argumentHint: command.argumentHint,
+      })),
+      ...usableTemplates.map((template) => ({
+        name: template.name,
+        description: template.description,
+        argumentHint: template.argumentHint,
+      })),
+    ],
     config.Workspace,
   )
 
@@ -684,8 +763,20 @@ async function main() {
       pending = undefined
       roundRunning = true
       try {
-        // 斜杠命令在本地执行,不发给模型
-        const commandResult = await commandRegistry.execute(text)
+        // 提示模板先匹配:模板命令的正文展开后当用户消息发出去,
+        // 不走本地命令表。模板正文里带 / 开头也不会被当成命令。
+        const templateMatch = matchPromptTemplate(usableTemplates, text)
+        const effectiveText = templateMatch
+          ? expandPromptTemplate(templateMatch.template.body, templateMatch.argument)
+          : text
+        if (templateMatch) {
+          logger.info({ template: templateMatch.template.name }, '提示模板已展开')
+        }
+
+        // 斜杠命令在本地执行,不发给模型。模板命令不在命令表里,直接进模型。
+        const commandResult = templateMatch
+          ? null
+          : await commandRegistry.execute(effectiveText)
         if (commandResult !== null) {
           if (commandResult) tui.printNotice(commandResult)
         } else {
@@ -693,7 +784,10 @@ async function main() {
           const ctrl = new AbortController()
           tui.onAbort(() => ctrl.abort())
 
-          const promptEffect = await hookRunner.run({ event: 'UserPromptSubmit', prompt: text }, ctrl.signal)
+          const promptEffect = await hookRunner.run(
+            { event: 'UserPromptSubmit', prompt: effectiveText },
+            ctrl.signal,
+          )
           for (const message of promptEffect.systemMessages) tui.printNotice(message)
           for (const errorMessage of promptEffect.errors) tui.printError(errorMessage)
           if (promptEffect.aborted || ctrl.signal.aborted) {
@@ -703,7 +797,7 @@ async function main() {
           } else {
             context.messages.push({
               role: 'user',
-              content: appendHookContext(text, promptEffect.additionalContext),
+              content: appendHookContext(effectiveText, promptEffect.additionalContext),
             })
 
             for await (const ev of runAgent(model, context, tools, ctrl.signal, {
@@ -716,6 +810,13 @@ async function main() {
                 keepRecentTokens: config.CompactKeepRecentTokens,
               },
               hooks: hookRunner,
+              // 只有本地世界才给工作区根:远程的路径在另一台机器上,
+              // 本机解析出来的结论是错的。全权限模式没有边界,
+              // 报 insideWorkspace=false 反而会误导钩子。
+              workspaceRoot: config.ExecutionWorld === 'remote'
+                || world.policy.mode === 'danger-full-access'
+                ? undefined
+                : config.Workspace,
             })) {
               switch (ev.type) {
                 case 'assistant_text': tui.printText(ev.delta); break

@@ -74,6 +74,9 @@ const SUMMARY_FORMAT = `严格使用这个格式:
 ## 关键决定
 - **[决定]**: [简短理由]
 
+## 验证记录
+- [跑过了什么检查、结果如何、失败的原因是什么]
+
 ## 下一步
 1. [接下来按顺序该做什么]
 
@@ -81,7 +84,8 @@ const SUMMARY_FORMAT = `严格使用这个格式:
 - [接着干活必须知道的数据、例子、报错原文]
 - [没有就写「（无）」]
 
-每一节都短。保留准确的文件路径、函数名和报错原文。不要自己编文件清单,路径由系统另外附上。`
+每一节都短。保留准确的文件路径、函数名和报错原文。不要自己编文件清单,路径由系统另外附上。
+「验证记录」不要省:什么检查跑过、什么失败了、为什么失败,丢了就没法接着干。`
 
 const SUMMARY_PROMPT =
   `上面的对话需要总结成上下文检查点,另一段模型会靠它接着干活。\n\n${SUMMARY_FORMAT}`
@@ -92,6 +96,7 @@ const UPDATE_SUMMARY_PROMPT =
 - 补上新的进展、决定和上下文
 - 做完的事从「进行中」挪到「已完成」
 - 按当前状态改「下一步」
+- 验证记录要合并:同一项检查的结果用最新的覆盖,不同的检查都留着
 - 不再相关的可以删
 
 ${SUMMARY_FORMAT}`
@@ -326,12 +331,22 @@ export function compactionPending(context: Context, compactionOptions: Compactio
  *
  * 压缩失败时不动任何消息——
  * 宁可多发点上下文,也不能用空摘要把会话毁掉。
+ *
+ * force 跳过阈值判断(手动 /compact 用)。
+ * guidance 是一句额外要求,比如「重点保留验证记录」,会拼进摘要提示词。
  */
 export async function compactContext(
   model: Model,
   context: Context,
   signal: AbortSignal | undefined,
-  options: { transport?: Transport; logger?: Logger } = {},
+  options: {
+    transport?: Transport
+    logger?: Logger
+    /** 手动触发:不看阈值,只要有能压的历史就压 */
+    force?: boolean
+    /** 额外要求,引导摘要的重点 */
+    guidance?: string
+  } = {},
   compactionOptions: CompactionOptions,
 ): Promise<void> {
   // abort 时不压缩,省一次请求也避免半截摘要
@@ -342,7 +357,7 @@ export async function compactContext(
   // 看的是即将发给模型的视图,不是完整历史。已经压掉的部分不该再把阈值撑满。
   const viewTokens = estimateMessagesTokens(buildModelMessages(context, compaction))
   const tokenBudget = compactionOptions.contextWindow - compactionOptions.reserveTokens
-  if (viewTokens <= tokenBudget) return
+  if (!options.force && viewTokens <= tokenBudget) return
 
   // 从尾部留下大约 keepRecentTokens,再保证不劈开工具调用和结果
   const boundary = findTokenCut(context.messages, summarizedCount, compactionOptions.keepRecentTokens)
@@ -357,10 +372,12 @@ export async function compactContext(
   // 上一次的摘要要带上:这轮是把新消息合并进旧摘要,
   // 只总结新增的部分会把之前压缩掉的历史弄丢。
   const previousSummary = compaction?.summary
+  const guidance = options.guidance?.trim()
+  const guidanceText = guidance ? `\n\n额外要求:${guidance}` : ''
   const conversationText = newMessages.map(flattenMessage).join('\n')
   const prompt = previousSummary
-    ? `<conversation>\n${conversationText}\n</conversation>\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\n${UPDATE_SUMMARY_PROMPT}`
-    : `<conversation>\n${conversationText}\n</conversation>\n\n${SUMMARY_PROMPT}`
+    ? `<conversation>\n${conversationText}\n</conversation>\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\n${UPDATE_SUMMARY_PROMPT}${guidanceText}`
+    : `<conversation>\n${conversationText}\n</conversation>\n\n${SUMMARY_PROMPT}${guidanceText}`
 
   // 用一轮额外的调用做总结,不走工具
   const summaryContext: Context = {

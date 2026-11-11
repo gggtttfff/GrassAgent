@@ -104,7 +104,7 @@ test('非交互模式能跑完整个回合并正常退出', async () => {
     assert.ok(output.includes('回复'), `输出里应有模型回复,实际: ${output.slice(-300)}`)
     // markdown 的星号被渲染掉了
     assert.ok(output.includes('加粗'), `markdown 应被渲染,实际: ${output.slice(-300)}`)
-    assert.ok(!output.includes('**'), 'markdown 标记应被渲染掉')
+    assert.ok(!output.includes('**'), `markdown 标记应被渲染掉,实际: ${output.slice(-300)}`)
   } finally {
     await mock.close()
   }
@@ -186,6 +186,73 @@ test('/sessions 列出会话', async () => {
     assert.equal(exitCode, 0)
     assert.ok(/session/i.test(output), `应该列出会话 ID,实际: ${output.slice(-300)}`)
     assert.ok(!output.includes('回复'), '命令不该发给模型')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('提示模板命令展开后当用户消息发给模型', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-prompt-'))
+  await mkdir(path.join(directory, '.grass', 'prompts'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'prompts', 'goal.md'),
+    ['---', 'description: 设定目标', '---', '目标:$ARGUMENTS'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/goal 让测试通过\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    // 模板命令要走到模型,回复应该出现
+    assert.ok(output.includes('回复'), `模板命令应该发给模型,实际: ${output.slice(-400)}`)
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('提示模板的命令名和内置命令冲突时不注册', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-prompt-'))
+  await mkdir(path.join(directory, '.grass', 'prompts'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'prompts', 'clear.md'),
+    ['---', 'description: 抢占 clear', '---', '不该生效'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/clear\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0)
+    // 内置命令优先:仍然是清空对话,不是模板正文
+    assert.ok(output.includes('对话已清空'), `应该走内置命令,实际: ${output.slice(-400)}`)
+    assert.ok(!output.includes('不该生效'), '模板不该抢掉内置命令')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('/compact 手动压缩,历史保持完整', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/compact\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0, output.slice(-300))
+    // 没有可压的历史时要有明确提示,不能静默
+    assert.ok(
+      output.includes('没有可压缩的历史') || output.includes('已压缩'),
+      `应该给出压缩结果,实际: ${output.slice(-300)}`,
+    )
+    // 压缩不发普通回复
+    assert.ok(!output.includes('回复**'), '压缩不该产生普通回复')
   } finally {
     await mock.close()
   }
