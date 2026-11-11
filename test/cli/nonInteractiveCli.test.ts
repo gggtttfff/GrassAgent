@@ -515,6 +515,25 @@ test('/skills 列出技能,reload 重新扫描', async () => {
   }
 })
 
+test('/mode 显示当前模式,非交互切到全权限会被拒绝', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/mode\n/mode read-only\n/mode danger-full-access\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_SANDBOX_MODE: 'read-only',
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('read-only'), `应显示当前模式,实际: ${output.slice(-500)}`)
+    // 非交互没人能点头,升级到全权限必须被拒
+    assert.ok(output.includes('没有切到 danger-full-access'), output.slice(-500))
+    assert.ok(!output.includes('已切换到 danger-full-access'), output.slice(-500))
+    assert.ok(!output.includes('回复'), '命令不该发给模型')
+  } finally {
+    await mock.close()
+  }
+})
+
 test('普通输入照常发给模型', async () => {
   const mock = await startMockServer()
   try {

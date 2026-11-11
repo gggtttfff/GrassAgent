@@ -11,9 +11,15 @@ import { runAgent } from './agent/agent.ts'
 import { Tui } from './ui/tui.ts'
 import { builtinTools, replaceLoadSkillTool } from './agent/tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
-import type { ExecutionWorld } from './world/executionWorld.ts'
+import type { ExecutionWorld, SandboxMode } from './world/executionWorld.ts'
+import { isSandboxMode, SANDBOX_MODES } from './world/executionWorld.ts'
+import { createModeSwitcher } from './world/modeSwitch.ts'
 import { createAskUserTool } from './agent/askUser.ts'
-import type { ApprovalDecision, ApprovalGate } from './world/approvalGate.ts'
+import {
+  createStartupEscalationGate,
+  type ApprovalDecision,
+  type ApprovalGate,
+} from './world/approvalGate.ts'
 import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
 import { readVersion } from './version.ts'
 import { createLoggerFromConfig, type Logger } from './core/logger.ts'
@@ -25,12 +31,18 @@ import { canUseInteractiveTerminal } from './ui/nonInteractiveTerminal.ts'
 import { appendHookContext, createHookRunner, type HookRunner } from './agent/hooks.ts'
 import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './agent/hookConfig.ts'
 import {
+  DangerousCommandsError,
+  defaultDangerousCommandsPath,
+  loadDangerousCommandsFile,
+  type DangerousCommandRule,
+} from './agent/dangerousCommands.ts'
+import {
   appendPromptSection,
   discoverProjectInstructions,
   formatInstructionReport,
   summarizeInstructions,
 } from './instructions/projectInstructions.ts'
-import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
+import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, mergeSkillCatalogs, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillLog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
 import {
   BundleError,
   defaultBundlePath,
@@ -102,9 +114,12 @@ async function main() {
   // 项目里其他工具的规则接着拼在后面。识别失败不挡启动,否则一个坏文件会让整个程序起不来。
   let instructionReport = '项目规则识别已关闭'
   let instructionNotice = ''
-  let systemPrompt = SYSTEM_PROMPT
-  // 规则段单独存着:重载技能时要重建系统提示词,规则不能跟着丢
+  // 系统提示词分段存。任何一段变了都走 rebuildSystemPrompt(),
+  // 不然重载技能、切模式这类操作会把别的段冲掉。
   let instructionSection = ''
+  let skillSection = ''
+  let modeSection = ''
+  let hookContext: string | undefined
   if (config.LoadProjectInstructions) {
     try {
       const catalog = await discoverProjectInstructions(config.Workspace, {
@@ -112,7 +127,6 @@ async function main() {
         info: (object, message) => logger.info(object, message),
       })
       instructionSection = catalog.promptSection
-      systemPrompt = appendPromptSection(SYSTEM_PROMPT, instructionSection)
       instructionReport = formatInstructionReport(catalog.instructions)
       if (catalog.instructions.length > 0) instructionNotice = summarizeInstructions(catalog.instructions)
     } catch (error) {
@@ -127,11 +141,16 @@ async function main() {
   const tui = new Tui()
 
   // 文件和命令进同一个执行世界。远程创建失败就退出,不改绑本机工作区。
+  // 配置里写 danger-full-access 等于用户本人授权,启动时不再问一遍,但要留下记录。
+  if (config.SandboxMode === 'danger-full-access') {
+    logger.warn({ sandboxMode: config.SandboxMode }, '以全权限模式启动,工作区边界不再拦截')
+  }
   let world: ExecutionWorld
   try {
     world = await openExecutionWorld(config, {
       sessionId,
       onProgress: (event) => tui.printNotice(event.message),
+      approval: createStartupEscalationGate(),
     })
   } catch (error) {
     logger.error({
@@ -149,6 +168,9 @@ async function main() {
     sandboxId: world.sandboxId,
     executionWorld: config.ExecutionWorld,
   }, '执行世界已绑定')
+  // 模式段跟着世界走。切换时由 modeSwitcher 的 onChanged 更新。
+  modeSection = formatModeSection(world.policy.mode)
+  tui.setMode(world.policy.mode)
 
   // 技能:正文不进系统提示词,只列名字和描述,模型要做这件事时用 load_skill 取全文。
   // 技能从执行世界里读,远程时读的是沙盒里的文件,不是本机那份。
@@ -160,21 +182,40 @@ async function main() {
 
   const scanSkills = async (): Promise<SkillCatalog> => {
     const skillOrigin = describeSkillOrigin(config, world)
-    const skillFiles = skillOrigin.kind === 'remote'
-      ? createWorldSkillFiles(world)
-      : await createLocalSkillFiles(config.Workspace)
+    const skillLogger: SkillLog = {
+      warn: (object, message) => logger.warn(object, message),
+      info: (object, message) => logger.info(object, message),
+    }
     // 缓存只在本地用:远程的目录每次都是新克隆的,缓存没有意义
-    const skillCache = skillOrigin.kind === 'remote'
-      ? undefined
-      : createSkillCache({ workspace: config.Workspace, relativePath: SKILL_CACHE_RELATIVE_PATH })
+    const skillCache = createSkillCache({
+      workspace: config.Workspace,
+      relativePath: SKILL_CACHE_RELATIVE_PATH,
+    })
+
+    // 远程模式:本地和远程各扫一遍再合并。
+    // 只扫远程的话,本地的运维手册这类技能在远程会话里完全看不到;
+    // 只扫本地的话,远程工作区自带的技能又用不了。
+    if (skillOrigin.kind === 'remote') {
+      const local = await discoverSkills({
+        files: await createLocalSkillFiles(config.Workspace),
+        origin: { kind: 'local', label: '本地工作区' },
+        cache: skillCache,
+        logger: skillLogger,
+      })
+      const remote = await discoverSkills({
+        files: createWorldSkillFiles(world),
+        origin: skillOrigin,
+        logger: skillLogger,
+      })
+      // 同名时以远程为准:模型实际编辑的是远程工作区
+      return mergeSkillCatalogs(remote, local, skillLogger)
+    }
+
     return discoverSkills({
-      files: skillFiles,
+      files: await createLocalSkillFiles(config.Workspace),
       origin: skillOrigin,
       cache: skillCache,
-      logger: {
-        warn: (object, message) => logger.warn(object, message),
-        info: (object, message) => logger.info(object, message),
-      },
+      logger: skillLogger,
     })
   }
 
@@ -182,7 +223,7 @@ async function main() {
     try {
       const scanned = await scanSkills()
       skillCatalog = scanned
-      systemPrompt = appendPromptSection(systemPrompt, scanned.promptSection)
+      skillSection = scanned.promptSection
       skills = createSkillRegistry(scanned.skills)
       skillReport = summarizeSkills(scanned.skills)
       // 同名冲突这类问题要让用户看见,不然技能凭空消失,没人知道为什么
@@ -195,12 +236,59 @@ async function main() {
   }
 
   const context: Context = {
-    systemPrompt,
+    systemPrompt: SYSTEM_PROMPT,
     messages: sessionStore.load(),
   }
 
-  // 技能加载的审批门。审批发生在回合里,那时候 Tui 早就 start 过了。
-  const skillApproval = createSkillApprovalGate(config.ApproveSkills, () => tui, logger)
+  /** 把几段提示词重新拼一遍。任何一段变了都调它,别在别处手工拼。 */
+  const rebuildSystemPrompt = (): void => {
+    let prompt = SYSTEM_PROMPT
+    for (const section of [instructionSection, skillSection, modeSection]) {
+      prompt = appendPromptSection(prompt, section)
+    }
+    context.systemPrompt = appendHookContext(prompt, hookContext)
+  }
+  rebuildSystemPrompt()
+
+  // 审批门。技能加载和模式升级都走它。
+  // 审批发生在回合里,那时候 Tui 早就 start 过了。
+  const approval = createApprovalGate(config.ApproveSkills, () => tui, logger)
+
+  // 模式切换。斜杠命令和快捷键共用这一个入口,审批、串行、通知都在里面。
+  const modeSwitcher = createModeSwitcher({
+    world,
+    approval,
+    logger,
+    onChanged: (mode) => {
+      modeSection = formatModeSection(mode)
+      tui.setMode(mode)
+      rebuildSystemPrompt()
+    },
+  })
+
+  // 危险命令规则。读本机工作区的那份——沙盒里的文件模型能改,
+  // 规则得是用户这台机器上的配置。
+  const dangerousCommandsPath = defaultDangerousCommandsPath(config.Workspace)
+  let dangerousCommands: DangerousCommandRule[] = []
+  try {
+    dangerousCommands = await loadDangerousCommandsFile(dangerousCommandsPath)
+    if (dangerousCommands.length > 0) {
+      logger.info({
+        dangerousCommandsPath,
+        ruleCount: dangerousCommands.length,
+      }, '危险命令规则已加载')
+    }
+  } catch (error) {
+    if (error instanceof DangerousCommandsError) {
+      console.error(`[grassagent] ${error.message}`)
+      for (const issue of error.issues) console.error(issue)
+      await world.close()
+      sessionStore.close()
+      tui.stop()
+      process.exit(1)
+    }
+    throw error
+  }
 
   // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
@@ -208,7 +296,9 @@ async function main() {
     world,
     commandTimeoutMs: config.CommandTimeoutMs,
     skills,
-    approval: skillApproval,
+    approval,
+    dangerousCommands,
+    dangerousCommandsPath,
   })
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
@@ -248,7 +338,8 @@ async function main() {
   }
   for (const errorMessage of sessionStart.errors) console.error(`[grassagent] ${errorMessage}`)
   if (sessionStart.additionalContext) {
-    context.systemPrompt = appendHookContext(context.systemPrompt ?? '', sessionStart.additionalContext)
+    hookContext = sessionStart.additionalContext
+    rebuildSystemPrompt()
   }
   // 会话真正起来之后,退出时才跑 SessionEnd。启动被拒绝不算一次会话。
   let sessionStarted = true
@@ -503,12 +594,10 @@ async function main() {
         skillCatalog = refreshed
         skills = createSkillRegistry(refreshed.skills)
         skillReport = summarizeSkills(refreshed.skills)
-        // 规则段留着,只换技能段
-        context.systemPrompt = appendPromptSection(
-          appendPromptSection(SYSTEM_PROMPT, instructionSection),
-          refreshed.promptSection,
-        )
-        replaceLoadSkillTool(tools, skills, skillApproval)
+        // 规则段和模式段留着,只换技能段
+        skillSection = refreshed.promptSection
+        rebuildSystemPrompt()
+        replaceLoadSkillTool(tools, skills, approval)
         skillNotices.length = 0
         skillNotices.push(...describeDisabledSkills(refreshed.skills))
         skillNotices.push(...describeSkippedSkills(refreshed.skills))
@@ -523,6 +612,45 @@ async function main() {
   })
 
   registerCommandOnlySkills(skillCatalog)
+
+  // /mode:看当前模式,或者切一个。
+  commandRegistry.register({
+    name: 'mode',
+    description: '查看或切换沙盒权限模式',
+    argumentHint: '[read-only|workspace-write|danger-full-access]',
+    execute: async (argument) => {
+      const requested = argument.trim()
+      if (!requested) {
+        return `当前沙盒模式:${modeSwitcher.current()}\n可用:${SANDBOX_MODES.join('、')}`
+      }
+      if (!isSandboxMode(requested)) {
+        return `未知的模式 ${requested}。可用:${SANDBOX_MODES.join('、')}`
+      }
+      // 升级到全权限要弹审批。审批期间界面不能算空闲——
+      // 空闲状态下的 Ctrl+C 是退出进程,会把审批直接掐掉。
+      tui.setBusy(true)
+      try {
+        const result = await modeSwitcher.switchTo(requested)
+        return result.message
+      } finally {
+        tui.setBusy(false)
+      }
+    },
+  })
+
+  // Shift+Tab 循环模式。只在只读和可写之间转:
+  // 升级到全权限要走 /mode,回合中途弹审批会跟 ask_user 抢同一个输入框。
+  tui.onModeCycle(() => {
+    const current = modeSwitcher.current()
+    const next: SandboxMode = current === 'read-only'
+      ? 'workspace-write'
+      : current === 'danger-full-access'
+        ? 'workspace-write'
+        : 'read-only'
+    void modeSwitcher.switchTo(next).then((result) => {
+      tui.printNotice(result.message)
+    })
+  })
 
   // 切换会话:存盘当前会话,切过去,载入目标会话的历史
   const switchToSession = async (targetSessionId: string): Promise<string> => {
@@ -660,7 +788,15 @@ function entryFilePath(entryArgument: string): string {
  *
  * 同一个技能在会话里只问一次,免得模型反复请求时反复弹窗。
  */
-function createSkillApprovalGate(
+/**
+ * 审批门。
+ *
+ * 技能加载和模式升级走同一个门,但按 kind 分开:
+ * - skill:由 GRASSAGENT_APPROVE_SKILLS 决定(ask/allow/deny),同一批只问一次
+ * - escalate:升级到全权限一定要人点头,不受 GRASSAGENT_APPROVE_SKILLS 影响。
+ *   而且每次都问——上一次同意不代表这一次也同意。
+ */
+function createApprovalGate(
   mode: 'ask' | 'allow' | 'deny',
   getTui: () => Tui | undefined,
   logger: Logger,
@@ -668,6 +804,9 @@ function createSkillApprovalGate(
   const decided = new Map<string, ApprovalDecision>()
   return {
     async decide(action): Promise<ApprovalDecision> {
+      if (action.kind === 'escalate') {
+        return askEscalation(action.summary, getTui, logger)
+      }
       if (mode === 'allow') return 'allow'
       if (mode === 'deny') return 'deny'
       const remembered = decided.get(action.summary)
@@ -694,6 +833,47 @@ function createSkillApprovalGate(
       return decision
     },
   }
+}
+
+/**
+ * 升级到全权限要人点头。
+ * 不缓存:同意一次不等于一直同意。
+ */
+async function askEscalation(
+  summary: string,
+  getTui: () => Tui | undefined,
+  logger: Logger,
+): Promise<ApprovalDecision> {
+  const tui = getTui()
+  if (!tui) {
+    logger.warn({ summary }, '没有界面可问,拒绝升级沙盒模式')
+    return 'unavailable'
+  }
+  const reply = await tui.ask(
+    `要把沙盒切到 ${summary} 吗?它会绕过工作区限制,输入 y 同意,其它拒绝。`,
+  )
+  let decision: ApprovalDecision = 'deny'
+  if (reply.status === 'answered') {
+    const answer = reply.answer.trim().toLowerCase()
+    decision = answer === 'y' || answer === 'yes' ? 'allow' : 'deny'
+  } else if (reply.status === 'unavailable') {
+    decision = 'unavailable'
+  }
+  logger.info({ summary, decision }, '沙盒模式升级已裁决')
+  return decision
+}
+
+/**
+ * 系统提示词里的模式说明。
+ * 模型知道当前能做什么,就不会一次次试着越界再等报错。
+ */
+function formatModeSection(mode: SandboxMode): string {
+  const detail: Record<SandboxMode, string> = {
+    'read-only': '只能读工作区。写文件、编辑和执行命令都会被拒绝。',
+    'workspace-write': '可以读写工作区,命令的工作目录锁在工作区内。',
+    'danger-full-access': '不再限制工作区边界,工作区外的路径也能访问。',
+  }
+  return `当前沙盒模式:${mode}。${detail[mode]}`
 }
 
 /**

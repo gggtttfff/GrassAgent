@@ -130,8 +130,52 @@ npm start
 | `/export` | 把会话导出成文件。不带路径时写到 `.grass/grassagent-bundle.json` |
 | `/import` | 从文件导回会话。同 ID 默认跳过，`--replace` 才覆盖 |
 | `/instructions` | 列出识别到的规则和提示词 |
+| `/mode` | 查看或切换沙盒权限模式 |
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
+
+### 沙盒权限模式
+
+文件和命令能碰到多大范围，由沙盒权限模式决定。
+
+| 模式 | 文件 | 命令 |
+| --- | --- | --- |
+| `read-only` | 只能读工作区 | 整个拒绝执行命令 |
+| `workspace-write` | 可读写工作区 | 工作目录锁在工作区内 |
+| `danger-full-access` | 绕过工作区限制 | 不锁工作目录 |
+
+默认 `workspace-write`。三种方式切换：
+
+- **配置**：`GRASSAGENT_SANDBOX_MODE` 决定启动时的模式
+- **命令**：`/mode` 看当前模式，`/mode read-only` 切一个
+- **快捷键**：交互模式按 Shift+Tab 在 `read-only` 和 `workspace-write` 之间循环
+
+输入框上方有一行状态，随时能看到当前模式。切模式立刻生效——模型的下一次工具调用就按新模式来，不用重开会话。
+
+切到 `danger-full-access` 会绕过工作区边界，所以要人点头：`.env` 里写死它算你本人授权，启动时直接生效并记一条警告日志；会话里用 `/mode` 切过去会弹一次审批，输入 `y` 才同意。非交互模式（管道、CI）没人能点头，按拒绝处理。
+
+远程沙盒也支持切换。模式由沙盒里的 daemon 判定，切换会真的通知到它。
+
+> `danger-full-access` 在 Docker 后端下只是放开 Grass 的路径闸门——容器根文件系统仍是只读的、仍是非 root，实际能写的只有 `/workspace` 和 `/tmp`。SSH 后端下才是整台远程机。同名模式在两种后端能力不同，别把「全权限」理解成「宿主全权限」。
+
+### 危险命令规则
+
+`.grass/dangerous-commands.json` 里可以列几条不该跑的命令。文件不存在就等于没有规则，行为不变。
+
+```json
+{
+  "commands": [
+    { "pattern": "\\brm\\s+-[a-zA-Z]*r", "reason": "禁止递归删除" },
+    { "pattern": "mkfs", "reason": "禁止格式化磁盘" }
+  ]
+}
+```
+
+`pattern` 是正则，匹配模型给的命令字符串，命中就拒绝执行并告诉模型原因。所有模式都生效——模式决定能碰到多大范围，规则决定哪些命令根本不跑。
+
+规则文件读的是**本机工作区**下的那一份，不是沙盒里的：沙盒里的文件模型能改，规则得是你这台机器上的配置。文件存在但写坏了会在启动时报错，不会静默当成没有规则。
+
+> 这是护栏，不是安全边界。匹配的是命令字符串本身，`bash script.sh`、`find -delete` 这类写法绕得开。真正的隔离靠沙盒和容器。
 
 ### 导入导出
 
@@ -299,6 +343,7 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
 | `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
 | `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS` | 是否识别 opencode、cursor、claude、kiro 的规则和提示词 | `1` |
+| `GRASSAGENT_SANDBOX_MODE` | 沙盒权限模式。`read-only` / `workspace-write` / `danger-full-access` | `workspace-write` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 

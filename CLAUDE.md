@@ -13,14 +13,14 @@ cli.ts                  唯一入口：拼装所有簇，自己不被任何模�
   ↓
 ui/         tui / theme / sessionPicker / nonInteractiveTerminal / lineQueue / slashCommands
   ↓
-agent/      agent / tools / askUser / hooks / hookConfig
+agent/      agent / tools / askUser / hooks / hookConfig / dangerousCommands
   ↓
 llm/        llm / protocol / messages / compaction / providers/
 instructions/ projectInstructions / skills
 session/    sessionStore / sessionBundle
 sandbox/    daemon / docker·inProcess·ssh 后端 / 控制面 / remoteWorld
   ↓
-world/      executionWorld / localWorld / outputBound / approvalGate
+world/      executionWorld / localWorld / outputBound / approvalGate / modeSwitch
   ↓
 core/       logger / jsonSafety / retry / transport / validation /
             mutationQueue / pathGuard / textEdit / frontmatter
@@ -179,6 +179,20 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 
 **56. 测试里 spawn CLI 必须显式关掉远程世界。** `runCliWithInput` 的 cwd 是仓库根，配置层会读到开发机的 `.env`；那里如果配了 `GRASSAGENT_EXECUTION_WORLD=remote`，测试就会去连真实沙盒，技能扫描也会读到远程目录。所有 CLI 测试都要带 `GRASSAGENT_EXECUTION_WORLD=local`。
 
+**57. 沙盒模式只有一个写入路径：`ExecutionWorld.setMode`。** 命令和快捷键都走 `src/world/modeSwitch.ts`，不要在别处直接改 `world.policy.mode`。远程世界的模式由 daemon 判定，改本地字段不等于切成功——必须等 RPC 确认。
+
+**58. daemon 的模式要存成共享的可变引用。** `startDaemon` 里 `modeRef = { current }`，每个请求的 `HandlerContext` 指向同一个对象。直接捕获字符串的话，`setMode` 改了也没有任何请求看得到——因为 `HandlerContext` 是每个请求新建的字面量。
+
+**59. 远程全权限模式要两侧都改。** 客户端 `advertisedPath` 会先拒掉区外路径，daemon 的 `advertisedFromLocal` 又会把区外路径写成越界错误——后者发生在写盘之后，会出现「写成功却报失败」。客户端走 `advertisedPathLoose`，daemon 走 `displayPath`，两处都要覆盖 read / write / edit 三条路。
+
+**60. 危险命令规则读本机工作区，不读沙盒。** 沙盒里的文件模型能改，规则得是用户这台机器上的配置，位置和 `.grass/hooks.json` 一致。规则在 `run_bash` 内部、钩子改写参数之后匹配——提前到 agent 的预检阶段会被 `PreToolUse` 钩子绕过。
+
+**61. 系统提示词分段存，用 `rebuildSystemPrompt()` 重建。** 规则段、技能段、模式段、钩子上下文各自一份。任何一段变了都走这个函数，不然一次 `/skills reload` 就把模式段和钩子上下文冲掉。
+
+**62. 升级到全权限要人点头，配置写死不算。** `.env` 里写 `danger-full-access` 是用户本人授权，启动时用 `createStartupEscalationGate()` 放行并记 warn 日志；会话里用 `/mode` 切过去走 `askEscalation`，每次都问、不缓存。审批门按 `action.kind` 分支——`GRASSAGENT_APPROVE_SKILLS=allow` 只管技能，不该顺带放行升级。
+
+**63. Shift+Tab 只在只读和可写之间循环。** 升级到全权限要走 `/mode`：回合中途弹审批会跟 `ask_user` 抢同一个 `editor.onSubmit`。`/mode` 执行期间要 `tui.setBusy(true)`，否则空闲状态下的 Ctrl+C 会直接退进程。
+
 ## 已知取舍
 
 这些是刻意简化，不是 bug，改动前先想清楚影响：
@@ -209,6 +223,12 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 - 按文件生效的规则不会在读到匹配文件时自动注入，只在系统提示词里留索引
 - 不读用户主目录里的全局规则，也不抓取 opencode 配置里的远程 URL
 - 会话包是明文 JSON，对话里如果曾经出现过密钥，导出时不会再扫一遍剔掉
+- danger-full-access 在 Docker 后端下只放开 Grass 的路径闸门——容器根文件系统仍是 `--read-only`、仍是非 root，实际能写的只有 `/workspace` 和 `/tmp`；SSH 后端下才是整台远程机。同名模式在两种后端能力不同，不能对外暗示「全权限 = 宿主全权限」
+- 危险命令规则匹配的是模型给的 `bash -c` 字符串，`bash script.sh`、`find -delete`、引号换行都能绕开。它是护栏不是边界
+- 危险命令规则启动时读一次即固定，不热加载——否则模型能在可写模式下改写规则文件削弱后面的拦截
+- 远程挂回（`GRASSAGENT_SANDBOX_ID`）时以本次配置的模式为准，会影响同一个沙盒上的其他挂回者
+- 沙盒协议版本 2→3 不兼容，外部独立控制面（`npm run sandbox:control`）必须和客户端一起升级
+- 远程 daemon 启动瞬间是 workspace-write，配置的模式在创建后用一次 `setMode` 对齐。此时还没有任何工具调用，没有窗口期
 
 ## 测试
 

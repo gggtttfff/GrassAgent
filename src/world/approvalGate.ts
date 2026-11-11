@@ -30,6 +30,22 @@ export function createDefaultApprovalGate(): ApprovalGate {
 }
 
 /**
+ * 启动时的窄门。
+ *
+ * `.env` 里写死 danger-full-access 是用户本人的动作,不需要再问一次;
+ * 但它只是「启动」这一次的授权,不替别的升级背书——技能加载、会话内切换
+ * 仍然走自己的门,拿到的是 unavailable。
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+export function createStartupEscalationGate(): ApprovalGate {
+  return {
+    async decide(action) {
+      return action.kind === 'escalate' ? 'allow' : 'unavailable'
+    },
+  }
+}
+
+/**
  * 加载技能必须拿到 allow。
  *
  * 技能正文是仓库里的文本,拿到它就等于让模型按别人的指令做事。

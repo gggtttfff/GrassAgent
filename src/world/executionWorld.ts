@@ -3,7 +3,14 @@
 // agent 循环只看到工具返回的字符串,不关心字节在哪台机器上。
 
 /** 沙盒能碰到的范围。审批是另一条路,不写在这个模式里。 */
-export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+export const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
+
+export type SandboxMode = (typeof SANDBOX_MODES)[number]
+
+/** 协议和配置里来的模式都是不可信输入,先过这一关。 */
+export function isSandboxMode(value: unknown): value is SandboxMode {
+  return typeof value === 'string' && (SANDBOX_MODES as readonly string[]).includes(value)
+}
 
 /**
  * 一次调用的沙盒策略。
@@ -75,6 +82,12 @@ export interface ExecutionWorld {
   edit(filePath: string, edits: readonly TextEdit[]): Promise<string>
   /** 执行 argv。stdout/stderr 已经按这个世界的上限收过尾。作者：Pieory 创建日期：2025-07-18 */
   exec(request: ExecRequest, signal?: AbortSignal): Promise<ExecResult>
+  /**
+   * 运行时切换模式。远程世界要通知 daemon,失败就抛,不静默降级。
+   * 审批由调用方负责——这个方法只回答「世界有没有真的切过去」。
+   * 作者：Pieory 创建日期：2025-07-18
+   */
+  setMode(mode: SandboxMode): Promise<void>
   /** 会话结束时释放远程资源。本地世界什么都不做。作者：Pieory 创建日期：2025-07-18 */
   close(): Promise<void>
 }

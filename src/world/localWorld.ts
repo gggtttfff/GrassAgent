@@ -9,6 +9,7 @@ import { assertEscalationAllowed, type ApprovalGate } from './approvalGate.ts'
 import {
   EncodingError,
   PolicyDeniedError,
+  isSandboxMode,
   type DirectoryEntry,
   type ExecRequest,
   type ExecResult,
@@ -148,6 +149,18 @@ class LocalWorld implements ExecutionWorld {
       ? path.resolve(request.cwd)
       : await this.resolveInside(request.cwd)
     return runArgv(request, cwd, this.workspaceRoot, signal)
+  }
+
+  /**
+   * 运行时切换模式。
+   *
+   * policy 是活的对象,每次 read/write/exec 都重新读它,所以改字段立刻生效,
+   * 不用重建世界,也不用重建捕获了这个世界的工具。
+   * 作者：Pieory 创建日期：2025-07-18
+   */
+  async setMode(mode: SandboxMode): Promise<void> {
+    if (!isSandboxMode(mode)) throw new Error(`未知的沙盒模式: ${String(mode)}`)
+    this.policy.mode = mode
   }
 
   /** 作者：Pieory 创建日期：2025-07-18 */

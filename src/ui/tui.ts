@@ -32,6 +32,7 @@ import { JsonSafetyError, stringifyJson } from '../core/jsonSafety.ts'
 import { NonInteractiveTerminal, canUseInteractiveTerminal } from './nonInteractiveTerminal.ts'
 import { SessionPicker, type SessionChoice } from './sessionPicker.ts'
 import type { UserReply } from '../agent/askUser.ts'
+import type { SandboxMode } from '../world/executionWorld.ts'
 import {
   accentText,
   editorTheme,
@@ -44,6 +45,13 @@ import {
 
 // 输入框上下留白
 const EDITOR_PADDING_X = 1
+
+// 状态行上每个模式的说法。danger 要说得直白,它是唯一会越过工作区边界的那个。
+const MODE_LABELS: Record<SandboxMode, string> = {
+  'read-only': 'read-only 只读',
+  'workspace-write': 'workspace-write 工作区可写',
+  'danger-full-access': 'danger-full-access 绕过工作区限制',
+}
 
 function formatToolArgs(args: unknown): string {
   try {
@@ -59,12 +67,16 @@ export class Tui {
   private readonly editor: Editor
   private readonly terminal: ProcessTerminal | NonInteractiveTerminal
   private readonly transcript = new Container()
+  // 常驻的状态行。放在输入框上面,切模式时不用往上翻对话记录。
+  private readonly modeLine = new Text('', EDITOR_PADDING_X, 0)
 
   private onAbortCb: (() => void) | null = null
   // 非交互模式下 stdin 读完的回调
   private onInputClosedCb: (() => void) | null = null
   // 空闲时 Ctrl+C 退出。交给 cli,这样退出前还能跑 SessionEnd 钩子。
   private onExitCb: (() => void) | null = null
+  // Shift+Tab 循环模式。真正切不切由 cli 决定。
+  private onModeCycleCb: (() => void) | null = null
 
   // 当前回合的流式文本组件。流式结束后用它换成 Markdown 组件。
   private streamingText: Text | null = null
@@ -88,6 +100,7 @@ export class Tui {
     }
 
     this.tui.addChild(this.transcript)
+    this.tui.addChild(this.modeLine)
     this.tui.addChild(this.editor)
     this.tui.setFocus(this.editor)
 
@@ -95,20 +108,29 @@ export class Tui {
     // 空闲时按 Ctrl+C 退出,运行中则打断当前回合。
     // 两种情况都要 consume 掉这个按键——不然它会落到编辑器里变成一个 ^C 字符。
     //
+    // Shift+Tab 循环模式。编辑器的 tab 绑定是裸 tab,带 shift 的不会落到它手里;
+    // 这个监听器又排在聚焦组件之前,所以能先拿到。
+    //
     // 非交互环境不注册这个监听:那边没有原始模式,Ctrl+C 会正常触发 SIGINT,
-    // 由 cli 层的 SIGINT 处理函数接管。
+    // 由 cli 层的 SIGINT 处理函数接管,也没有键盘能按 Shift+Tab。
     if (canUseInteractiveTerminal()) {
       this.tui.addInputListener((data) => {
-        if (!matchesKey(data, 'ctrl+c')) return undefined
-        if (this.busy) {
-          this.onAbortCb?.()
-        } else if (this.onExitCb) {
-          this.onExitCb()
-        } else {
-          this.stop()
-          process.exit(0)
+        if (matchesKey(data, 'ctrl+c')) {
+          if (this.busy) {
+            this.onAbortCb?.()
+          } else if (this.onExitCb) {
+            this.onExitCb()
+          } else {
+            this.stop()
+            process.exit(0)
+          }
+          return { consume: true }
         }
-        return { consume: true }
+        if (matchesKey(data, 'shift+tab')) {
+          this.onModeCycleCb?.()
+          return { consume: true }
+        }
+        return undefined
       })
     }
   }
@@ -181,6 +203,23 @@ export class Tui {
   flush(): void {
     if (this.stopped) return
     this.tui.renderNow()
+  }
+
+  /** 注册 Shift+Tab 的回调。只在交互模式会触发。 */
+  onModeCycle(cb: () => void): void {
+    this.onModeCycleCb = cb
+  }
+
+  /**
+   * 更新状态行上的沙盒模式。
+   *
+   * danger-full-access 用错误色:它和另外两个不是一个量级的东西,
+   * 不能让人以为只是换了个开关。
+   */
+  setMode(mode: SandboxMode): void {
+    const label = `沙盒 ${MODE_LABELS[mode]} · Shift+Tab 切换`
+    this.modeLine.setText(mode === 'danger-full-access' ? errorText(label) : mutedText(label))
+    this.tui.requestRender()
   }
 
   /** agent 开始运行时调用:锁住输入框 */

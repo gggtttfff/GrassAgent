@@ -5,12 +5,13 @@ import { timingSafeEqual } from 'node:crypto'
 import {
   PolicyDeniedError,
   SandboxUnavailableError,
+  type SandboxMode,
   type TextEdit,
 } from '../world/executionWorld.ts'
 import { TextEditError } from '../core/textEdit.ts'
 
 /** 对不上就拒绝,不在半新半旧的进程上继续干活。 */
-export const SANDBOX_PROTOCOL_VERSION = 2
+export const SANDBOX_PROTOCOL_VERSION = 3
 
 export const MAX_CALL_BYTES = 2 * 1024 * 1024
 
@@ -19,7 +20,7 @@ export const MAX_RAW_BYTES = 1024 * 1024
 
 export type SandboxCall = {
   version: number
-  kind: 'health' | 'read' | 'write' | 'edit' | 'exec' | 'list'
+  kind: 'health' | 'read' | 'write' | 'edit' | 'exec' | 'list' | 'setMode'
   path?: string
   content?: string
   edits?: TextEdit[]
@@ -28,6 +29,8 @@ export type SandboxCall = {
   timeoutMs?: number
   /** read 时要全文就带上它,不走输出上限的截断 */
   raw?: boolean
+  /** setMode 的目标模式 */
+  mode?: SandboxMode
 }
 
 /** 目录里的一个条目。size 和 mtimeMs 让客户端能判断文件有没有变过。 */
@@ -49,6 +52,8 @@ export type SandboxSuccess = {
   stderr?: string
   aborted?: boolean
   timedOut?: boolean
+  /** daemon 当前生效的模式。客户端拿它对齐自己那份 policy。 */
+  mode?: SandboxMode
 }
 
 export type SandboxFailureCode =

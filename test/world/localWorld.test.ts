@@ -5,6 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { createDefaultApprovalGate } from '../../src/world/approvalGate.ts'
 import { createLocalWorld } from '../../src/world/localWorld.ts'
+import type { SandboxMode } from '../../src/world/executionWorld.ts'
 import { MAX_OUTPUT_BYTES } from '../../src/world/outputBound.ts'
 
 test('本地世界读写和原子编辑与原来的工具一致', async () => {
@@ -149,6 +150,66 @@ test('只读世界拒绝写入和执行,danger-full-access 没有审批就创建
     )
   } finally {
     await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('setMode 切到只读后写入和执行都被拒,切回来又能写', async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'grass-setmode-'))
+  try {
+    const world = await createLocalWorld({ workspace })
+    await world.write('ok.txt', 'kept')
+    assert.equal(world.policy.mode, 'workspace-write')
+
+    await world.setMode('read-only')
+    assert.equal(world.policy.mode, 'read-only')
+    await assert.rejects(() => world.write('ok.txt', 'x'), /只读沙盒拒绝写入/)
+    await assert.rejects(() => world.exec({
+      argv: ['bash', '-c', 'touch ok.txt'],
+      cwd: world.workspaceRoot,
+      timeoutMs: 1000,
+    }), /只读沙盒拒绝执行命令/)
+
+    await world.setMode('workspace-write')
+    await world.write('ok.txt', 'again')
+    assert.equal(await world.read('ok.txt'), 'again')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('setMode 拒绝未知模式,原来的模式不变', async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'grass-badmode-'))
+  try {
+    const world = await createLocalWorld({ workspace })
+    await assert.rejects(
+      () => world.setMode('whatever' as SandboxMode),
+      /未知的沙盒模式/,
+    )
+    assert.equal(world.policy.mode, 'workspace-write')
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('全权限模式能写工作区外的路径,切回可写模式又挡住', async () => {
+  const workspace = await mkdtemp(path.join(os.tmpdir(), 'grass-danger-'))
+  const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'grass-outside-'))
+  try {
+    const world = await createLocalWorld({
+      workspace,
+      mode: 'danger-full-access',
+      approval: { async decide() { return 'allow' } },
+    })
+    const outsideFile = path.join(outsideDir, 'danger.txt')
+    const written = await world.write(outsideFile, 'outside')
+    assert.equal(written, path.resolve(outsideFile))
+    assert.equal(await readFile(outsideFile, 'utf-8'), 'outside')
+
+    await world.setMode('workspace-write')
+    await assert.rejects(() => world.write(outsideFile, 'x'), /越界/)
+  } finally {
+    await rm(workspace, { recursive: true, force: true })
+    await rm(outsideDir, { recursive: true, force: true })
   }
 })
 

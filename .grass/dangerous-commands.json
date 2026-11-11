@@ -1,0 +1,11 @@
+{
+  "commands": [
+    { "pattern": "\\brm\\s+-[a-zA-Z]*(rf|fr)\\b", "reason": "禁止递归强制删除" },
+    { "pattern": "\\bmkfs(\\.[a-z0-9]+)?\\b", "reason": "禁止格式化磁盘" },
+    { "pattern": "\\bdd\\b[^\\n]*\\bof=/dev/", "reason": "禁止直接写块设备" },
+    { "pattern": ":\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:", "reason": "fork bomb" },
+    { "pattern": "\\bchmod\\s+-R\\s+777\\s+/\\s*$", "reason": "禁止把根目录改成所有人可写" },
+    { "pattern": "\\b(shutdown|reboot|halt|poweroff)\\b", "reason": "禁止关停机器" },
+    { "pattern": ">\\s*/dev/sd[a-z]", "reason": "禁止覆盖磁盘设备" }
+  ]
+}

@@ -2,10 +2,11 @@
 // 按配置打开执行世界。远程创建失败就停在这里,不退回本机工作区。
 
 import type { AgentConfig } from '../config.ts'
-import type { ExecutionWorld } from '../world/executionWorld.ts'
+import type { ExecutionWorld, SandboxMode } from '../world/executionWorld.ts'
+import type { ApprovalGate } from '../world/approvalGate.ts'
 import { createLocalWorld } from '../world/localWorld.ts'
 import { parseJson } from '../core/jsonSafety.ts'
-import { createRemoteWorld } from './remoteWorld.ts'
+import { createRemoteWorld, type RemoteWorldOptions } from './remoteWorld.ts'
 import { createSshBackend } from './sshBackend.ts'
 import { createControlPlane } from './control.ts'
 import { listenControl } from './controlHttp.ts'
@@ -50,10 +51,16 @@ export async function openExecutionWorld(
     fetchImpl?: typeof fetch
     /** 创建沙盒的进度。只在控制面跑在本进程时可用。 */
     onProgress?: (event: ProvisionProgress) => void
+    /** danger-full-access 必须先过审批。配置里写死的升级由调用方提供一个放行的门。 */
+    approval?: ApprovalGate
   },
 ): Promise<ExecutionWorld> {
   if (config.ExecutionWorld !== 'remote') {
-    return createLocalWorld({ workspace: config.Workspace })
+    return createLocalWorld({
+      workspace: config.Workspace,
+      mode: config.SandboxMode,
+      approval: options.approval,
+    })
   }
   const fetchImpl = options.fetchImpl ?? fetch
 
@@ -71,11 +78,12 @@ export async function openExecutionWorld(
       { ttlMs: config.SandboxTtlMs, sessionId: options.sessionId },
       config.SandboxControlToken,
     )
-    return createRemoteWorld({
+    return openRemoteWorld({
       controlUrl,
       sandboxId: handle.sandboxId,
       token: handle.token,
       workspaceRoot: handle.workspaceRoot,
+      mode: config.SandboxMode,
       fetchImpl,
     })
   }
@@ -85,13 +93,31 @@ export async function openExecutionWorld(
     sandboxCreateBody(config, options.sessionId),
     config.SandboxControlToken,
   )
-  return createRemoteWorld({
+  return openRemoteWorld({
     controlUrl,
     sandboxId: handle.sandboxId,
     token: handle.token,
     workspaceRoot: handle.workspaceRoot,
+    mode: config.SandboxMode,
     fetchImpl,
   })
+}
+
+/**
+ * 造好远程世界之后立刻把模式对齐到配置。
+ *
+ * daemon 起来时是 workspace-write。对齐发生在任何工具调用之前,所以没有窗口期。
+ * 对齐失败就把沙盒放掉——留一个模式和配置不符的世界,比直接失败更危险。
+ */
+async function openRemoteWorld(options: RemoteWorldOptions): Promise<ExecutionWorld> {
+  const world = createRemoteWorld(options)
+  try {
+    await world.setMode(options.mode ?? 'workspace-write')
+  } catch (error) {
+    await world.close().catch(() => undefined)
+    throw error
+  }
+  return world
 }
 
 /**
@@ -121,22 +147,34 @@ async function openInProcessControlPlane(
     callTimeoutMs: config.SandboxSshCallTimeoutMs,
     orphanMinimumAgeMs: config.SandboxSshOrphanAgeMs,
     keepRetentionMs: config.SandboxSshKeepRetentionMs,
+    reconnectAttempts: config.SandboxSshReconnectAttempts,
+    reconnectCooldownMs: config.SandboxSshReconnectCooldownMs,
     timeoutMs: config.SandboxSshTimeoutMs,
   })
   const plane = createControlPlane({ backend, controlToken: config.SandboxControlToken, onProgress })
   const listening = await listenControl(plane)
   try {
-    const handle = await postJson<SandboxHandle>(
-      fetch,
-      joinUrl(listening.url, '/v1/sandboxes'),
-      sandboxCreateBody(config, sessionId),
-      config.SandboxControlToken,
-    )
-    const world = createRemoteWorld({
+    // 配了 SandboxId 就走挂回。不区分的话这个配置在 SSH 后端下形同虚设,
+    // 每次启动都新建一个沙盒,原来那个工作区再也接不回去。
+    const handle = config.SandboxId
+      ? await postJson<SandboxHandle>(
+        fetch,
+        joinUrl(listening.url, `/v1/sandboxes/${config.SandboxId}/attach`),
+        { ttlMs: config.SandboxTtlMs, sessionId },
+        config.SandboxControlToken,
+      )
+      : await postJson<SandboxHandle>(
+        fetch,
+        joinUrl(listening.url, '/v1/sandboxes'),
+        sandboxCreateBody(config, sessionId),
+        config.SandboxControlToken,
+      )
+    const world = await openRemoteWorld({
       controlUrl: listening.url,
       sandboxId: handle.sandboxId,
       token: handle.token,
       workspaceRoot: handle.workspaceRoot,
+      mode: config.SandboxMode,
     })
     // 控制面跟着世界一起关。远端 daemon 才会被回收。
     const originalClose = world.close.bind(world)

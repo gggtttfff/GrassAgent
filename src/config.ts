@@ -140,6 +140,11 @@ export const configSchema = z.object({
   ExecutionWorld: z.enum(['local', 'remote'], {
     error: 'ExecutionWorld 只能是 local 或 remote',
   }).default('local'),
+  // 沙盒权限模式。read-only 只读;workspace-write 可写工作区;
+  // danger-full-access 绕过工作区限制,在这里写死等于用户本人授权。
+  SandboxMode: z.enum(['read-only', 'workspace-write', 'danger-full-access'], {
+    error: 'SandboxMode 只能是 read-only、workspace-write 或 danger-full-access',
+  }).default('workspace-write'),
   // 控制面用哪种后端创建沙盒。docker 起容器,ssh 连远程主机起 daemon,
   // inprocess 不起外部进程,给测试用。
   SandboxBackend: z.enum(['docker', 'ssh', 'inprocess'], {
@@ -216,6 +221,14 @@ export const configSchema = z.object({
   SandboxSshKeepRetentionMs: numericOption({
     minimum: 3_600_000, maximum: 31_536_000_000, defaultValue: 604_800_000,
     label: 'SandboxSshKeepRetentionMs',
+  }),
+  // SSH 断线后每轮最多重连几次。0 表示关掉重连。
+  SandboxSshReconnectAttempts: numericOption({
+    minimum: 0, maximum: 10, defaultValue: 3, label: 'SandboxSshReconnectAttempts',
+  }),
+  // 连续几轮都救不回来,冷却这么久再试。
+  SandboxSshReconnectCooldownMs: numericOption({
+    minimum: 0, maximum: 600_000, defaultValue: 30_000, label: 'SandboxSshReconnectCooldownMs',
   }),
 }).check(z.refine(
   (config) => config.CompactKeepRecentTokens + config.CompactReserveTokens < config.ContextWindow,
@@ -296,6 +309,7 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
   ApproveSkills: `${ENV_PREFIX}APPROVE_SKILLS`,
   ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
+  SandboxMode: `${ENV_PREFIX}SANDBOX_MODE`,
   SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
   SandboxImage: `${ENV_PREFIX}SANDBOX_IMAGE`,
   SandboxRepoUrl: `${ENV_PREFIX}SANDBOX_REPO_URL`,
@@ -324,6 +338,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxSshCallTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_CALL_TIMEOUT_MS`,
   SandboxSshOrphanAgeMs: `${ENV_PREFIX}SANDBOX_SSH_ORPHAN_AGE_MS`,
   SandboxSshKeepRetentionMs: `${ENV_PREFIX}SANDBOX_SSH_KEEP_RETENTION_MS`,
+  SandboxSshReconnectAttempts: `${ENV_PREFIX}SANDBOX_SSH_RECONNECT_ATTEMPTS`,
+  SandboxSshReconnectCooldownMs: `${ENV_PREFIX}SANDBOX_SSH_RECONNECT_COOLDOWN_MS`,
 }
 
 // .env 解析:逐行 KEY=VALUE,支持 # 注释和成对引号包裹。

@@ -189,6 +189,7 @@ test('默认会识别项目里的规则和提示词', () => {
 test('默认执行世界是本地,远程缺少控制面地址时失败', () => {
   const config = validateConfig({ ApiKey: 'k' })
   assert.equal(config.ExecutionWorld, 'local')
+  assert.equal(config.SandboxMode, 'workspace-write')
   assert.equal(config.SandboxTtlMs, 1_800_000)
   assert.equal(config.SandboxKeep, false)
   assert.throws(
@@ -212,6 +213,22 @@ test('默认执行世界是本地,远程缺少控制面地址时失败', () => {
 test('LoadProjectInstructions 可以用 0 关掉', () => {
   const config = validateConfig({ ApiKey: 'k', LoadProjectInstructions: '0' })
   assert.equal(config.LoadProjectInstructions, false)
+})
+
+test('沙盒权限模式可以配,非法取值启动就报错', () => {
+  assert.equal(validateConfig({ ApiKey: 'k', SandboxMode: 'read-only' }).SandboxMode, 'read-only')
+  assert.equal(
+    validateConfig({ ApiKey: 'k', SandboxMode: 'danger-full-access' }).SandboxMode,
+    'danger-full-access',
+  )
+  assert.throws(
+    () => validateConfig({ ApiKey: 'k', SandboxMode: 'whatever' }),
+    (error: unknown) => {
+      assert.ok(error instanceof ConfigError)
+      assert.ok(error.issues.some((issue) => issue.includes('GRASSAGENT_SANDBOX_MODE')))
+      return true
+    },
+  )
 })
 
 test('钩子超时有默认值,空路径视为没配', () => {

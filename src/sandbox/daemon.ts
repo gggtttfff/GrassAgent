@@ -5,9 +5,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import * as path from 'node:path'
+import * as posix from 'node:path/posix'
 import {
   EncodingError,
   PolicyDeniedError,
+  isSandboxMode,
   type SandboxMode,
 } from '../world/executionWorld.ts'
 import { parseJson } from '../core/jsonSafety.ts'
@@ -20,6 +22,7 @@ import {
   advertisedFromLocal,
   advertisedPath,
   ADVERTISED_WORKSPACE,
+  isAdvertisedInside,
   localPathFromAdvertised,
 } from './lexicalPath.ts'
 import {
@@ -59,11 +62,16 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
   if (host !== '127.0.0.1') {
     throw new Error('沙盒服务只监听回环地址')
   }
+  if (options.mode !== undefined && !isSandboxMode(options.mode)) {
+    throw new Error(`未知的沙盒模式: ${String(options.mode)}`)
+  }
   const advertisedRoot = options.advertisedRoot ?? ADVERTISED_WORKSPACE
   const version = options.version ?? SANDBOX_PROTOCOL_VERSION
   const pathGuard = await createPathGuard(options.localRoot)
   const diskBytes = (options.diskMb ?? 10240) * 1024 * 1024
-  const mode = options.mode ?? 'workspace-write'
+  // 模式要能被 setMode 改掉,所以存成一个共享的引用。
+  // 每个请求拿 HandlerContext 时读的是 modeRef.current 的当前值。
+  const modeRef: ModeRef = { current: options.mode ?? 'workspace-write' }
 
   const server = createServer((request, response) => {
     void handleRequest(request, response, {
@@ -72,7 +80,7 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
       advertisedRoot,
       pathGuard,
       diskBytes,
-      mode,
+      modeRef,
     }).catch((error: unknown) => {
       writeJson(response, 500, {
         ok: false,
@@ -101,13 +109,16 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
   }
 }
 
+/** 所有请求共用的一份模式状态。setMode 改的是它,不是某个请求的快照。 */
+type ModeRef = { current: SandboxMode }
+
 type HandlerContext = {
   token: string
   version: number
   advertisedRoot: string
   pathGuard: PathGuard
   diskBytes: number
-  mode: SandboxMode
+  modeRef: ModeRef
 }
 
 async function handleRequest(
@@ -160,8 +171,17 @@ async function dispatch(
   signal: AbortSignal,
 ): Promise<SandboxResult> {
   try {
+    // 一次请求只取一份模式快照,这条调用前后看到的是同一个模式
+    const mode = context.modeRef.current
     if (body.kind === 'health') {
-      return { ok: true, version: context.version }
+      return { ok: true, version: context.version, mode }
+    }
+    if (body.kind === 'setMode') {
+      if (!isSandboxMode(body.mode)) {
+        return { ok: false, code: 'failed', error: `未知的沙盒模式: ${String(body.mode)}` }
+      }
+      context.modeRef.current = body.mode
+      return { ok: true, version: context.version, mode: body.mode }
     }
     if (body.kind === 'read') {
       const resolved = await resolveCallPath(body.path ?? '', context)
@@ -180,7 +200,7 @@ async function dispatch(
         return { ok: true, version: context.version, content: text }
       }
       const content = await presentFile(resolved, context.pathGuard.workspace, (local) => (
-        advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, local)
+        displayPath(context, local)
       ))
       return { ok: true, version: context.version, content }
     }
@@ -225,7 +245,7 @@ async function dispatch(
       return { ok: true, version: context.version, entries: listed }
     }
     if (body.kind === 'write') {
-      assertWritable(context.mode, '写入')
+      assertWritable(mode, '写入')
       const content = body.content ?? ''
       assertDisk(content, context.diskBytes)
       const resolved = await resolveCallPath(body.path ?? '', context)
@@ -235,11 +255,11 @@ async function dispatch(
       return {
         ok: true,
         version: context.version,
-        path: advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, resolved),
+        path: displayPath(context, resolved),
       }
     }
     if (body.kind === 'edit') {
-      assertWritable(context.mode, '编辑')
+      assertWritable(mode, '编辑')
       const resolved = await resolveCallPath(body.path ?? '', context)
       const buffer = await readFile(resolved)
       let content: string
@@ -249,7 +269,7 @@ async function dispatch(
         throw new EncodingError(resolved, (error as Error).message)
       }
       const edits = body.edits ?? []
-      const advertised = advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, resolved)
+      const advertised = displayPath(context, resolved)
       const next = applyEdits(content, edits, advertised)
       assertDisk(next, context.diskBytes)
       const { writeFile } = await import('node:fs/promises')
@@ -257,7 +277,7 @@ async function dispatch(
       return { ok: true, version: context.version, path: advertised }
     }
     if (body.kind === 'exec') {
-      if (context.mode === 'read-only') throw new PolicyDeniedError('只读沙盒拒绝执行命令')
+      if (mode === 'read-only') throw new PolicyDeniedError('只读沙盒拒绝执行命令')
       const cwd = await resolveCallPath(body.cwd || context.advertisedRoot, context)
       const result = await runArgv({
         argv: body.argv ?? [],
@@ -281,9 +301,43 @@ async function dispatch(
 }
 
 async function resolveCallPath(requested: string, context: HandlerContext): Promise<string> {
+  if (context.modeRef.current === 'danger-full-access') {
+    return resolveCallPathInDanger(requested, context)
+  }
   const advertised = advertisedPath(context.advertisedRoot, requested)
   const local = localPathFromAdvertised(context.advertisedRoot, advertised, context.pathGuard.workspace)
   return context.pathGuard.resolve(local)
+}
+
+/**
+ * danger-full-access 下的路径解析。
+ *
+ * 工作区里的路径照旧映射成真实目录并 realpath——不然 /workspace 里放一个软链
+ * 就能绕过所有判断。区外的路径原样当作这台机器上的绝对路径。
+ */
+async function resolveCallPathInDanger(requested: string, context: HandlerContext): Promise<string> {
+  const target = posix.resolve(context.advertisedRoot, requested)
+  if (isAdvertisedInside(context.advertisedRoot, target)) {
+    const local = localPathFromAdvertised(context.advertisedRoot, target, context.pathGuard.workspace)
+    return context.pathGuard.resolve(local)
+  }
+  return path.resolve(target)
+}
+
+/**
+ * 回给模型的路径。
+ * 工作区里写成 /workspace/...;danger 下区外路径原样返回,不假装它还在工作区里。
+ */
+function displayPath(context: HandlerContext, localFile: string): string {
+  if (context.modeRef.current !== 'danger-full-access') {
+    return advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, localFile)
+  }
+  try {
+    return advertisedFromLocal(context.pathGuard.workspace, context.advertisedRoot, localFile)
+  } catch (error) {
+    if (error instanceof PathOutsideWorkspaceError) return localFile
+    throw error
+  }
 }
 
 function assertWritable(mode: SandboxMode, action: string): void {
@@ -369,6 +423,14 @@ function readFlag(name: string): string | undefined {
   return process.argv[index + 1]
 }
 
+/** --mode 的取值不可信。写错了要在启动时报,不是等第一次调用。 */
+function readModeFlag(): SandboxMode {
+  const value = readFlag('--mode')
+  if (value === undefined) return 'workspace-write'
+  if (!isSandboxMode(value)) throw new Error(`未知的沙盒模式: ${value}`)
+  return value
+}
+
 function isDaemonEntry(): boolean {
   const entry = process.argv[1]
   if (!entry) return false
@@ -387,7 +449,7 @@ async function serveFromArgv(): Promise<void> {
     token,
     host: readFlag('--host') ?? '127.0.0.1',
     port: Number(readFlag('--port') ?? 8765),
-    mode: (readFlag('--mode') as SandboxMode | undefined) ?? 'workspace-write',
+    mode: readModeFlag(),
     diskMb: Number(readFlag('--disk-mb') ?? 10240),
   })
   process.stdout.write(`daemon listening ${daemon.url}\n`)

@@ -12,6 +12,11 @@ import { formatExecResult, createLocalWorld } from '../world/localWorld.ts'
 import { describePathError } from '../core/pathGuard.ts'
 import { formatSkillForModel, type Skill, type SkillRegistry } from '../instructions/skills.ts'
 import { TextEditError } from '../core/textEdit.ts'
+import {
+  findDangerousCommand,
+  formatDangerousCommandRejection,
+  type DangerousCommandRule,
+} from './dangerousCommands.ts'
 
 // 命令执行超时(毫秒)。默认 3 秒——编译、跑测试这类任务通常要更久,
 // 可通过 GRASSAGENT_COMMAND_TIMEOUT_MS 调整。
@@ -149,13 +154,21 @@ function buildEditBatch(world: ExecutionWorld): AgentTool {
 }
 
 // run_bash:执行 shell 命令。argv 交给世界,不在工具里再包一层 shell。
-function buildRunBash(world: ExecutionWorld, timeoutMs: number): AgentTool {
+// 危险命令规则在这里拦一道:模式再宽,这几条命令也不跑。
+function buildRunBash(
+  world: ExecutionWorld,
+  timeoutMs: number,
+  dangerousCommands: readonly DangerousCommandRule[],
+  rulesPath: string,
+): AgentTool {
   return {
     name: 'run_bash',
     description: '执行shell命令.参数:command(命令字符串).在工作目录内执行,返回stdout+stderr,截取最后200行',
     parameters: runBashParameters,
     execute: async (args, signal) => {
       const { command } = args as { command: string }
+      const blocked = findDangerousCommand(dangerousCommands, command)
+      if (blocked) return formatDangerousCommandRejection(blocked, rulesPath)
       try {
         const result = await world.exec({
           argv: ['bash', '-c', command],
@@ -290,6 +303,10 @@ export async function builtinTools(options: {
   skills?: SkillRegistry
   /** 加载技能前要过的审批门 */
   approval?: ApprovalGate
+  /** 危险命令规则。命中就直接拒绝,不执行。 */
+  dangerousCommands?: readonly DangerousCommandRule[]
+  /** 规则文件路径。只在拒绝时给模型看,让它知道去哪儿改。 */
+  dangerousCommandsPath?: string
 } = {}): Promise<AgentTool[]> {
   const world = options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() })
   const tools = [
@@ -297,7 +314,12 @@ export async function builtinTools(options: {
     buildWriteFile(world),
     buildEdit(world),
     buildEditBatch(world),
-    buildRunBash(world, options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS),
+    buildRunBash(
+      world,
+      options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+      options.dangerousCommands ?? [],
+      options.dangerousCommandsPath ?? '危险命令规则文件',
+    ),
   ]
   // 一个技能都没有时不注册 load_skill:模型看见用不上的工具只会乱调
   if (options.skills && options.skills.names().length > 0) {

@@ -54,6 +54,80 @@ test('远程世界能列目录,raw 读拿到全文', async () => {
   }
 })
 
+test('远程世界能切换模式,切到只读后写入被拒', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-remote-mode-'))
+  try {
+    const backend = createInProcessBackend({ stateDir })
+    const plane = createControlPlane({ backend, timer: idleTimer })
+    const listening = await listenControl(plane)
+    try {
+      const config = validateConfig({
+        ApiKey: 'sk-test',
+        ExecutionWorld: 'remote',
+        SandboxControlUrl: listening.url,
+        SandboxImage: 'test-image',
+        Workspace: stateDir,
+      })
+      const world = await openExecutionWorld(config, { sessionId: 'session-mode' })
+      assert.equal(world.policy.mode, 'workspace-write')
+      await world.write('note.txt', 'hello')
+
+      await world.setMode('read-only')
+      assert.equal(world.policy.mode, 'read-only')
+      await assert.rejects(() => world.write('note.txt', 'x'), /只读沙盒拒绝写入/)
+
+      await world.setMode('workspace-write')
+      await world.write('note.txt', 'again')
+      assert.equal(await world.read('note.txt'), 'again')
+    } finally {
+      await listening.close().catch(() => undefined)
+    }
+  } finally {
+    await rm(stateDir, { recursive: true, force: true })
+  }
+})
+
+// 远程协议里的路径是 POSIX 规则(见 src/sandbox/lexicalPath.ts)。
+// Windows 上没法用 POSIX 路径表达工作区外的位置,所以这条只在类 Unix 上跑。
+test('远程全权限模式能写工作区外的路径', {
+  skip: process.platform === 'win32' ? '远程协议只认 POSIX 路径' : false,
+}, async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-remote-danger-'))
+  const outsideDir = await mkdtemp(path.join(os.tmpdir(), 'grass-outside-'))
+  try {
+    const backend = createInProcessBackend({ stateDir })
+    const plane = createControlPlane({ backend, timer: idleTimer })
+    const listening = await listenControl(plane)
+    try {
+      const config = validateConfig({
+        ApiKey: 'sk-test',
+        ExecutionWorld: 'remote',
+        SandboxControlUrl: listening.url,
+        SandboxImage: 'test-image',
+        Workspace: stateDir,
+      })
+      const world = await openExecutionWorld(config, { sessionId: 'session-danger' })
+      await world.setMode('danger-full-access')
+      assert.equal(world.policy.mode, 'danger-full-access')
+
+      // 区外路径这时能写,回执就是它自己的路径
+      const outsideFile = path.posix.join(outsideDir.replace(/\\/g, '/'), 'danger.txt')
+      const written = await world.write(outsideFile, 'outside')
+      assert.equal(written, outsideFile)
+      assert.equal(await readFile(outsideFile, 'utf-8'), 'outside')
+
+      // 工作区里的路径照旧显示成 /workspace/...
+      const inside = await world.write('inside.txt', 'inside')
+      assert.equal(inside, '/workspace/inside.txt')
+    } finally {
+      await listening.close().catch(() => undefined)
+    }
+  } finally {
+    await rm(stateDir, { recursive: true, force: true })
+    await rm(outsideDir, { recursive: true, force: true })
+  }
+})
+
 test('断开控制面后工具结果是沙盒不可用,不会改读本机文件', async () => {
   const stateDir = await mkdtemp(path.join(os.tmpdir(), 'grass-remote-'))
   const decoy = path.join(stateDir, 'decoy')
