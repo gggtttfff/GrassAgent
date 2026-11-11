@@ -352,7 +352,7 @@ test('SSH 后端:daemon 协议版本对不上时创建失败', { timeout: 40_000
   }
 })
 
-test('SSH 后端:挂回返回 null,不伪造空工作区', { timeout: 20_000 }, async () => {
+test('SSH 后端:挂回不存在的沙盒返回 null,不伪造空工作区', { timeout: 20_000 }, async () => {
   const remote = await startFakeRemote()
   const { keyPath, directory } = await makeKeyFile()
   try {
@@ -364,11 +364,60 @@ test('SSH 后端:挂回返回 null,不伪造空工作区', { timeout: 20_000 }, 
       knownHostsPath: path.join(directory, 'known_hosts'),
       logger: silentLogger,
     })
-    // 远程目录跟着 daemon 一起删了,挂不回就该明说,不能给个空目录顶替
+    // 远程没有这个沙盒的记录,挂不回就该明说,不能给个空目录顶替
     assert.equal(await backend.attach('missing'), null)
   } finally {
     await remote.close()
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('SSH 后端:挂回时能重新拉起沙盒并继续转发', { timeout: 40_000 }, async () => {
+  const remote = await startFakeRemote()
+  const { keyPath, directory } = await makeKeyFile()
+  const backend = createSshBackend({
+    host: '127.0.0.1',
+    port: remote.port,
+    username: 'dev',
+    privateKeyPath: keyPath,
+    knownHostsPath: path.join(directory, 'known_hosts'),
+    remoteWorkspace: `${REMOTE_ROOT}/workspace-attach`,
+    remoteRoot: REMOTE_ROOT,
+    logger: silentLogger,
+  })
+  try {
+    const sandbox = await backend.provision({
+      sandboxId: 'sb-attach',
+      token: 'attach-token-123456',
+      image: '',
+      repoUrl: '',
+      credential: null,
+      cpu: 1,
+      memoryMb: 1024,
+      diskMb: 1024,
+      networkAllowlist: [],
+      keep: true,
+    })
+
+    // 挂回:远端还留着 state.json 和令牌,应该能接上
+    const attached = await backend.attach('sb-attach')
+    assert.ok(attached, '挂回应成功')
+    assert.equal(attached!.sandboxId, 'sb-attach')
+    // 挂回来的沙盒按 keep 处理,不能被回收时删掉持久化状态
+    assert.equal(attached!.keep, true)
+
+    const result = await attached!.forward({
+      version: SANDBOX_PROTOCOL_VERSION,
+      kind: 'health',
+    })
+    assert.equal(result.ok, true)
+
+    await attached!.destroy({ removeVolume: false })
+    await sandbox.destroy({ removeVolume: true })
+  } finally {
+    await remote.close()
+    await rm(directory, { recursive: true, force: true })
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
   }
 })
 

@@ -7,7 +7,17 @@
 
 import type { Logger } from '../core/logger.ts'
 import type { ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
-import { deployRemoteDaemon, sweepOrphanDirectories, type RemoteDaemon } from './sshDeploy.ts'
+import {
+  deployRemoteDaemon,
+  pidIsAlive,
+  readSandboxRecord,
+  remotePathExists,
+  runRemote,
+  shellQuote,
+  sweepOrphanDirectories,
+  type RemoteDaemon,
+  type SandboxRecord,
+} from './sshDeploy.ts'
 import { resolveSshConfig, type SshConnectionConfig } from './sshConfig.ts'
 import { connectSsh, openSshTunnel, type SshTunnel } from './sshTunnel.ts'
 import {
@@ -39,6 +49,10 @@ export type SshBackendOptions = {
   orphanMinimumAgeMs?: number
   /** keep 的沙盒目录保留这么久。 */
   keepRetentionMs?: number
+  /** 断线后每轮最多重连几次。0 表示关掉重连。 */
+  reconnectAttempts?: number
+  /** 连续几轮都救不回来,冷却这么久再试。 */
+  reconnectCooldownMs?: number
   timeoutMs?: number
   logger?: Logger
 }
@@ -60,6 +74,18 @@ const DEFAULT_REMOTE_ROOT = '/tmp'
 
 /** keep 的目录默认保留一周。 */
 const DEFAULT_KEEP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
+/** 断线后每轮默认重连 3 次。 */
+const DEFAULT_RECONNECT_ATTEMPTS = 3
+
+/** 重连退避:第一次就要立刻再试,所以从第二次开始等。 */
+const RECONNECT_BACKOFF_MS = [500, 2_000, 5_000] as const
+
+/** 连续这么多轮都救不回来就冷却。 */
+const RECONNECT_FAILED_EPISODES_BEFORE_COOLDOWN = 3
+
+/** 冷却时长。期间调用直接返回不可用,不再卡在重连上。 */
+const DEFAULT_RECONNECT_COOLDOWN_MS = 30_000
 
 /** exec 在本机这一侧要留出往返和排队的时间。 */
 const EXEC_TIMEOUT_MARGIN_MS = 5_000
@@ -128,7 +154,16 @@ async function provision(
       timeoutMs: options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
       logger: options.logger,
     })
-    return runningFrom(client, daemon, tunnel, request, options)
+    return runningFrom({
+      client,
+      tunnel,
+      daemon,
+      sandboxId: request.sandboxId,
+      token: request.token,
+      keep: request.keep,
+      options,
+      config,
+    })
   } catch (error) {
     // 清理已经起来的部分。顺序反过来:先断隧道,再停 daemon,最后断连接。
     if (tunnel) await tunnel.close().catch(() => undefined)
@@ -139,48 +174,285 @@ async function provision(
 }
 
 /**
- * 挂回一个 keep 留下的沙盒。
+ * 挂回一个之前留下的沙盒。
  *
- * SSH 后端不保留远程的卷——远程目录跟着 daemon 一起被删了。
- * 所以这里直接返回 null,让控制面报「挂不回」而不是给一个空工作区。
+ * 两种情况:
+ * - daemon 还活着:重开隧道接上去,工作区原样
+ * - daemon 已经死了:沿用保存的令牌和目录重新起一个,工作区内容不动
+ *
+ * 拿不到状态、工作区被删、进程在但不响应,一律返回 null。
+ * 宁可说「挂不回去」,也不要给一个空工作区冒充原来的。
  */
 async function attach(
   options: SshBackendOptions,
   sandboxId: string,
 ): Promise<RunningSandbox | null> {
-  options.logger?.info({ sandboxId }, 'SSH 后端不支持挂回,远程目录已随 daemon 一起删除')
-  return null
+  const config = buildConfig(options)
+  const client = await connectSsh(config, { logger: options.logger })
+  let tunnel: SshTunnel | undefined
+  try {
+    const record = await readSandboxRecord({
+      client,
+      sandboxId,
+      remoteRoot: options.remoteRoot,
+      logger: options.logger,
+    })
+    if (!record) {
+      options.logger?.info({ sandboxId }, '远程没有这个沙盒的记录,不能挂回')
+      client.end()
+      return null
+    }
+    if (!await remotePathExists(client, record.state.workspace, options.logger)) {
+      options.logger?.info({
+        sandboxId,
+        workspace: record.state.workspace,
+      }, '沙盒工作区不在了,不能挂回')
+      client.end()
+      return null
+    }
+
+    // 进程还在就直接接上去。这里绝不能再起一个——
+    // 同一个工作区跑两个 daemon,写文件会互相踩。
+    if (record.state.pid > 0 && await pidIsAlive(client, record.state.pid, options.logger)) {
+      tunnel = await openSshTunnel(client, {
+        dstHost: '127.0.0.1',
+        dstPort: record.state.port,
+        logger: options.logger,
+      })
+      if (!await healthOnce(tunnel.localPort, record.token)) {
+        await tunnel.close().catch(() => undefined)
+        options.logger?.warn({
+          sandboxId,
+          pid: record.state.pid,
+        }, '沙盒进程还在但不响应,不重复启动')
+        client.end()
+        return null
+      }
+      options.logger?.info({ sandboxId, port: record.state.port }, '沙盒已挂回')
+      return runningFrom({
+        client,
+        tunnel,
+        daemon: daemonHandleFromRecord(client, record, options.logger),
+        sandboxId,
+        token: record.token,
+        // 挂回来的按 keep 处理,否则控制面回收时会把持久化状态删掉
+        keep: true,
+        options,
+        config,
+      })
+    }
+
+    // 进程已经死了:沿用原来的目录和令牌重新起一个,工作区不动
+    const daemon = await deployRemoteDaemon({
+      client,
+      sandboxId,
+      token: record.token,
+      remoteWorkspace: record.state.workspace,
+      diskMb: record.state.diskMb,
+      keep: true,
+      remoteRoot: options.remoteRoot,
+      logger: options.logger,
+    })
+    tunnel = await openSshTunnel(client, {
+      dstHost: '127.0.0.1',
+      dstPort: daemon.port,
+      logger: options.logger,
+    })
+    await waitForHealthy({
+      localPort: tunnel.localPort,
+      token: record.token,
+      daemon,
+      timeoutMs: options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS,
+      logger: options.logger,
+    })
+    options.logger?.info({ sandboxId, port: daemon.port }, '沙盒已重新拉起')
+    return runningFrom({
+      client,
+      tunnel,
+      daemon,
+      sandboxId,
+      token: record.token,
+      keep: true,
+      options,
+      config,
+    })
+  } catch (error) {
+    await tunnel?.close().catch(() => undefined)
+    client.end()
+    throw error
+  }
 }
 
-function runningFrom(
+/** 用持久化记录拼一个 daemon 句柄。日志和清理脚本都在沙盒目录里。 */
+function daemonHandleFromRecord(
   client: Awaited<ReturnType<typeof connectSsh>>,
-  daemon: RemoteDaemon,
-  tunnel: SshTunnel,
-  request: ProvisionRequest,
-  options: SshBackendOptions,
-): RunningSandbox {
-  const baseTimeoutMs = options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS
+  record: SandboxRecord,
+  logger?: Logger,
+): RemoteDaemon {
+  const logPath = `${record.sandboxDir}/daemon.log`
+  const stopScriptPath = `${record.sandboxDir}/stop.sh`
+  const killCommand = `sh ${shellQuote(stopScriptPath)} ${shellQuote(record.sandboxDir)}`
   return {
-    sandboxId: request.sandboxId,
-    // 模型看到的根固定是 /workspace,真实路径在远程那一侧。
-    workspaceRoot: '/workspace',
-    token: request.token,
-    localWorkspace: daemon.remoteDirectory,
-    keep: request.keep,
-    forward: (call) => postCall(
-      tunnel.localPort,
-      request.token,
-      call,
-      callTimeoutMs(call, baseTimeoutMs),
-    ),
-    destroy: async ({ removeVolume }) => {
-      await tunnel.close().catch(() => undefined)
-      await daemon.stop().catch(() => undefined)
-      client.end()
-      // SSH 后端没有本地卷。远程目录由 daemon.stop 清掉。
-      void removeVolume
+    port: record.state.port,
+    remoteDirectory: record.sandboxDir,
+    sourceDirectory: record.state.sourceDirectory,
+    readLogTail: async (maxChars = 800) => {
+      const output = await runRemote(client, `cat ${shellQuote(logPath)} 2>/dev/null || true`, logger)
+      return output.slice(-maxChars)
+    },
+    stopProcess: async () => {
+      await runRemote(client, killCommand, logger).catch(() => undefined)
+    },
+    stop: async () => {
+      await runRemote(
+        client,
+        `${killCommand}; rm -rf ${shellQuote(record.sandboxDir)}`,
+        logger,
+      ).catch(() => undefined)
     },
   }
+}
+
+function runningFrom(params: {
+  client: Awaited<ReturnType<typeof connectSsh>>
+  tunnel: SshTunnel
+  daemon: RemoteDaemon
+  sandboxId: string
+  token: string
+  keep: boolean
+  options: SshBackendOptions
+  config: SshConnectionConfig
+}): RunningSandbox {
+  const baseTimeoutMs = params.options.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS
+  const session = new SshSession(params)
+
+  return {
+    sandboxId: params.sandboxId,
+    // 模型看到的根固定是 /workspace,真实路径在远程那一侧。
+    workspaceRoot: '/workspace',
+    token: params.token,
+    localWorkspace: params.daemon.remoteDirectory,
+    keep: params.keep,
+    forward: (call) => session.forward(call, baseTimeoutMs),
+    destroy: async ({ removeVolume }) => {
+      session.markClosed()
+      await session.closeTunnel()
+      // keep 的时候只停进程,目录留着给下次挂回
+      if (removeVolume) await params.daemon.stop()
+      else await params.daemon.stopProcess()
+      session.closeClient()
+    },
+  }
+}
+
+/**
+ * 一个会话的 SSH 连接和隧道。
+ *
+ * 断线后惰性重连:只有调用真的失败了才重连,不做后台心跳。
+ * 每轮最多试 N 次、连续几轮都失败就冷却一段时间,避免每次工具调用
+ * 都卡在重连上。
+ */
+class SshSession {
+  private client: Awaited<ReturnType<typeof connectSsh>>
+  private tunnel: SshTunnel
+  private readonly params: Parameters<typeof runningFrom>[0]
+  private closed = false
+  private failedEpisodes = 0
+  private deadUntil = 0
+  private reconnecting: Promise<boolean> | undefined
+
+  constructor(params: Parameters<typeof runningFrom>[0]) {
+    this.params = params
+    this.client = params.client
+    this.tunnel = params.tunnel
+  }
+
+  /** 转发一次调用。传输层失败时先尝试重连,再接一次。 */
+  async forward(call: SandboxCall, baseTimeoutMs: number): Promise<SandboxResult> {
+    const timeoutMs = callTimeoutMs(call, baseTimeoutMs)
+    const result = await postCall(this.tunnel.localPort, this.params.token, call, timeoutMs)
+    // 业务错误(路径越界、版本不符)重连也没用
+    if (result.ok || result.code !== 'unavailable') return result
+    if (!(await this.reconnect())) return result
+    return postCall(this.tunnel.localPort, this.params.token, call, timeoutMs)
+  }
+
+  markClosed(): void {
+    this.closed = true
+  }
+
+  async closeTunnel(): Promise<void> {
+    await this.tunnel.close().catch(() => undefined)
+  }
+
+  closeClient(): void {
+    this.client.end()
+  }
+
+  private async reconnect(): Promise<boolean> {
+    const { options, config } = this.params
+    const attempts = options.reconnectAttempts ?? DEFAULT_RECONNECT_ATTEMPTS
+    if (this.closed || attempts <= 0) return false
+    if (Date.now() < this.deadUntil) return false
+    if (this.reconnecting) return this.reconnecting
+
+    this.reconnecting = (async () => {
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) await delay(RECONNECT_BACKOFF_MS[attempt - 1] ?? 5_000)
+        let nextClient: Awaited<ReturnType<typeof connectSsh>> | undefined
+        let nextTunnel: SshTunnel | undefined
+        try {
+          nextClient = await connectSsh(config, { logger: options.logger })
+          nextTunnel = await openSshTunnel(nextClient, {
+            dstHost: '127.0.0.1',
+            dstPort: this.params.daemon.port,
+            logger: options.logger,
+          })
+          // 隧道通了不代表 daemon 还在,再探一次
+          if (!await healthOnce(nextTunnel.localPort, this.params.token)) {
+            await nextTunnel.close().catch(() => undefined)
+            nextClient.end()
+            continue
+          }
+          await this.tunnel.close().catch(() => undefined)
+          this.client.end()
+          this.client = nextClient
+          this.tunnel = nextTunnel
+          this.failedEpisodes = 0
+          options.logger?.info({ sandboxId: this.params.sandboxId }, 'SSH 连接已重连')
+          return true
+        } catch (error) {
+          await nextTunnel?.close().catch(() => undefined)
+          nextClient?.end()
+          options.logger?.warn({
+            attempt: attempt + 1,
+            errorMessage: (error as Error).message,
+          }, 'SSH 重连失败')
+        }
+      }
+      this.failedEpisodes++
+      // 连续几轮都救不回来就别再试了,冷却一段时间直接返回不可用
+      if (this.failedEpisodes >= RECONNECT_FAILED_EPISODES_BEFORE_COOLDOWN) {
+        this.deadUntil = Date.now() + (options.reconnectCooldownMs ?? DEFAULT_RECONNECT_COOLDOWN_MS)
+      }
+      return false
+    })()
+
+    try {
+      return await this.reconnecting
+    } finally {
+      this.reconnecting = undefined
+    }
+  }
+}
+
+/** 探一次健康。返回 true 表示 daemon 在正常应答。 */
+async function healthOnce(localPort: number, token: string): Promise<boolean> {
+  const health = await postCall(localPort, token, {
+    version: SANDBOX_PROTOCOL_VERSION,
+    kind: 'health',
+  }, HEALTH_CALL_TIMEOUT_MS)
+  return health.ok && health.version === SANDBOX_PROTOCOL_VERSION
 }
 
 /** exec 的超时管的是远程那条命令,本机这一侧要留出往返和排队的时间。 */

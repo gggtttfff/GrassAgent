@@ -23,6 +23,7 @@ import {
   MINIMUM_NODE_VERSION,
   nodeVersionIsSupported,
   parseNodeVersion,
+  parseSandboxState,
   parseSweepListing,
   sandboxDirectory,
   SANDBOX_STATE_FILE_NAME,
@@ -102,6 +103,9 @@ export type RemoteDaemon = {
    * 才不至于只剩一句「daemon 没起来」。
    */
   readLogTail: (maxChars?: number) => Promise<string>
+  /** 只停进程,保留目录。keep 的沙盒回收时用这个,目录要留给下次挂回。 */
+  stopProcess: () => Promise<void>
+  /** 停进程并删掉沙盒目录。共享源码目录不动。 */
   stop: () => Promise<void>
 }
 
@@ -247,6 +251,16 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
           logger,
         )
         return output.slice(-maxChars)
+      },
+      stopProcess: async () => {
+        // 只停进程。keep 的沙盒回收时用这个,目录要留给下次挂回。
+        await runRemote(client, `sh ${shellQuote(stopPath)} ${shellQuote(sandboxDir)}`, logger)
+          .catch((error: unknown) => {
+            logger?.warn({
+              sandboxDirectory: sandboxDir,
+              errorMessage: (error as Error).message,
+            }, '停止远程 daemon 失败')
+          })
       },
       stop: async () => {
         // 杀进程和删目录放一条命令:中途断线的话至少不会只做一半。
@@ -522,12 +536,61 @@ export async function sweepOrphanDirectories(options: SweepOptions): Promise<str
   return removed
 }
 
-async function pidIsAlive(client: Client, pid: number, logger?: Logger): Promise<boolean> {
+/** 远程进程还活着吗。挂回时用来判断要不要重新起 daemon。 */
+export async function pidIsAlive(client: Client, pid: number, logger?: Logger): Promise<boolean> {
   try {
     await runRemote(client, `kill -0 ${pid}`, logger)
     return true
   } catch {
     return false
+  }
+}
+
+/** 远程路径存不存在。挂回时用来确认工作区还在。 */
+export async function remotePathExists(
+  client: Client,
+  remotePath: string,
+  logger?: Logger,
+): Promise<boolean> {
+  try {
+    await runRemote(client, `test -e ${shellQuote(remotePath)}`, logger)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 从远程目录里读回一个沙盒的记录。读不到任何一样都返回 null。 */
+export type SandboxRecord = {
+  sandboxDir: string
+  token: string
+  state: SandboxState
+}
+
+/**
+ * 读沙盒的持久化状态和令牌。
+ *
+ * 缺任何一样都返回 null:少令牌就没法调用 daemon,少状态就不知道端口和 PID。
+ * 宁可报「挂不回去」也不要拿半套信息去拼。
+ */
+export async function readSandboxRecord(options: {
+  client: Client
+  sandboxId: string
+  remoteRoot?: string
+  logger?: Logger
+}): Promise<SandboxRecord | null> {
+  const sandboxDir = sandboxDirectory(options.remoteRoot ?? '/tmp', options.sandboxId)
+  const remote = await openRemoteFiles(options.client)
+  try {
+    const stateText = await remote.read(`${sandboxDir}/${SANDBOX_STATE_FILE_NAME}`)
+    if (!stateText) return null
+    const state = parseSandboxState(stateText)
+    if (!state) return null
+    const token = (await remote.read(`${sandboxDir}/token`))?.trim()
+    if (!token) return null
+    return { sandboxDir, token, state }
+  } finally {
+    remote.close()
   }
 }
 
