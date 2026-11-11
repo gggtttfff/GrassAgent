@@ -27,6 +27,10 @@ const REDACT_PATHS = [
   'credentialRef',
   'gitToken',
   'sandboxToken',
+  'password',
+  '*.password',
+  'passphrase',
+  '*.passphrase',
 ]
 
 export interface LoggerOptions {

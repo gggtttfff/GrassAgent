@@ -15,6 +15,7 @@ import {
   keyFingerprint,
   knownHostsHostName,
   loadKnownHosts,
+  missingAuthMethod,
   openSshTunnel,
 } from '../../src/sandbox/sshTunnel.ts'
 import { resolveSshConfig, expandHome } from '../../src/sandbox/sshConfig.ts'
@@ -58,6 +59,29 @@ test('SSH 配置把私钥路径展开成绝对路径', () => {
 test('SSH 配置缺主机或用户时报错', () => {
   assert.throws(() => resolveSshConfig({ username: 'dev' }), /主机/)
   assert.throws(() => resolveSshConfig({ host: 'example.com' }), /用户名/)
+})
+
+test('SSH 配置带上 agent 和密码', () => {
+  const config = resolveSshConfig({
+    host: 'example.com',
+    username: 'dev',
+    agentPath: '/run/user/1000/ssh-agent.socket',
+    password: '  hunter2  ',
+  })
+  assert.equal(config.agentPath, '/run/user/1000/ssh-agent.socket')
+  // 首尾空白要去掉,不然密码里会多一个空格
+  assert.equal(config.password, 'hunter2')
+})
+
+test('三种认证方式都没有时,连之前就报错', () => {
+  const config = resolveSshConfig({ host: 'example.com', username: 'dev' })
+  const withoutAuth = { ...config, privateKeyPath: null, agentPath: null, password: null }
+  assert.match(missingAuthMethod(withoutAuth) ?? '', /认证方式/)
+
+  // 任意一种配上就不该拦
+  assert.equal(missingAuthMethod({ ...withoutAuth, privateKeyPath: '/k' }), null)
+  assert.equal(missingAuthMethod({ ...withoutAuth, agentPath: '/a' }), null)
+  assert.equal(missingAuthMethod({ ...withoutAuth, password: 'p' }), null)
 })
 
 test('主机密钥指纹用 SHA-256,和 OpenSSH 格式一致', () => {

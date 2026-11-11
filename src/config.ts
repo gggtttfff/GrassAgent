@@ -176,10 +176,15 @@ export const configSchema = z.object({
   SandboxSshPort: numericOption({
     minimum: 1, maximum: 65_535, defaultValue: 22, label: 'SandboxSshPort',
   }),
-  // 私钥文件路径。留空则依赖 ssh-agent 或密码认证。
+  // 私钥文件路径。留空则改用 ssh-agent 或密码认证。
   SandboxSshKeyPath: optionalText('SandboxSshKeyPath'),
   // 私钥口令。加密私钥才需要。
   SandboxSshKeyPassphrase: optionalText('SandboxSshKeyPassphrase'),
+  // ssh-agent 的 socket 或命名管道。留空则自动探测 SSH_AUTH_SOCK,
+  // Windows 上再试 OpenSSH 自带的命名管道。
+  SandboxSshAgent: optionalText('SandboxSshAgent'),
+  // 密码认证的口令。私钥和 agent 都用不上时才需要。
+  SandboxSshPassword: optionalText('SandboxSshPassword'),
   // known_hosts 文件。留空用 ~/.ssh/known_hosts。主机密钥变化时连接会被拒绝。
   SandboxSshKnownHostsPath: optionalText('SandboxSshKnownHostsPath'),
   // 远程工作区的真实路径。模型看到的是 /workspace,这里对应远程机器上的目录。
@@ -284,6 +289,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   SandboxSshPort: `${ENV_PREFIX}SANDBOX_SSH_PORT`,
   SandboxSshKeyPath: `${ENV_PREFIX}SANDBOX_SSH_KEY_PATH`,
   SandboxSshKeyPassphrase: `${ENV_PREFIX}SANDBOX_SSH_KEY_PASSPHRASE`,
+  SandboxSshAgent: `${ENV_PREFIX}SANDBOX_SSH_AGENT`,
+  SandboxSshPassword: `${ENV_PREFIX}SANDBOX_SSH_PASSWORD`,
   SandboxSshKnownHostsPath: `${ENV_PREFIX}SANDBOX_SSH_KNOWN_HOSTS_PATH`,
   SandboxSshWorkspace: `${ENV_PREFIX}SANDBOX_SSH_WORKSPACE`,
   SandboxSshTimeoutMs: `${ENV_PREFIX}SANDBOX_SSH_TIMEOUT_MS`,

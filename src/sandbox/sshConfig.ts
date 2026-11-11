@@ -2,11 +2,15 @@
 // SSH 后端的连接参数。只在这里解析主机、用户、端口和凭据,
 // 别的地方不要直接读环境变量,免得同一个键有两套解释。
 
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
-/** 一次 SSH 连接需要的全部信息。私钥和口令都不进日志。 */
+/** Windows 上 OpenSSH 自带的 agent 命名管道。 */
+const WINDOWS_AGENT_PIPE = '\\\\.\\pipe\\openssh-ssh-agent'
+
+/** 一次 SSH 连接需要的全部信息。私钥、口令和密码都不进日志。 */
 export type SshConnectionConfig = {
   host: string
   port: number
@@ -14,6 +18,10 @@ export type SshConnectionConfig = {
   /** 私钥文件的绝对路径。空则用 ssh-agent 或密码。 */
   privateKeyPath: string | null
   privateKeyPassphrase: string | null
+  /** ssh-agent 的 socket 或命名管道。空则不用 agent。 */
+  agentPath: string | null
+  /** 密码认证的口令。 */
+  password: string | null
   /** known_hosts 的绝对路径。空则用 ~/.ssh/known_hosts。 */
   knownHostsPath: string
   /** 远程工作区的真实路径。模型看到的是 /workspace,这里对应远程的真实目录。 */
@@ -35,6 +43,8 @@ export type SshConfigInput = {
   username?: string
   privateKeyPath?: string
   privateKeyPassphrase?: string
+  agentPath?: string
+  password?: string
   knownHostsPath?: string
   remoteWorkspace?: string
   timeoutMs?: number
@@ -61,6 +71,7 @@ export function resolveSshConfig(input: SshConfigInput): SshConnectionConfig {
     ? path.resolve(expandHome(input.knownHostsPath.trim()))
     : path.join(os.homedir(), '.ssh', 'known_hosts')
   const remoteWorkspace = input.remoteWorkspace?.trim() || '/workspace'
+  const agentPath = input.agentPath?.trim() || defaultAgentPath()
 
   return {
     host,
@@ -68,10 +79,25 @@ export function resolveSshConfig(input: SshConfigInput): SshConnectionConfig {
     username,
     privateKeyPath,
     privateKeyPassphrase: input.privateKeyPassphrase?.trim() || null,
+    agentPath,
+    password: input.password?.trim() || null,
     knownHostsPath,
     remoteWorkspace,
     timeoutMs: input.timeoutMs ?? 30_000,
   }
+}
+
+/**
+ * 挑一个默认的 ssh-agent 地址。
+ *
+ * POSIX 走 SSH_AUTH_SOCK。Windows 没有这个变量,但 OpenSSH 客户端自带的 agent
+ * 监听一个固定命名管道——先确认它真在,不然 ssh2 会去连不存在的管道然后认证失败。
+ */
+function defaultAgentPath(): string | null {
+  const fromEnvironment = process.env.SSH_AUTH_SOCK?.trim()
+  if (fromEnvironment) return fromEnvironment
+  if (process.platform === 'win32' && existsSync(WINDOWS_AGENT_PIPE)) return WINDOWS_AGENT_PIPE
+  return null
 }
 
 /**

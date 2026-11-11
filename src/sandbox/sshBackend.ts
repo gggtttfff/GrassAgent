@@ -22,6 +22,10 @@ export type SshBackendOptions = {
   username: string
   privateKeyPath?: string
   privateKeyPassphrase?: string
+  /** ssh-agent 的 socket 或命名管道。留空则自动探测。 */
+  agentPath?: string
+  /** 密码认证的口令。 */
+  password?: string
   knownHostsPath?: string
   /** 远程工作区的真实路径。模型看到的是 /workspace。 */
   remoteWorkspace?: string
@@ -170,6 +174,8 @@ function buildConfig(options: SshBackendOptions): SshConnectionConfig {
     username: options.username,
     privateKeyPath: options.privateKeyPath,
     privateKeyPassphrase: options.privateKeyPassphrase,
+    agentPath: options.agentPath,
+    password: options.password,
     knownHostsPath: options.knownHostsPath,
     remoteWorkspace: options.remoteWorkspace,
     timeoutMs: options.timeoutMs,

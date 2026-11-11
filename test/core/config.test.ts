@@ -253,6 +253,23 @@ test('SSH 后端不需要控制面地址和镜像', () => {
   assert.equal(config.SandboxBackend, 'ssh')
   assert.equal(config.SandboxSshHost, 'dev.example.com')
   assert.equal(config.SandboxSshPort, 22)
+  // 认证方式都留空,由运行期自动探测或报错
+  assert.equal(config.SandboxSshAgent, undefined)
+  assert.equal(config.SandboxSshPassword, undefined)
+})
+
+test('SSH 认证方式可以走 agent 或密码', () => {
+  const config = validateConfig({
+    ApiKey: 'k',
+    ExecutionWorld: 'remote',
+    SandboxBackend: 'ssh',
+    SandboxSshHost: 'dev.example.com',
+    SandboxSshUser: 'dev',
+    SandboxSshAgent: '/run/user/1000/ssh-agent.socket',
+    SandboxSshPassword: 'hunter2',
+  })
+  assert.equal(config.SandboxSshAgent, '/run/user/1000/ssh-agent.socket')
+  assert.equal(config.SandboxSshPassword, 'hunter2')
 })
 
 test('SSH 后端缺主机或用户时被拒绝', () => {

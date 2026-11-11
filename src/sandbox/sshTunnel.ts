@@ -14,7 +14,7 @@ import * as path from 'node:path'
 import { createServer, type Socket } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import type { Logger } from '../core/logger.ts'
-import { readPrivateKey, type SshConnectionConfig } from './sshConfig.ts'
+import { readPrivateKey, SshConfigError, type SshConnectionConfig } from './sshConfig.ts'
 
 const { Client } = ssh2
 
@@ -22,6 +22,21 @@ export type SshTunnel = {
   /** 本机回环地址上的端口,请求发到这里就会转到远程 daemon。 */
   localPort: number
   close: () => Promise<void>
+}
+
+/**
+ * 有没有一种能用的认证方式。返回 null 表示有。
+ *
+ * 抽成纯函数:connectSsh 要真连上服务器才跑得起来,
+ * 而「什么都没配」这种情况应该在连之前就判掉,不该等握手超时。
+ *
+ * 作者：Pieory 创建日期：2025-07-18
+ */
+export function missingAuthMethod(
+  config: Pick<SshConnectionConfig, 'privateKeyPath' | 'agentPath' | 'password'>,
+): string | null {
+  if (config.privateKeyPath || config.agentPath || config.password) return null
+  return 'SSH 没有可用的认证方式:配置私钥路径、启动 ssh-agent 或设置密码'
 }
 
 /**
@@ -33,6 +48,10 @@ export async function connectSsh(
   config: SshConnectionConfig,
   options: { logger?: Logger } = {},
 ): Promise<SshClient> {
+  // 什么都没配时 ssh2 会连着失败几轮才报一个很难懂的错误,先说清楚缺什么。
+  const missingAuth = missingAuthMethod(config)
+  if (missingAuth) throw new SshConfigError(missingAuth)
+
   const connectConfig: ConnectConfig = {
     host: config.host,
     port: config.port,
@@ -47,6 +66,8 @@ export async function connectSsh(
       connectConfig.passphrase = config.privateKeyPassphrase
     }
   }
+  if (config.agentPath) connectConfig.agent = config.agentPath
+  if (config.password) connectConfig.password = config.password
 
   const client = new Client()
   await new Promise<void>((resolve, reject) => {
