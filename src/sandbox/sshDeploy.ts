@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import type { Logger } from '../core/logger.ts'
 import { stringifyJson } from '../core/jsonSafety.ts'
 import { SANDBOX_PROTOCOL_VERSION } from './protocol.ts'
+import type { ProvisionProgress } from './backend.ts'
 import {
   computeSourceHash,
   formatNodeVersion,
@@ -115,7 +116,25 @@ export type DeployOptions = {
   keep?: boolean
   /** 远程上放 daemon 源码的根目录。默认 /tmp。 */
   remoteRoot?: string
+  /** 部署进度。界面用来显示「卡在哪一步」。 */
+  onProgress?: (event: ProvisionProgress) => void
   logger?: Logger
+}
+
+/**
+ * 报一次进度。
+ *
+ * 界面回调抛异常不能把部署打断——显示失败比部署失败轻得多。
+ */
+function reportProgress(
+  onProgress: ((event: ProvisionProgress) => void) | undefined,
+  event: ProvisionProgress,
+): void {
+  try {
+    onProgress?.(event)
+  } catch {
+    // 忽略:进度只是展示
+  }
 }
 
 /**
@@ -131,6 +150,7 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
   const remoteRoot = options.remoteRoot ?? '/tmp'
 
   // 1. Node 版本先探。不合格就别传文件了——传完再失败白等几十秒。
+  reportProgress(options.onProgress, { phase: 'node-check', message: '检查远程 Node 版本' })
   const nodeVersion = await probeNodeVersion(client, logger)
   if (!nodeVersionIsSupported(nodeVersion)) {
     throw new Error(
@@ -159,7 +179,7 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
     // 工作区要先有,daemon 起来时会对它做 realpath。不存在就直接失败。
     await createWorkspace(remote, workspace)
     await remote.mkdir(sandboxDir)
-    await ensureSourceDirectory(remote, sourceDir, sources, fullHash, logger)
+    await ensureSourceDirectory(remote, sourceDir, sources, fullHash, logger, options.onProgress)
 
     // 令牌写在远程的 0600 文件里。daemon 每次调用都读它比对。
     await remote.write(tokenPath, options.token)
@@ -189,6 +209,7 @@ export async function deployRemoteDaemon(options: DeployOptions): Promise<Remote
       `echo $! > ${shellQuote(pidPath)}`,
     ].join(' ')
 
+    reportProgress(options.onProgress, { phase: 'start', message: '启动远程 daemon' })
     await runRemote(client, startCommand, logger)
     const port = await discoverDaemonPort(client, logPath, logger)
     const pid = await readDaemonPid(remote, pidPath)
@@ -387,9 +408,11 @@ async function ensureSourceDirectory(
   sources: ReadonlyMap<string, string>,
   fullHash: string,
   logger?: Logger,
+  onProgress?: (event: ProvisionProgress) => void,
 ): Promise<void> {
   const completed = await remote.read(`${sourceDir}/.complete`)
   if (completed?.trim() === fullHash) {
+    reportProgress(onProgress, { phase: 'reuse-source', message: '远程源码已是最新,跳过上传' })
     logger?.debug({ sourceDir }, '远程源码已是最新,跳过上传')
     return
   }
@@ -397,11 +420,17 @@ async function ensureSourceDirectory(
   const staging = stagingDirectory(sourceDir, randomBytes(8).toString('hex'))
   try {
     await remote.mkdir(staging)
-    // 排序后传,排障时日志顺眼
-    for (const relative of [...sources.keys()].sort()) {
+    const relatives = [...sources.keys()].sort()
+    for (const [index, relative] of relatives.entries()) {
       const remotePath = `${staging}/${relative}`
       await remote.mkdir(path.posix.dirname(remotePath))
       await remote.write(remotePath, sources.get(relative) ?? '')
+      reportProgress(onProgress, {
+        phase: 'upload',
+        message: `上传 daemon 源码 ${index + 1}/${relatives.length}`,
+        current: index + 1,
+        total: relatives.length,
+      })
     }
     // .complete 最后写。它出现了就代表整个目录是完整的。
     await remote.write(`${staging}/.complete`, fullHash)
@@ -432,6 +461,7 @@ export type SweepOptions = {
   minimumAgeMs: number
   /** keep 的目录保留这么久。 */
   keepRetentionMs: number
+  onProgress?: (event: ProvisionProgress) => void
   logger?: Logger
 }
 
@@ -445,6 +475,7 @@ export type SweepOptions = {
  */
 export async function sweepOrphanDirectories(options: SweepOptions): Promise<string[]> {
   const { client, remoteRoot, logger } = options
+  reportProgress(options.onProgress, { phase: 'sweep', message: '扫描远程残留目录' })
   let listing: string
   try {
     listing = await runRemote(client, sweepListingCommand(remoteRoot), logger)

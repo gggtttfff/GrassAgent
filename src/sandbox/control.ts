@@ -10,7 +10,7 @@ import {
   createToken,
   resolveCredentialRef,
 } from './secrets.ts'
-import type { ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
+import type { ProvisionProgress, ProvisionRequest, RunningSandbox, SandboxBackend } from './backend.ts'
 
 export type TimerHandle = {
   refresh: () => void
@@ -92,6 +92,8 @@ export function createControlPlane(options: {
   logger?: Logger
   /** 调用方凭据。创建和挂回要校验它。 */
   controlToken?: string
+  /** 创建沙盒时的进度回调。跨进程的控制面拿不到,只对本进程有效。 */
+  onProgress?: (event: ProvisionProgress) => void
 }): ControlPlane {
   const timer = options.timer ?? defaultIdleTimer
   const live = new Map<string, LiveSandbox>()
@@ -109,7 +111,13 @@ export function createControlPlane(options: {
         throw new Error('调用方令牌被拒绝')
       }
       const credential = await rememberSecret(input.credentialRef, options.credentialsFile, secrets)
-      const request = provisionRequest(createSandboxId(), createToken(), input, credential)
+      const request = provisionRequest(
+        createSandboxId(),
+        createToken(),
+        input,
+        credential,
+        options.onProgress,
+      )
       return startTracked(options, timer, live, request, input.ttlMs, secrets)
     },
     async attach(sandboxId, ttlMs, sessionId, callerToken) {
@@ -232,6 +240,7 @@ function provisionRequest(
   token: string,
   input: CreateSandboxInput,
   credential: string | null,
+  onProgress?: (event: ProvisionProgress) => void,
 ): ProvisionRequest {
   return {
     sandboxId,
@@ -245,5 +254,6 @@ function provisionRequest(
     networkAllowlist: input.networkAllowlist ?? [],
     keep: input.keep ?? false,
     sessionId: input.sessionId,
+    onProgress,
   }
 }

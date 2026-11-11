@@ -10,6 +10,7 @@ import { createSshBackend } from './sshBackend.ts'
 import { createControlPlane } from './control.ts'
 import { listenControl } from './controlHttp.ts'
 import type { CreateSandboxInput, SandboxHandle } from './control.ts'
+import type { ProvisionProgress } from './backend.ts'
 
 /**
  * 发给控制面的创建参数。这里没有 API Key,密钥留在 Grass 进程里。
@@ -44,7 +45,12 @@ export function sandboxCreateBody(config: AgentConfig, sessionId: string): Creat
  */
 export async function openExecutionWorld(
   config: AgentConfig,
-  options: { sessionId: string; fetchImpl?: typeof fetch },
+  options: {
+    sessionId: string
+    fetchImpl?: typeof fetch
+    /** 创建沙盒的进度。只在控制面跑在本进程时可用。 */
+    onProgress?: (event: ProvisionProgress) => void
+  },
 ): Promise<ExecutionWorld> {
   if (config.ExecutionWorld !== 'remote') {
     return createLocalWorld({ workspace: config.Workspace })
@@ -53,7 +59,7 @@ export async function openExecutionWorld(
 
   // SSH 后端且没指定控制面地址:控制面在本进程里起。
   if (!config.SandboxControlUrl && config.SandboxBackend === 'ssh') {
-    return openInProcessControlPlane(config, options.sessionId)
+    return openInProcessControlPlane(config, options.sessionId, options.onProgress)
   }
 
   const controlUrl = config.SandboxControlUrl
@@ -98,6 +104,7 @@ export async function openExecutionWorld(
 async function openInProcessControlPlane(
   config: AgentConfig,
   sessionId: string,
+  onProgress?: (event: ProvisionProgress) => void,
 ): Promise<ExecutionWorld> {
   const backend = createSshBackend({
     host: config.SandboxSshHost ?? '',
@@ -116,7 +123,7 @@ async function openInProcessControlPlane(
     keepRetentionMs: config.SandboxSshKeepRetentionMs,
     timeoutMs: config.SandboxSshTimeoutMs,
   })
-  const plane = createControlPlane({ backend, controlToken: config.SandboxControlToken })
+  const plane = createControlPlane({ backend, controlToken: config.SandboxControlToken, onProgress })
   const listening = await listenControl(plane)
   try {
     const handle = await postJson<SandboxHandle>(

@@ -87,6 +87,7 @@ async function provision(
   request: ProvisionRequest,
 ): Promise<RunningSandbox> {
   const config = buildConfig(options)
+  request.onProgress?.({ phase: 'connect', message: '连接远程主机' })
   const client = await connectSsh(config, { logger: options.logger })
   let daemon: RemoteDaemon | undefined
   let tunnel: SshTunnel | undefined
@@ -98,6 +99,7 @@ async function provision(
       remoteRoot: options.remoteRoot ?? DEFAULT_REMOTE_ROOT,
       minimumAgeMs: options.orphanMinimumAgeMs ?? DEFAULT_ORPHAN_MINIMUM_AGE_MS,
       keepRetentionMs: options.keepRetentionMs ?? DEFAULT_KEEP_RETENTION_MS,
+      onProgress: request.onProgress,
       logger: options.logger,
     })
 
@@ -109,6 +111,7 @@ async function provision(
       diskMb: request.diskMb,
       keep: request.keep,
       remoteRoot: options.remoteRoot,
+      onProgress: request.onProgress,
       logger: options.logger,
     })
     tunnel = await openSshTunnel(client, {
@@ -117,6 +120,7 @@ async function provision(
       logger: options.logger,
     })
     // 走一遍协议,确认远程 daemon 起来了、版本也对得上。
+    request.onProgress?.({ phase: 'health', message: '等待远程 daemon 就绪' })
     await waitForHealthy({
       localPort: tunnel.localPort,
       token: request.token,

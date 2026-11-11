@@ -122,10 +122,17 @@ async function main() {
     }
   }
 
+  // Tui 提前建出来:远程沙盒创建要等十几秒,期间得有东西告诉用户卡在哪。
+  // 构造函数不碰终端,真正的接管发生在 start()——那时候沙盒早就建好了。
+  const tui = new Tui()
+
   // 文件和命令进同一个执行世界。远程创建失败就退出,不改绑本机工作区。
   let world: ExecutionWorld
   try {
-    world = await openExecutionWorld(config, { sessionId })
+    world = await openExecutionWorld(config, {
+      sessionId,
+      onProgress: (event) => tui.printNotice(event.message),
+    })
   } catch (error) {
     logger.error({
       errorMessage: (error as Error).message,
@@ -133,6 +140,7 @@ async function main() {
       sessionId,
     }, '执行世界创建失败')
     console.error(`[grassagent] ${(error as Error).message}`)
+    tui.stop()
     sessionStore.close()
     process.exit(1)
   }
@@ -191,8 +199,7 @@ async function main() {
     messages: sessionStore.load(),
   }
 
-  // 技能加载的审批门。
-  // Tui 还没建出来,但审批发生在回合里,那时 Tui 早就在了——所以这里用变量延迟取。
+  // 技能加载的审批门。审批发生在回合里,那时候 Tui 早就 start 过了。
   const skillApproval = createSkillApprovalGate(config.ApproveSkills, () => tui, logger)
 
   // 工具的文件访问被限制在这个世界里。
@@ -224,6 +231,7 @@ async function main() {
       for (const issue of error.issues) console.error(issue)
       await world.close()
       sessionStore.close()
+      tui.stop()
       process.exit(1)
     }
     throw error
@@ -235,6 +243,7 @@ async function main() {
     for (const message of sessionStart.systemMessages) console.error(`[grassagent] ${message}`)
     await world.close()
     sessionStore.close()
+    tui.stop()
     process.exit(1)
   }
   for (const errorMessage of sessionStart.errors) console.error(`[grassagent] ${errorMessage}`)
@@ -245,7 +254,6 @@ async function main() {
   let sessionStarted = true
   const sessionNotices = sessionStart.systemMessages
 
-  const tui = new Tui()
   const tools = [
     ...fileTools,
     createAskUserTool({

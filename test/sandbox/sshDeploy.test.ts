@@ -11,6 +11,7 @@ import { shellQuote, pathLevels } from '../../src/sandbox/sshDeploy.ts'
 import { connectSsh } from '../../src/sandbox/sshTunnel.ts'
 import { resolveSshConfig } from '../../src/sandbox/sshConfig.ts'
 import { deployRemoteDaemon } from '../../src/sandbox/sshDeploy.ts'
+import type { ProvisionProgress } from '../../src/sandbox/backend.ts'
 import { createLogger } from '../../src/core/logger.ts'
 
 // 远程部署的测试。
@@ -403,6 +404,41 @@ test('同一份源码第二次部署不重传', { timeout: 40_000 }, async () =>
     assert.notEqual(second.remoteDirectory, first.remoteDirectory)
     const sourceUploads = remote.writes.filter((written) => written.startsWith(first!.sourceDirectory))
     assert.deepEqual(sourceUploads, [], '源码已就绪时一个文件都不该重传')
+  } finally {
+    await connection.cleanup()
+    await remote.close()
+    await rm(toLocalPath(REMOTE_ROOT), { recursive: true, force: true })
+  }
+})
+
+test('部署过程会报进度,上传阶段带计数', { timeout: 30_000 }, async () => {
+  const remote = await startFakeRemote()
+  const connection = await connectTo(remote)
+  const events: ProvisionProgress[] = []
+  let daemon: Awaited<ReturnType<typeof deployRemoteDaemon>> | undefined
+  try {
+    daemon = await deployRemoteDaemon({
+      client: connection.client,
+      sandboxId: 'progress',
+      token: 'progress-token',
+      remoteWorkspace: `${REMOTE_ROOT}/workspace-progress`,
+      remoteRoot: REMOTE_ROOT,
+      diskMb: 1024,
+      onProgress: (event) => events.push(event),
+      logger: silentLogger,
+    })
+
+    const phases = events.map((event) => event.phase)
+    // 十几秒的等待期间,用户至少要看到卡在哪一步
+    assert.ok(phases.includes('node-check'), '应该报 Node 版本检查')
+    assert.ok(phases.includes('upload'), '首次部署应该报上传')
+    assert.ok(phases.includes('start'), '应该报启动 daemon')
+
+    // 上传要带 current/total,界面才能画进度
+    const uploads = events.filter((event) => event.phase === 'upload')
+    assert.ok(uploads.length > 0)
+    assert.equal(uploads.at(-1)?.current, uploads.length)
+    assert.equal(uploads.at(-1)?.total, uploads.length)
   } finally {
     await connection.cleanup()
     await remote.close()

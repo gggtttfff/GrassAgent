@@ -4,6 +4,23 @@
 
 import type { SandboxCall, SandboxResult } from './protocol.ts'
 
+/** 创建沙盒时的阶段。给界面显示用,不参与序列化。 */
+export type ProvisionPhase =
+  | 'connect'
+  | 'node-check'
+  | 'sweep'
+  | 'reuse-source'
+  | 'upload'
+  | 'start'
+  | 'health'
+
+export type ProvisionProgress = {
+  phase: ProvisionPhase
+  message: string
+  current?: number
+  total?: number
+}
+
 export type ProvisionRequest = {
   sandboxId: string
   token: string
@@ -16,6 +33,13 @@ export type ProvisionRequest = {
   networkAllowlist: readonly string[]
   keep: boolean
   sessionId?: string
+  /**
+   * 进度回调。
+   *
+   * 只在控制面跑在本进程时有效——走 HTTP 的独立控制面是一次性返回的,
+   * 拿不到中间状态。
+   */
+  onProgress?: (event: ProvisionProgress) => void
 }
 
 export type RunningSandbox = {
