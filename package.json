@@ -1,6 +1,6 @@
 {
   "name": "grassagent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "极简 AI Agent 骨架：零依赖、可流式、能读写文件与执行命令",
   "type": "module",
   "main": "dist/cli.js",
