@@ -37,6 +37,7 @@ import { freezeDangerousCommands, freezeHookDefinitions } from './plugin/freeze.
 import { assertToolNames, createPluginHost, registerBuiltinPlugins } from './plugin/host.ts'
 import { createSessionPort } from './plugin/ports.ts'
 import { createSessionCommands } from './plugin/sessionCommands.ts'
+import { loadWorkspacePlugins } from './plugin/workspacePlugins.ts'
 import {
   DangerousCommandsError,
   defaultDangerousCommandsPath,
@@ -328,6 +329,21 @@ async function main() {
     assertToolNames(pluginHost, tools.map((tool) => tool.name), omit)
     if (config.SkillEval) {
       logger.info({ cardDirectory: config.SkillEvalDirectory }, '技能评估已打开,不进入模型工具表')
+    }
+    const workspacePlugins = await loadWorkspacePlugins({
+      host: pluginHost,
+      workspace: config.Workspace,
+      trustMode: config.TrustPlugins,
+      trustFile: config.PluginTrustFile,
+      logger,
+      ask: async (question) => {
+        if (!canUseInteractiveTerminal()) return false
+        const reply = await tui.ask(question)
+        return reply.status === 'answered' && /^(y|yes)$/i.test(reply.answer.trim())
+      },
+    })
+    if (workspacePlugins.skipped.length > 0 && !workspacePlugins.trusted) {
+      tui.printNotice('工作区插件未获信任,未登记 .grass/plugins')
     }
   } catch (error) {
     if (error instanceof PluginError) {

@@ -174,6 +174,13 @@ export const configSchema = z.object({
     error: 'ApproveSkills 只能是 ask、allow 或 deny',
   }).default('ask'),
 
+  // 工作区 .grass/plugins 要先信任。ask 问一次并记在宿主目录;allow 是宿主配置放行;deny 一律不登记。
+  TrustPlugins: z.enum(['ask', 'allow', 'deny'], {
+    error: 'TrustPlugins 只能是 ask、allow 或 deny',
+  }).default('ask'),
+  PluginTrustFile: z.string().min(1, { error: 'PluginTrustFile 不能为空' })
+    .default(() => path.join(os.homedir(), '.grassagent', 'plugin-trust.json')),
+
   SkillEval: booleanOption(false, 'SkillEval'),
   // 效果验证卡的目录。必须在工作区外面,模型用世界端口写不到这里。
   SkillEvalDirectory: z.string().min(1, { error: 'SkillEvalDirectory 不能为空' })
@@ -359,6 +366,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
   LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
   ApproveSkills: `${ENV_PREFIX}APPROVE_SKILLS`,
+  TrustPlugins: `${ENV_PREFIX}TRUST_PLUGINS`,
+  PluginTrustFile: `${ENV_PREFIX}PLUGIN_TRUST_FILE`,
   SkillEval: `${ENV_PREFIX}SKILL_EVAL`,
   SkillEvalDirectory: `${ENV_PREFIX}SKILL_EVAL_DIRECTORY`,
   ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
