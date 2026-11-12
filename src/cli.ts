@@ -37,6 +37,7 @@ import { freezeDangerousCommands, freezeHookDefinitions } from './plugin/freeze.
 import { assertToolNames, createPluginHost, registerBuiltinPlugins } from './plugin/host.ts'
 import { createSessionPort } from './plugin/ports.ts'
 import { createSessionCommands } from './plugin/sessionCommands.ts'
+import { createHandoffTool, answerCloudHandoff, bindCloudSandbox, enqueueCloudSession, readCloudSession } from './plugin/cloudSession.ts'
 import { loadWorkspacePlugins } from './plugin/workspacePlugins.ts'
 import {
   DangerousCommandsError,
@@ -172,7 +173,30 @@ async function main() {
     sessionId,
     sandboxId: world.sandboxId,
     executionWorld: config.ExecutionWorld,
+    sessionProfile: config.SessionProfile,
   }, '执行世界已绑定')
+  if (config.SessionProfile === 'cloud') {
+    if (!world.sandboxId) {
+      console.error('[grassagent] 云端会话必须有远程沙盒,不改绑本机')
+      await world.close()
+      sessionStore.close()
+      tui.stop()
+      process.exit(1)
+    }
+    try {
+      await bindCloudSandbox({
+        directory: config.CloudSessionDirectory,
+        sessionId,
+        sandboxId: world.sandboxId,
+      })
+    } catch (error) {
+      console.error(`[grassagent] ${(error as Error).message}`)
+      await world.close()
+      sessionStore.close()
+      tui.stop()
+      process.exit(1)
+    }
+  }
   // 模式段跟着世界走。切换时由 modeSwitcher 的 onChanged 更新。
   modeSection = formatModeSection(world.policy.mode)
   tui.setMode(world.policy.mode)
@@ -314,16 +338,28 @@ async function main() {
   let sessionStarted = true
   const sessionNotices = sessionStart.systemMessages
 
-  const tools = [
-    ...fileTools,
-    createAskUserTool({
-      ask: (question, signal) => tui.ask(question, signal),
-      logger,
-    }),
-  ]
+  const tools = config.SessionProfile === 'cloud'
+    ? [
+      ...fileTools,
+      createHandoffTool({
+        directory: config.CloudSessionDirectory,
+        sessionId,
+        sandboxId: world.sandboxId ?? '',
+      }),
+    ]
+    : [
+      ...fileTools,
+      createAskUserTool({
+        ask: (question, signal) => tui.ask(question, signal),
+        logger,
+      }),
+    ]
   try {
     const pluginHost = createPluginHost()
-    registerBuiltinPlugins(pluginHost, { skillEval: config.SkillEval })
+    registerBuiltinPlugins(pluginHost, {
+      skillEval: config.SkillEval,
+      profile: config.SessionProfile,
+    })
     assertRegisteredProviders(pluginHost)
     const omit = tools.some((tool) => tool.name === 'load_skill') ? [] : ['load_skill']
     assertToolNames(pluginHost, tools.map((tool) => tool.name), omit)
@@ -483,6 +519,38 @@ async function main() {
   }
 
   registerCommandOnlySkills(skillCatalog)
+
+  if (config.SessionProfile !== 'cloud') {
+    commandRegistry.register({
+      name: 'cloud',
+      description: '把任务排给一个云端会话,/cloud status <id> 查看并代为提问',
+      argumentHint: '<任务> | status <会话ID>',
+      execute: async (argument) => {
+        const trimmed = argument.trim()
+        if (trimmed.startsWith('status ')) {
+          const target = trimmed.slice('status '.length).trim()
+          const record = await answerCloudHandoff({
+            directory: config.CloudSessionDirectory,
+            sessionId: target,
+            ask: async (question) => {
+              if (!canUseInteractiveTerminal()) return undefined
+              const reply = await tui.ask(question)
+              return reply.status === 'answered' ? reply.answer : undefined
+            },
+          })
+          if (!record) return `找不到云端会话 ${target}`
+          const answer = record.answer ? `\n回答: ${record.answer}` : ''
+          return `云端会话 ${record.sessionId} 沙盒 ${record.sandboxId ?? '未绑定'} 状态 ${record.status}\n${record.summary}${answer}`
+        }
+        if (!trimmed) return '用法: /cloud <任务> 或 /cloud status <会话ID>'
+        const queued = await enqueueCloudSession({
+          directory: config.CloudSessionDirectory,
+          prompt: trimmed,
+        })
+        return `已排队云端会话 ${queued.sessionId}。另开一个进程,设置 GRASSAGENT_SESSION_PROFILE=cloud 和 GRASSAGENT_SESSION_ID=${queued.sessionId},并使用远程执行世界。`
+      },
+    })
+  }
 
   // /compact:手动压缩上下文。
   //
@@ -784,6 +852,12 @@ async function main() {
   for (const message of skillNotices) tui.printNotice(message)
   for (const message of sessionNotices) tui.printNotice(message)
   tui.start()
+  if (config.SessionProfile === 'cloud') {
+    const job = await readCloudSession(config.CloudSessionDirectory, sessionId)
+    if (job?.status === 'running' && job.prompt) {
+      void runInput(job.prompt)
+    }
+  }
 
   process.once('exit', cleanupSync)
   process.once('SIGINT', () => {

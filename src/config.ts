@@ -174,6 +174,13 @@ export const configSchema = z.object({
     error: 'ApproveSkills 只能是 ask、allow 或 deny',
   }).default('ask'),
 
+  // facing 是面对用户的会话,带 ask_user。cloud 是另一块沙盒上的会话,不带 ask_user。
+  SessionProfile: z.enum(['facing', 'cloud'], {
+    error: 'SessionProfile 只能是 facing 或 cloud',
+  }).default('facing'),
+  CloudSessionDirectory: z.string().min(1, { error: 'CloudSessionDirectory 不能为空' })
+    .default(() => path.join(os.homedir(), '.grassagent', 'cloud-sessions')),
+
   // 工作区 .grass/plugins 要先信任。ask 问一次并记在宿主目录;allow 是宿主配置放行;deny 一律不登记。
   TrustPlugins: z.enum(['ask', 'allow', 'deny'], {
     error: 'TrustPlugins 只能是 ask、allow 或 deny',
@@ -366,6 +373,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
   LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
   ApproveSkills: `${ENV_PREFIX}APPROVE_SKILLS`,
+  SessionProfile: `${ENV_PREFIX}SESSION_PROFILE`,
+  CloudSessionDirectory: `${ENV_PREFIX}CLOUD_SESSION_DIRECTORY`,
   TrustPlugins: `${ENV_PREFIX}TRUST_PLUGINS`,
   PluginTrustFile: `${ENV_PREFIX}PLUGIN_TRUST_FILE`,
   SkillEval: `${ENV_PREFIX}SKILL_EVAL`,
