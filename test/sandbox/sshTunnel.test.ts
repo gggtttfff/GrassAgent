@@ -243,6 +243,15 @@ type TestHost = {
  * 作者：Pieory 创建日期：2025-07-18
  */
 function publicSshBlob(publicKey: string): Buffer {
+  // known_hosts 和 hostVerifier 用的是 SSH wire format。
+  // ssh2 生成的一行公钥已经是 `ssh-ed25519 <base64>`。
+  // Node 24 上 parseKey 会把这种 ed25519 公钥判成 malformed,直接解 base64 即可。
+  const trimmed = publicKey.trim()
+  const parts = trimmed.split(/\s+/)
+  if (parts.length >= 2 && parts[0].startsWith('ssh-')) {
+    const blob = Buffer.from(parts[1], 'base64')
+    if (blob.length > 0) return blob
+  }
   const parsed = utils.parseKey(publicKey)
   if (parsed instanceof Error) throw parsed
   return parsed.getPublicSSH()

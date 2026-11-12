@@ -75,7 +75,10 @@ export const BUILTIN_COMMANDS = [
  * 注册 Grass 自带的插件清单。技能评估默认不注册。
  * 作者：Pieory 创建日期：2025-07-18
  */
-export function registerBuiltinPlugins(host: PluginHost, options: { skillEval: boolean }): void {
+export function registerBuiltinPlugins(host: PluginHost, options: {
+  skillEval: boolean
+  profile?: 'facing' | 'cloud'
+}): void {
   host.register({
     id: 'grass.tools.files',
     version: '1.0.0',
@@ -116,16 +119,29 @@ export function registerBuiltinPlugins(host: PluginHost, options: { skillEval: b
     capabilities: ['world.read', 'approval.ask'],
     contributes: { tools: ['load_skill'] },
   })
-  host.register({
-    id: 'grass.tools.ask-user',
-    version: '1.0.0',
-    api: 1,
-    plane: 'host',
-    order: 120,
-    failure: 'isolate',
-    capabilities: ['ui.ask'],
-    contributes: { tools: ['ask_user'] },
-  })
+  if ((options.profile ?? 'facing') === 'cloud') {
+    host.register({
+      id: 'grass.tools.handoff',
+      version: '1.0.0',
+      api: 1,
+      plane: 'host',
+      order: 120,
+      failure: 'isolate',
+      capabilities: ['ui.notice'],
+      contributes: { tools: ['handoff_user'] },
+    })
+  } else {
+    host.register({
+      id: 'grass.tools.ask-user',
+      version: '1.0.0',
+      api: 1,
+      plane: 'host',
+      order: 120,
+      failure: 'isolate',
+      capabilities: ['ui.ask'],
+      contributes: { tools: ['ask_user'] },
+    })
+  }
   host.register({
     id: 'grass.session.commands',
     version: '1.0.0',
