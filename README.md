@@ -2,15 +2,15 @@
 
 > 像小草一样生长 —— 微小却顽强。
 
-一个用来学习「AI Agent 到底怎么跑起来」的骨架。你能读到一个 Agent 的每一块零件：SSE 流解析、工具调用、上下文压缩、会话持久化、配置校验、错误重试、路径沙箱。
+一个用来学习「AI Agent 到底怎么跑起来」的骨架。你能读到一个 Agent 的每一块零件：固定的回合循环、SSE 流解析、工具调用、上下文压缩、会话持久化、配置校验、错误重试，以及一块可替换的执行世界。
 
-不是框架，不打算替你做决定。它是你可以拆、可以改、可以往里长东西的原型。
+不是框架，不打算替你做决定。回合循环是固定的 `runAgent`，插件换不掉它。它是你可以拆、可以改、可以往里长东西的原型。
 
 ## 特性
 
 - **流式输出** —— 从 SSE chunk 里增量解析文本和 tool_call 参数
 - **终端界面** —— 差分渲染 + markdown 排版，流式输出不闪屏
-- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume` `/export` `/import` `/instructions`，本地执行，带命令补全
+- **斜杠命令** —— `/clear` `/new` `/sessions` `/resume` `/export` `/import` `/instructions` `/cloud`，本地执行，带命令补全
 - **想来就来，想走就走** —— 会话导出成一个 JSON 包，换一台机器再导回来。包里没有 API Key
 - **认得仓库里已有的约定** —— 启动时识别 opencode、cursor、claude、kiro 的规则和提示词。始终生效的规则进上下文，提示词只列目录，点名再用
 - **上下文自管理** —— 消息过多时让模型自己总结旧消息，历史本身不丢
@@ -19,7 +19,10 @@
 - **会话持久化** —— SQLite 存历史，进程崩溃也不会丢
 - **配置校验** —— 启动阶段就用 schema 校验环境变量，错误配置立刻报错
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
-- **路径沙箱** —— 文件读写和命令执行都限制在工作区内
+- **执行世界** —— 文件和命令走同一块 `ExecutionWorld`。远程创建失败不退回本机。模型循环留在 Grass 进程里，daemon 只做文件和命令
+- **进程内插件** —— 工具、世界、会话命令、provider、规则和技能在进程内登记。工作区 `.grass/plugins` 要先信任，不能申请 `host.exec`，也不加载可执行入口
+- **云端会话** —— 一个会话一块沙盒。`ask_user` 只在面对用户的会话上；云端要人决定时把短状态交回来
+- **路径沙箱** —— 本地世界里，文件读写和命令执行都限制在工作区内
 - **生命周期钩子** —— 会话、提示词、工具和压缩前后可以观察、拒绝或改写
 - **监视器** —— 后台跑命令或定时回看状态，报告在回合结束后还能推回模型
 - **结构化日志** —— JSON 输出，密钥自动脱敏
@@ -85,6 +88,16 @@ src/
     skills.ts      SKILL.md：只列名字描述，正文由 load_skill 按需取
     prompts.ts    .grass/prompts/*.md：每份变成一条斜杠命令
 
+  plugin/        进程内插件。不替换 runAgent
+    host.ts            清单注册表：工具、命令、provider 同名即失败
+    contract.ts        能力闭集。世界平面不能申请宿主能力
+    workspacePlugins.ts  .grass/plugins 信任后才登记清单
+    worldPlugins.ts    按配置打开 local 或 remote，失败不改绑
+    sessionCommands.ts 内置斜杠命令
+    promptPlugins.ts   规则和技能发现
+    cloudSession.ts    云端会话：一会话一沙盒，短状态写在宿主目录
+    builtinProviders.ts 核对清单里的 provider 已经显式注册
+
   sandbox/       沙箱后端与控制面
     daemon.ts      跑在沙盒里的窄服务
     control*.ts    控制面：生命周期、HTTP 服务、命令行入口
@@ -139,6 +152,7 @@ npm start
 | `/instructions` | 列出识别到的规则和提示词 |
 | `/compact` | 手动压缩上下文。参数是摘要要重点保留的内容 |
 | `/mode` | 查看或切换沙盒权限模式 |
+| `/cloud` | 面对用户的会话里，把任务排进云端会话。`/cloud status <会话ID>` 查看，需要人决定时代为提问 |
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
 
@@ -167,6 +181,65 @@ npm start
 远程沙盒也支持切换。模式由沙盒里的 daemon 判定，切换会真的通知到它。
 
 > `danger-full-access` 在 Docker 后端下只是放开 Grass 的路径闸门——容器根文件系统仍是只读的、仍是非 root，实际能写的只有 `/workspace` 和 `/tmp`。SSH 后端下才是整台远程机。同名模式在两种后端能力不同，别把「全权限」理解成「宿主全权限」。
+
+### 执行世界
+
+文件和命令读同一块根，接口是 `ExecutionWorld`。`runAgent` 只看见工具返回的字符串。
+
+| `GRASSAGENT_EXECUTION_WORLD` | 行为 |
+| --- | --- |
+| `local`（默认） | 本机工作区。路径先 resolve 再 realpath |
+| `remote` | 控制面上的沙盒（Docker、SSH，或本进程里的 daemon）。创建失败就退出，不改绑本机 |
+
+daemon 只做文件和命令。模型循环留在 Grass 进程里，不进容器，也不进远程 daemon。上面的权限模式决定这块世界能碰到多大范围。控制面地址、镜像、SSH 和限额在 `.env.example`，名字以 `GRASSAGENT_SANDBOX_` 开头。
+
+### 插件
+
+插件在进程内登记清单，不替换 `runAgent`。启动时按固定顺序注册内置插件，名字冲突就起不来。
+
+| 插件 | 贡献 |
+| --- | --- |
+| `grass.tools.files` | `read_file` / `write_file` / `edit` / `edit_batch` / `run_bash` |
+| `grass.tools.monitor` | `monitor` |
+| `grass.tools.skills` | `load_skill` |
+| `grass.tools.ask-user` | `ask_user`。只在面对用户的会话里 |
+| `grass.tools.handoff` | `handoff_user`。只在云端会话里，用来代替 `ask_user` |
+| `grass.session.commands` | 内置斜杠命令 |
+| `grass.world.local` / `grass.world.remote` | 按配置打开其中一个。失败不改试另一个 |
+| `grass.llm.openai` | OpenAI 兼容 provider。协议转换仍在 `src/llm/providers/` |
+| `grass.instructions` | 规则和技能发现 |
+
+实际注册出来的工具名必须和清单一致，多一个或少一个都是组装错误。没有技能时不注册 `load_skill`，清单里仍留着这个名字。
+
+工作区 `.grass/plugins/<目录>/grass-plugin.json` 默认不生效。`GRASSAGENT_TRUST_PLUGINS`：
+
+| 值 | 行为 |
+| --- | --- |
+| `ask`（默认） | 交互模式下问一次，回答 yes 才登记，并记到 `~/.grassagent/plugin-trust.json`。这份记录必须在工作区外面，指到工作区里会被忽略。非交互没人点头，按不信任跳过 |
+| `allow` | 直接登记 |
+| `deny` | 一律跳过 |
+
+即使信任了，工作区清单也必须是世界平面，不能申请 `host.exec`。登记的只是清单，不加载可执行入口。某一份写坏了就跳过它，不挡启动。
+
+`GRASSAGENT_SKILL_EVAL` 默认关。打开后才登记技能评估，而且不进模型工具表。
+
+### 云端会话
+
+默认 `GRASSAGENT_SESSION_PROFILE=facing`，这是面对用户的会话，带 `ask_user`。
+
+`/cloud 任务描述` 只在宿主目录 `~/.grassagent/cloud-sessions` 里排队，不在当前进程里开沙盒。接着另开一个进程，带上排队时打印的会话 ID，并使用远程执行世界：
+
+```bash
+GRASSAGENT_SESSION_PROFILE=cloud
+GRASSAGENT_SESSION_ID=<排队时打印的 ID>
+GRASSAGENT_EXECUTION_WORLD=remote
+```
+
+这个进程必须拿到自己的 `sandboxId`。没有沙盒就退出，不改绑本机。一块沙盒只能绑一个会话，一个会话也不能再绑第二块；已经被占用就关掉刚打开的世界并退出。
+
+云端档没有 `ask_user`。要人决定时调用 `handoff_user`，把一段短状态写回宿主目录。面对用户的会话用 `/cloud status <会话ID>` 查看；状态是 `needs_user` 时在这边提问，回答记在同一份记录里。记录不在工作区里，沙盒里的工具写不到它。
+
+模型循环仍是这个进程里的 `runAgent`，不进 daemon。
 
 ### 危险命令规则
 
@@ -437,7 +510,15 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
 | `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
 | `GRASSAGENT_LOAD_PROJECT_INSTRUCTIONS` | 是否识别 opencode、cursor、claude、kiro 的规则和提示词 | `1` |
+| `GRASSAGENT_LOAD_SKILLS` | 是否扫描技能 | `1` |
+| `GRASSAGENT_APPROVE_SKILLS` | 加载技能前是否询问。`ask` / `allow` / `deny` | `ask` |
+| `GRASSAGENT_EXECUTION_WORLD` | `local` 或 `remote`。remote 失败不退回本机 | `local` |
 | `GRASSAGENT_SANDBOX_MODE` | 沙盒权限模式。`read-only` / `workspace-write` / `danger-full-access` | `workspace-write` |
+| `GRASSAGENT_SESSION_PROFILE` | `facing` 或 `cloud`。cloud 不带 `ask_user` | `facing` |
+| `GRASSAGENT_CLOUD_SESSION_DIRECTORY` | 云端会话记录目录。不要指到工作区里 | `~/.grassagent/cloud-sessions` |
+| `GRASSAGENT_TRUST_PLUGINS` | `.grass/plugins` 是否信任。`ask` / `allow` / `deny` | `ask` |
+| `GRASSAGENT_PLUGIN_TRUST_FILE` | 插件信任记录。不要指到工作区里 | `~/.grassagent/plugin-trust.json` |
+| `GRASSAGENT_SKILL_EVAL` | 是否打开技能评估。打开后也不进模型工具表 | `false` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -461,12 +542,16 @@ echo "读一下 README.md" | npm start
   → transport.ts 发流式请求（超时/重试/并发控制）
   → llm.ts 逐行解析 SSE
   → 边收边把文本增量推给 TUI 显示
-  → 模型决定调工具 → tools.ts 执行（路径过沙箱）
+  → 模型决定调工具 → 工具经 ExecutionWorld 执行（本地或远程同一接口）
   → 结果回填 context，再调一次模型
   → 模型不再调工具 → 回合结束，消息写入 sessions.db
 ```
 
 几个刻意保留的细节，也是这个项目想讲清楚的东西：
+
+**回合循环不拆。** `runAgent` 仍是流式调用、执行工具、结果回填、再问模型。插件只能登记工具、世界、会话命令、provider 和提示词发现，换不掉这个循环。云端会话跑的也是同一套循环，只是工具表里没有 `ask_user`。
+
+
 
 **`max_tokens` 截断。** 输出被截断时 tool_call 的参数 JSON 是不完整的。这里不执行它，而是把错误塞回 context，让模型重新发一次。硬执行只会拿到半个 JSON。
 
@@ -593,10 +678,10 @@ export const myProvider: Provider = {
 
 ### 加一个新工具
 
-在 `src/agent/tools.ts` 里写工厂函数接收 `PathGuard`：
+在 `src/agent/tools.ts` 里写工厂函数，文件和命令走 `WorldPort`（由 `ExecutionWorld` 收窄而来）：
 
 ```typescript
-function buildMyTool(pathGuard: PathGuard): AgentTool {
+function buildMyTool(world: WorldPort): AgentTool {
   return {
     name: 'my_tool',
     description: '工具做什么，写给模型看的',
@@ -604,14 +689,14 @@ function buildMyTool(pathGuard: PathGuard): AgentTool {
     // 会修改文件的话声明一下,并发执行时同一文件的操作会排队
     mutatesFiles: ['path'],
     execute: async (args) => {
-      // 涉及文件路径时用 pathGuard.resolve 限制在工作区内
+      // 涉及文件或命令时走 world，不要直接用 node:fs
       return '结果字符串'
     }
   }
 }
 ```
 
-然后加进 `builtinTools()` 的返回数组。工具是纯函数，不持有 agent 状态。
+然后加进 `builtinTools()` 的返回数组，并在 `src/plugin/host.ts` 的对应清单里写上同名工具。启动时两边对不上会直接退出。工具是纯函数，不持有 agent 状态。工作区 `.grass/plugins` 只登记清单，不会把这里的函数加载进去。
 
 不声明 `mutatesFiles` 的工具可以自由并发。声明了但操作的是「读-改-写」流程的（像 `edit`），必须声明，否则并发时会丢更新。
 
