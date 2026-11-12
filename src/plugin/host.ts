@@ -8,6 +8,7 @@ export type PluginHost = {
   register(manifest: PluginManifest): void
   contributedTools(): readonly string[]
   contributedCommands(): readonly string[]
+  contributedProviders(): readonly string[]
   ids(): readonly string[]
 }
 
@@ -20,6 +21,7 @@ export function createPluginHost(): PluginHost {
   const ids = new Set<string>()
   const tools = new Set<string>()
   const commands = new Set<string>()
+  const providers = new Set<string>()
 
   return {
     register(manifest) {
@@ -33,6 +35,10 @@ export function createPluginHost(): PluginHost {
         if (commands.has(name)) throw new PluginError(`命令名冲突: ${name}`)
         commands.add(name)
       }
+      for (const name of manifest.contributes.providers ?? []) {
+        if (providers.has(name)) throw new PluginError(`provider 冲突: ${name}`)
+        providers.add(name)
+      }
       ids.add(manifest.id)
       manifests.push(manifest)
       manifests.sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
@@ -42,6 +48,9 @@ export function createPluginHost(): PluginHost {
     },
     contributedCommands() {
       return manifests.flatMap((manifest) => [...(manifest.contributes.commands ?? [])])
+    },
+    contributedProviders() {
+      return manifests.flatMap((manifest) => [...(manifest.contributes.providers ?? [])])
     },
     ids() {
       return manifests.map((manifest) => manifest.id)
