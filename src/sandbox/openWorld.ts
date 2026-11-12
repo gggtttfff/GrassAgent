@@ -44,24 +44,45 @@ export function sandboxCreateBody(config: AgentConfig, sessionId: string): Creat
  *
  * 作者：Pieory 创建日期：2025-07-18
  */
+export type OpenWorldOptions = {
+  sessionId: string
+  fetchImpl?: typeof fetch
+  /** 创建沙盒的进度。只在控制面跑在本进程时可用。 */
+  onProgress?: (event: ProvisionProgress) => void
+  /** danger-full-access 必须先过审批。配置里写死的升级由调用方提供一个放行的门。 */
+  approval?: ApprovalGate
+}
+
+/**
+ * 打开执行世界。选哪个插件在 plugin/worldPlugins.ts,这里只提供两边的实现。
+ * 远程创建失败由调用方停住,本函数不会改绑本地世界。
+ * 作者：Pieory 创建日期：2025-07-18
+ */
 export async function openExecutionWorld(
   config: AgentConfig,
-  options: {
-    sessionId: string
-    fetchImpl?: typeof fetch
-    /** 创建沙盒的进度。只在控制面跑在本进程时可用。 */
-    onProgress?: (event: ProvisionProgress) => void
-    /** danger-full-access 必须先过审批。配置里写死的升级由调用方提供一个放行的门。 */
-    approval?: ApprovalGate
-  },
+  options: OpenWorldOptions,
 ): Promise<ExecutionWorld> {
-  if (config.ExecutionWorld !== 'remote') {
-    return createLocalWorld({
-      workspace: config.Workspace,
-      mode: config.SandboxMode,
-      approval: options.approval,
-    })
-  }
+  const { openSelectedWorld } = await import('../plugin/worldPlugins.ts')
+  return openSelectedWorld(config, options)
+}
+
+/** 本地世界插件的实现。作者：Pieory 创建日期：2025-07-18 */
+export async function openLocalWorldFromConfig(
+  config: AgentConfig,
+  options: OpenWorldOptions,
+): Promise<ExecutionWorld> {
+  return createLocalWorld({
+    workspace: config.Workspace,
+    mode: config.SandboxMode,
+    approval: options.approval,
+  })
+}
+
+/** 远程世界插件的实现。失败就抛,不改绑本地。作者：Pieory 创建日期：2025-07-18 */
+export async function openRemoteWorldFromConfig(
+  config: AgentConfig,
+  options: OpenWorldOptions,
+): Promise<ExecutionWorld> {
   const fetchImpl = options.fetchImpl ?? fetch
 
   // SSH 后端且没指定控制面地址:控制面在本进程里起。

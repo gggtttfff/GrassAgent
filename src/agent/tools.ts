@@ -7,6 +7,7 @@
 import { obj, str, arr, oneOf, opt, int, bool } from '@earendil-works/pi-schema'
 import { assertSkillAllowed, type ApprovalGate } from '../world/approvalGate.ts'
 import type { AgentTool } from './agent.ts'
+import { createWorldPort, type WorldPort } from '../plugin/ports.ts'
 import type { ExecutionWorld } from '../world/executionWorld.ts'
 import { formatExecResult, createLocalWorld } from '../world/localWorld.ts'
 import { describePathError } from '../core/pathGuard.ts'
@@ -93,7 +94,7 @@ const monitorParameters = obj({
 })
 
 // read_file:返回文件内容。超过 200 行或字节上限时只带尾部,全文在世界的临时区。
-function buildReadFile(world: ExecutionWorld): AgentTool {
+function buildReadFile(world: WorldPort): AgentTool {
   return {
     name: 'read_file',
     description: '读取文件内容.参数:path(文件路径).大文件截取最后200行',
@@ -110,7 +111,7 @@ function buildReadFile(world: ExecutionWorld): AgentTool {
 }
 
 // write_file 覆盖写入文件
-function buildWriteFile(world: ExecutionWorld): AgentTool {
+function buildWriteFile(world: WorldPort): AgentTool {
   return {
     name: 'write_file',
     description: '写入文件(覆盖).父目录不存在时自动创建.参数:path(路径),content(内容)',
@@ -131,7 +132,7 @@ function buildWriteFile(world: ExecutionWorld): AgentTool {
 }
 
 // edit 局部字符串替换(精确匹配 + 唯一性校验)
-function buildEdit(world: ExecutionWorld): AgentTool {
+function buildEdit(world: WorldPort): AgentTool {
   return {
     name: 'edit',
     description: '编辑文件:精确替换一段文本.参数:path,old_string,new_string.old_string必须在文件中唯一,否则报错',
@@ -156,7 +157,7 @@ function buildEdit(world: ExecutionWorld): AgentTool {
 }
 
 // edit_batch:一次改多处。所有替换成功才写文件,任一失败则文件保持原样。
-function buildEditBatch(world: ExecutionWorld): AgentTool {
+function buildEditBatch(world: WorldPort): AgentTool {
   return {
     name: 'edit_batch',
     description:
@@ -185,7 +186,7 @@ function buildEditBatch(world: ExecutionWorld): AgentTool {
 // run_bash:执行 shell 命令。argv 交给世界,不在工具里再包一层 shell。
 // 危险命令规则在这里拦一道:模式再宽,这几条命令也不跑。
 function buildRunBash(
-  world: ExecutionWorld,
+  world: WorldPort,
   timeoutMs: number,
   dangerousCommands: readonly DangerousCommandRule[],
   rulesPath: string,
@@ -420,7 +421,9 @@ export async function builtinTools(options: {
   /** 监视器注册表。给了才注册 monitor 工具 */
   monitors?: MonitorRegistry
 } = {}): Promise<AgentTool[]> {
-  const world = options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() })
+  const world = createWorldPort(
+    options.world ?? await createLocalWorld({ workspace: options.workspace ?? process.cwd() }),
+  )
   const dangerousCommands = options.dangerousCommands ?? []
   const dangerousCommandsPath = options.dangerousCommandsPath ?? '危险命令规则文件'
   const tools = [

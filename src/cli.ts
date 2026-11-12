@@ -13,7 +13,6 @@ import { Tui } from './ui/tui.ts'
 import { builtinTools, replaceLoadSkillTool } from './agent/tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
 import type { ExecutionWorld, SandboxMode } from './world/executionWorld.ts'
-import { isSandboxMode, SANDBOX_MODES } from './world/executionWorld.ts'
 import { createModeSwitcher } from './world/modeSwitch.ts'
 import { createAskUserTool } from './agent/askUser.ts'
 import {
@@ -31,6 +30,11 @@ import { buildSessionChoices } from './ui/sessionPicker.ts'
 import { canUseInteractiveTerminal } from './ui/nonInteractiveTerminal.ts'
 import { appendHookContext, createHookRunner, type HookRunner } from './agent/hooks.ts'
 import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './agent/hookConfig.ts'
+import { PluginError } from './plugin/contract.ts'
+import { freezeDangerousCommands, freezeHookDefinitions } from './plugin/freeze.ts'
+import { assertToolNames, createPluginHost, registerBuiltinPlugins } from './plugin/host.ts'
+import { createSessionPort } from './plugin/ports.ts'
+import { createSessionCommands } from './plugin/sessionCommands.ts'
 import {
   DangerousCommandsError,
   defaultDangerousCommandsPath,
@@ -46,15 +50,6 @@ import {
 } from './instructions/projectInstructions.ts'
 import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, mergeSkillCatalogs, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillLog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
 import {
-  BundleError,
-  defaultBundlePath,
-  parseExportArgument,
-  parseImportArgument,
-  readBundleFile,
-  resolveBundlePath,
-  writeBundleFile,
-} from './session/sessionBundle.ts'
-import {
   discoverPromptTemplates,
   expandPromptTemplate,
   isUsablePromptCommandName,
@@ -63,7 +58,6 @@ import {
 } from './instructions/prompts.ts'
 import { compactContext } from './llm/compaction.ts'
 import { ensureSessionTitle } from './session/sessionTitle.ts'
-import { messagesArePaired } from './llm/messages.ts'
 import { buildModelRoster } from './llm/modelRoster.ts'
 import type { Model, Context } from './llm/llm.ts'
 
@@ -289,7 +283,7 @@ async function main() {
   const dangerousCommandsPath = defaultDangerousCommandsPath(config.Workspace)
   let dangerousCommands: DangerousCommandRule[] = []
   try {
-    dangerousCommands = await loadDangerousCommandsFile(dangerousCommandsPath)
+    dangerousCommands = freezeDangerousCommands(await loadDangerousCommandsFile(dangerousCommandsPath))
     if (dangerousCommands.length > 0) {
       logger.info({
         dangerousCommandsPath,
@@ -309,16 +303,16 @@ async function main() {
   }
 
   // 监视器:后台命令和定时报告都归它管。真正的投递函数在回合循环建好之后才赋值,
-// 这里先用占位——监视器最早也要等工具被调用之后才会产生报告。
-let deliverMonitorReport: (text: string) => void = () => {}
-const monitors = createMonitorRegistry({
-  world,
-  workspaceRoot: world.workspaceRoot,
-  logger,
-  report: (text) => deliverMonitorReport(text),
-})
+  // 这里先用占位——监视器最早也要等工具被调用之后才会产生报告。
+  let deliverMonitorReport: (text: string) => void = () => {}
+  const monitors = createMonitorRegistry({
+    world,
+    workspaceRoot: world.workspaceRoot,
+    logger,
+    report: (text) => deliverMonitorReport(text),
+  })
 
-// 工具的文件访问被限制在这个世界里。
+  // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
   const fileTools = await builtinTools({
     world,
@@ -334,7 +328,7 @@ const monitors = createMonitorRegistry({
   const hooksPath = config.HooksPath ?? defaultHooksFilePath(config.Workspace)
   let hookRunner: HookRunner
   try {
-    const definitions = await loadHooksFile(hooksPath, { optional: config.HooksPath === undefined })
+    const definitions = freezeHookDefinitions(await loadHooksFile(hooksPath, { optional: config.HooksPath === undefined }))
     hookRunner = createHookRunner(definitions, {
       sessionId,
       cwd: config.Workspace,
@@ -381,6 +375,24 @@ const monitors = createMonitorRegistry({
       logger,
     }),
   ]
+  try {
+    const pluginHost = createPluginHost()
+    registerBuiltinPlugins(pluginHost, { skillEval: config.SkillEval })
+    const omit = tools.some((tool) => tool.name === 'load_skill') ? [] : ['load_skill']
+    assertToolNames(pluginHost, tools.map((tool) => tool.name), omit)
+    if (config.SkillEval) {
+      logger.info({ cardDirectory: config.SkillEvalDirectory }, '技能评估已打开,不进入模型工具表')
+    }
+  } catch (error) {
+    if (error instanceof PluginError) {
+      console.error(`[grassagent] ${error.message}`)
+      await world.close()
+      sessionStore.close()
+      tui.stop()
+      process.exit(1)
+    }
+    throw error
+  }
   // 进程收尾:先跑 SessionEnd,再停掉 TUI、关掉数据库。
   // tui.stop() 必须调——TUI 接管了终端原始模式,
   // 不清理的话退出后终端状态会留在那儿,后续命令看着像失灵了。
@@ -432,167 +444,10 @@ const monitors = createMonitorRegistry({
   })
 
   // ---- 斜杠命令 ----
-  // 命令在本地执行,不发给模型。/clear 和 /new 会改会话状态,
-  // 所以它们要能拿到 context 和 sessionStore——这里用闭包传进去。
+  // 命令在本地执行,不发给模型。会话库只通过 SessionPort 访问。
+  const session = createSessionPort(sessionStore)
   const commandRegistry = new SlashCommandRegistry()
 
-  commandRegistry.register({
-    name: 'clear',
-    description: '清空当前对话,保留会话',
-    execute: async () => {
-      await sessionStore.sync(context.messages)
-      context.messages = []
-      context.compaction = undefined
-      tui.clearTranscript()
-      return '对话已清空'
-    },
-  })
-
-  commandRegistry.register({
-    name: 'new',
-    description: '开一个新会话',
-    execute: async () => {
-      const newSessionId = sessionStore.createSession(context.messages)
-      context.messages = []
-      context.compaction = undefined
-      tui.clearTranscript()
-      logger.info({ sessionId: newSessionId }, '已创建新会话')
-      return `已创建新会话 ${newSessionId}`
-    },
-  })
-
-  commandRegistry.register({
-    name: 'sessions',
-    description: '列出所有会话',
-    execute: async () => {
-      const sessions = sessionStore.listSessionDetails()
-      if (sessions.length === 0) return '还没有任何会话'
-      const lines = sessions.map((session) => {
-        const marker = session.id === sessionStore.sessionId ? '*' : ' '
-        const title = session.title ? `${session.title} · ` : ''
-        return `${marker} ${title}${session.id}  (${session.messageCount} 条消息)`
-      })
-      return lines.join('\n')
-    },
-  })
-
-  commandRegistry.register({
-    name: 'resume',
-    description: '切换到别的会话',
-    argumentHint: '[会话ID]',
-    execute: async (argument) => {
-      const sessions = sessionStore.listSessionDetails()
-      if (sessions.length === 0) return '还没有任何会话'
-
-      // 给了 ID 就直接切
-      if (argument) {
-        const target = sessions.find((session) => session.id === argument)
-        if (!target) return `找不到会话 ${argument}`
-        return await switchToSession(target.id)
-      }
-
-      // 没给 ID:交互模式弹选择器,非交互模式列出来让用户自己挑
-      if (!canUseInteractiveTerminal()) {
-        return '请指定会话 ID:' + sessions.map((session) => session.id).join(' ')
-      }
-
-      // 选择器是异步的——用户什么时候选中不确定,
-      // 所以这里先返回空,选中后的动作在回调里做。
-      tui.showSessionPicker(
-        buildSessionChoices(sessions, sessionStore.sessionId),
-        (sessionId) => {
-          void switchToSession(sessionId).then((message) => tui.printNotice(message))
-        },
-        () => tui.printNotice('已取消'),
-      )
-      return ''
-    },
-  })
-
-  commandRegistry.register({
-    name: 'export',
-    description: '把会话导出成可带走的文件',
-    argumentHint: '[路径] [--session 会话ID]',
-    execute: async (argument) => {
-      const parsed = parseExportArgument(argument)
-      if (parsed.error) return parsed.error
-      // 先落盘,否则最后一轮还在内存里,带走的是旧对话
-      await sessionStore.sync(context.messages)
-      const filePath = parsed.filePath
-        ? resolveBundlePath(parsed.filePath, config.Workspace)
-        : defaultBundlePath(config.Workspace)
-      if (path.resolve(filePath) === path.resolve(config.SessionDatabasePath)) {
-        return '不能把导出发到会话数据库上,换一个路径'
-      }
-      const snapshots = parsed.sessionId
-        ? [sessionStore.readSession(parsed.sessionId)].flatMap((snapshot) => snapshot ? [snapshot] : [])
-        : sessionStore.listSnapshots()
-      if (parsed.sessionId && snapshots.length === 0) return `找不到会话 ${parsed.sessionId}`
-      const unpaired = snapshots.filter((snapshot) => !messagesArePaired(snapshot.messages))
-      try {
-        await writeBundleFile(filePath, snapshots)
-      } catch (error) {
-        if (error instanceof BundleError) return `导出失败:${error.message}`
-        throw error
-      }
-      logger.info({ filePath, sessionCount: snapshots.length }, '会话已导出')
-      const warning = unpaired.length > 0
-        ? `\n有 ${unpaired.length} 个会话的 tool_call 配不上对,文件已写出,但导回时会被拒绝`
-        : ''
-      return `已导出 ${snapshots.length} 个会话到 ${filePath}${warning}`
-    },
-  })
-
-  commandRegistry.register({
-    name: 'import',
-    description: '从文件导回会话',
-    argumentHint: '<路径> [--replace]',
-    execute: async (argument) => {
-      const parsed = parseImportArgument(argument)
-      if (parsed.error || !parsed.filePath) return parsed.error ?? 'import 需要文件路径'
-      await sessionStore.sync(context.messages)
-      const filePath = resolveBundlePath(parsed.filePath, config.Workspace)
-      let sessions
-      try {
-        sessions = await readBundleFile(filePath)
-      } catch (error) {
-        if (error instanceof BundleError) return `导入失败:${error.message}`
-        throw error
-      }
-      const mode = parsed.replace ? 'replace' : 'merge'
-      let imported = 0
-      let replaced = 0
-      let skipped = 0
-      let currentTouched = false
-      for (const session of sessions) {
-        const outcome = sessionStore.importSession(session, mode)
-        if (outcome === 'imported') imported++
-        else if (outcome === 'replaced') replaced++
-        else skipped++
-        if (session.id === sessionStore.sessionId && outcome !== 'skipped') currentTouched = true
-      }
-      // 覆盖了当前会话就必须从库里重新载入。
-      // 再拿旧的 context.messages 去 sync,会把刚导进来的内容盖掉。
-      if (currentTouched) {
-        context.messages = sessionStore.load()
-        context.compaction = undefined
-        tui.clearTranscript()
-      }
-      logger.info({ filePath, imported, replaced, skipped, mode }, '会话已导入')
-      return `导入完成:新增 ${imported},覆盖 ${replaced},跳过 ${skipped}`
-    },
-  })
-
-  commandRegistry.register({
-    name: 'instructions',
-    description: '列出识别到的规则、提示词和技能',
-    execute: () => `${instructionReport}\n${skillReport}`,
-  })
-
-  // /skills 和 /skills reload
-  // reload 要换掉三样东西:工具里的 load_skill、系统提示词里的技能段、清单文本。
-  // 只换其中一样,模型看到的和能调到的就对不上了。
-  //
   // 只读技能的命令也要跟着重注册:扫描出来的技能集变了,命令名也可能变了。
   const registerCommandOnlySkills = (catalog: SkillCatalog | undefined): void => {
     for (const skill of commandOnlySkills(catalog?.skills ?? [])) {
@@ -613,21 +468,29 @@ const monitors = createMonitorRegistry({
     }
   }
 
-  commandRegistry.register({
-    name: 'skills',
-    description: '列出技能,/skills reload 重新扫描',
-    argumentHint: '[reload]',
-    execute: async (argument) => {
-      if (argument.trim() !== 'reload') {
-        return formatSkillList(skillCatalog?.skills ?? [])
-      }
-      if (!config.LoadSkills) return '技能加载已关闭'
+  for (const command of createSessionCommands({
+    session,
+    workspace: config.Workspace,
+    databasePath: config.SessionDatabasePath,
+    logger,
+    messages: () => context.messages,
+    replaceMessages: (messages) => {
+      context.messages = messages
+    },
+    clearCompaction: () => {
+      context.compaction = undefined
+    },
+    clearTranscript: () => tui.clearTranscript(),
+    instructionReport: () => instructionReport,
+    skillReport: () => skillReport,
+    formatSkills: () => formatSkillList(skillCatalog?.skills ?? []),
+    skillsEnabled: () => config.LoadSkills,
+    reloadSkills: async () => {
       try {
         const refreshed = await scanSkills()
         skillCatalog = refreshed
         skills = createSkillRegistry(refreshed.skills)
         skillReport = summarizeSkills(refreshed.skills)
-        // 规则段和模式段留着,只换技能段
         skillSection = refreshed.promptSection
         rebuildSystemPrompt()
         replaceLoadSkillTool(tools, skills, approval)
@@ -642,7 +505,20 @@ const monitors = createMonitorRegistry({
         return `重新扫描技能失败:${(error as Error).message}`
       }
     },
-  })
+    mode: () => modeSwitcher,
+    setBusy: (busy) => tui.setBusy(busy),
+    interactive: () => canUseInteractiveTerminal(),
+    pickSession: (currentSessionId, onPick, onCancel) => {
+      tui.showSessionPicker(
+        buildSessionChoices(session.listSessionDetails(), currentSessionId),
+        onPick,
+        onCancel,
+      )
+    },
+    notify: (message) => tui.printNotice(message),
+  })) {
+    commandRegistry.register(command)
+  }
 
   registerCommandOnlySkills(skillCatalog)
 
@@ -687,31 +563,6 @@ const monitors = createMonitorRegistry({
     },
   })
 
-  // /mode:看当前模式,或者切一个。
-  commandRegistry.register({
-    name: 'mode',
-    description: '查看或切换沙盒权限模式',
-    argumentHint: '[read-only|workspace-write|danger-full-access]',
-    execute: async (argument) => {
-      const requested = argument.trim()
-      if (!requested) {
-        return `当前沙盒模式:${modeSwitcher.current()}\n可用:${SANDBOX_MODES.join('、')}`
-      }
-      if (!isSandboxMode(requested)) {
-        return `未知的模式 ${requested}。可用:${SANDBOX_MODES.join('、')}`
-      }
-      // 升级到全权限要弹审批。审批期间界面不能算空闲——
-      // 空闲状态下的 Ctrl+C 是退出进程,会把审批直接掐掉。
-      tui.setBusy(true)
-      try {
-        const result = await modeSwitcher.switchTo(requested)
-        return result.message
-      } finally {
-        tui.setBusy(false)
-      }
-    },
-  })
-
   // Shift+Tab 循环模式。只在只读和可写之间转:
   // 升级到全权限要走 /mode,回合中途弹审批会跟 ask_user 抢同一个输入框。
   tui.onModeCycle(() => {
@@ -725,18 +576,6 @@ const monitors = createMonitorRegistry({
       tui.printNotice(result.message)
     })
   })
-
-  // 切换会话:存盘当前会话,切过去,载入目标会话的历史
-  const switchToSession = async (targetSessionId: string): Promise<string> => {
-    if (targetSessionId === sessionStore.sessionId) return '已经在该会话中'
-    sessionStore.switchSession(targetSessionId, context.messages)
-    context.messages = sessionStore.load()
-    // 压缩状态跟着会话走——不同会话的历史长度不一样
-    context.compaction = undefined
-    tui.clearTranscript()
-    logger.info({ sessionId: targetSessionId }, '已切换会话')
-    return `已切换到会话 ${targetSessionId}(${context.messages.length} 条消息)`
-  }
 
   // 提示模板。.grass/prompts/*.md 每份变成一条斜杠命令,
   // 执行等价于把展开后的正文当成一条用户消息发给模型。
