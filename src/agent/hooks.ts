@@ -17,6 +17,7 @@
 // 脚本崩了不该把整个会话卡死。只有它明确拒绝(退出码 2 或 decision=block)才拦截。
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { hookCommandEnv } from '../plugin/ports.ts'
 import { JsonSafetyError, parseJson, stringifyJson } from '../core/jsonSafety.ts'
 import type { Logger } from '../core/logger.ts'
 
@@ -397,12 +398,11 @@ async function runCommandHook(
     child = spawn(command, {
       shell: true,
       cwd: options.cwd,
-      env: {
-        ...process.env,
-        GRASSAGENT_HOOK_EVENT: event,
-        GRASSAGENT_SESSION_ID: options.sessionId,
-        GRASSAGENT_WORKSPACE: options.cwd,
-      },
+      env: hookCommandEnv({
+        event,
+        sessionId: options.sessionId,
+        cwd: options.cwd,
+      }),
       // Unix 上让命令成为新进程组的组长,超时或打断时才能把 shell 和它拉起的子进程一起杀掉。
       // 只杀 shell 的话,真正干活的进程会留在后台。
       detached: process.platform !== 'win32',

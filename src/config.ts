@@ -136,6 +136,11 @@ export const configSchema = z.object({
     error: 'ApproveSkills 只能是 ask、allow 或 deny',
   }).default('ask'),
 
+  SkillEval: booleanOption(false, 'SkillEval'),
+  // 效果验证卡的目录。必须在工作区外面,模型用世界端口写不到这里。
+  SkillEvalDirectory: z.string().min(1, { error: 'SkillEvalDirectory 不能为空' })
+    .default(() => path.join(os.homedir(), '.grassagent', 'skill-eval')),
+
   // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
   ExecutionWorld: z.enum(['local', 'remote'], {
     error: 'ExecutionWorld 只能是 local 或 remote',
@@ -308,6 +313,8 @@ const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
   LoadProjectInstructions: `${ENV_PREFIX}LOAD_PROJECT_INSTRUCTIONS`,
   LoadSkills: `${ENV_PREFIX}LOAD_SKILLS`,
   ApproveSkills: `${ENV_PREFIX}APPROVE_SKILLS`,
+  SkillEval: `${ENV_PREFIX}SKILL_EVAL`,
+  SkillEvalDirectory: `${ENV_PREFIX}SKILL_EVAL_DIRECTORY`,
   ExecutionWorld: `${ENV_PREFIX}EXECUTION_WORLD`,
   SandboxMode: `${ENV_PREFIX}SANDBOX_MODE`,
   SandboxControlUrl: `${ENV_PREFIX}SANDBOX_CONTROL_URL`,
