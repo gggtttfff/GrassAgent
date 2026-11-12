@@ -31,6 +31,8 @@ import { canUseInteractiveTerminal } from './ui/nonInteractiveTerminal.ts'
 import { appendHookContext, createHookRunner, type HookRunner } from './agent/hooks.ts'
 import { defaultHooksFilePath, HookConfigError, loadHooksFile } from './agent/hookConfig.ts'
 import { PluginError } from './plugin/contract.ts'
+import { assertRegisteredProviders } from './plugin/builtinProviders.ts'
+import { loadRuleSection, loadSkillSection, scanProjectSkills } from './plugin/promptPlugins.ts'
 import { freezeDangerousCommands, freezeHookDefinitions } from './plugin/freeze.ts'
 import { assertToolNames, createPluginHost, registerBuiltinPlugins } from './plugin/host.ts'
 import { createSessionPort } from './plugin/ports.ts'
@@ -44,11 +46,8 @@ import {
 import { createModelApprover } from './agent/approval.ts'
 import {
   appendPromptSection,
-  discoverProjectInstructions,
-  formatInstructionReport,
-  summarizeInstructions,
 } from './instructions/projectInstructions.ts'
-import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, mergeSkillCatalogs, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillLog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
+import { commandOnlySkills, createSkillRegistry, describeDisabledSkills, describeSkippedSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, summarizeSkills, type SkillCatalog, type SkillRegistry } from './instructions/skills.ts'
 import {
   discoverPromptTemplates,
   expandPromptTemplate,
@@ -132,21 +131,14 @@ async function main() {
   let skillSection = ''
   let modeSection = ''
   let hookContext: string | undefined
-  if (config.LoadProjectInstructions) {
-    try {
-      const catalog = await discoverProjectInstructions(config.Workspace, {
-        warn: (object, message) => logger.warn(object, message),
-        info: (object, message) => logger.info(object, message),
-      })
-      instructionSection = catalog.promptSection
-      instructionReport = formatInstructionReport(catalog.instructions)
-      if (catalog.instructions.length > 0) instructionNotice = summarizeInstructions(catalog.instructions)
-    } catch (error) {
-      instructionReport = '识别项目规则失败,本次不加载外部规则'
-      instructionNotice = instructionReport
-      logger.error({ errorMessage: (error as Error).message }, '识别项目规则失败,继续启动')
-    }
-  }
+  const rules = await loadRuleSection({
+    enabled: config.LoadProjectInstructions,
+    workspace: config.Workspace,
+    logger,
+  })
+  instructionSection = rules.instructionSection
+  instructionReport = rules.instructionReport
+  instructionNotice = rules.instructionNotice
 
   // Tui 提前建出来:远程沙盒创建要等十几秒,期间得有东西告诉用户卡在哪。
   // 构造函数不碰终端,真正的接管发生在 start()——那时候沙盒早就建好了。
@@ -191,61 +183,14 @@ async function main() {
   let skillCatalog: SkillCatalog | undefined
   let skillReport = '技能加载已关闭'
   const skillNotices: string[] = []
+  const scannedSkills = await loadSkillSection({ config, world, logger })
+  skillSection = scannedSkills.skillSection
+  skillReport = scannedSkills.skillReport
+  skills = scannedSkills.skills
+  skillCatalog = scannedSkills.skillCatalog
+  skillNotices.push(...scannedSkills.skillNotices)
 
-  const scanSkills = async (): Promise<SkillCatalog> => {
-    const skillOrigin = describeSkillOrigin(config, world)
-    const skillLogger: SkillLog = {
-      warn: (object, message) => logger.warn(object, message),
-      info: (object, message) => logger.info(object, message),
-    }
-    // 缓存只在本地用:远程的目录每次都是新克隆的,缓存没有意义
-    const skillCache = createSkillCache({
-      workspace: config.Workspace,
-      relativePath: SKILL_CACHE_RELATIVE_PATH,
-    })
-
-    // 远程模式:本地和远程各扫一遍再合并。
-    // 只扫远程的话,本地的运维手册这类技能在远程会话里完全看不到;
-    // 只扫本地的话,远程工作区自带的技能又用不了。
-    if (skillOrigin.kind === 'remote') {
-      const local = await discoverSkills({
-        files: await createLocalSkillFiles(config.Workspace),
-        origin: { kind: 'local', label: '本地工作区' },
-        cache: skillCache,
-        logger: skillLogger,
-      })
-      const remote = await discoverSkills({
-        files: createWorldSkillFiles(world),
-        origin: skillOrigin,
-        logger: skillLogger,
-      })
-      // 同名时以远程为准:模型实际编辑的是远程工作区
-      return mergeSkillCatalogs(remote, local, skillLogger)
-    }
-
-    return discoverSkills({
-      files: await createLocalSkillFiles(config.Workspace),
-      origin: skillOrigin,
-      cache: skillCache,
-      logger: skillLogger,
-    })
-  }
-
-  if (config.LoadSkills) {
-    try {
-      const scanned = await scanSkills()
-      skillCatalog = scanned
-      skillSection = scanned.promptSection
-      skills = createSkillRegistry(scanned.skills)
-      skillReport = summarizeSkills(scanned.skills)
-      // 同名冲突这类问题要让用户看见,不然技能凭空消失,没人知道为什么
-      skillNotices.push(...describeDisabledSkills(scanned.skills))
-      skillNotices.push(...describeSkippedSkills(scanned.skills))
-    } catch (error) {
-      skillReport = '识别技能失败,本次不加载技能'
-      logger.error({ errorMessage: (error as Error).message }, '识别技能失败,继续启动')
-    }
-  }
+  const scanSkills = (): Promise<SkillCatalog> => scanProjectSkills({ config, world, logger })
 
   const context: Context = {
     systemPrompt: SYSTEM_PROMPT,
@@ -378,6 +323,7 @@ async function main() {
   try {
     const pluginHost = createPluginHost()
     registerBuiltinPlugins(pluginHost, { skillEval: config.SkillEval })
+    assertRegisteredProviders(pluginHost)
     const omit = tools.some((tool) => tool.name === 'load_skill') ? [] : ['load_skill']
     assertToolNames(pluginHost, tools.map((tool) => tool.name), omit)
     if (config.SkillEval) {
@@ -930,23 +876,6 @@ function formatModeSection(mode: SandboxMode): string {
     'danger-full-access': '不再限制工作区边界,工作区外的路径也能访问。',
   }
   return `当前沙盒模式:${mode}。${detail[mode]}`
-}
-
-/**
- * 技能是从哪儿读到的。
- * 远程时主机名来自 SSH 配置——模型改的是那台机器上的文件,来源必须说清楚。
- */
-function describeSkillOrigin(config: AgentConfig, world: ExecutionWorld): SkillOrigin {
-  if (config.ExecutionWorld !== 'remote') {
-    return { kind: 'local', label: '本地工作区' }
-  }
-  if (config.SandboxSshHost) {
-    const user = config.SandboxSshUser ? `${config.SandboxSshUser}@` : ''
-    const port = config.SandboxSshPort && config.SandboxSshPort !== 22 ? `:${config.SandboxSshPort}` : ''
-    return { kind: 'remote', label: `远程 ${user}${config.SandboxSshHost}${port}` }
-  }
-  if (world.sandboxId) return { kind: 'remote', label: `远程沙盒 ${world.sandboxId}` }
-  return { kind: 'remote', label: '远程工作区' }
 }
 
 // 直接运行才启动。调试器在 Windows 上给出的 argv 和 import.meta.url 经常对不齐，只比字符串会静默退出。
