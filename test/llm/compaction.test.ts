@@ -214,6 +214,60 @@ test('压缩的切点不劈开 tool_use 和 tool_result', async () => {
   }
 })
 
+test('force 模式跳过阈值判断,手动也能压缩', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('手动摘要'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    // 窗口很大,正常模式下这点历史根本不该触发压缩
+    const generousWindow = { contextWindow: 1_000_000, reserveTokens: 1000, keepRecentTokens: 16 }
+    const context: Context = { messages: plainMessages(30) }
+
+    await compactContext(model, context, undefined, { force: true }, generousWindow)
+
+    assert.ok(context.compaction, 'force 模式应该压了')
+    assert.ok(context.compaction!.summary.includes('手动摘要'))
+    // 历史仍然完整
+    assert.equal(context.messages.length, 30, '压缩不该删掉历史消息')
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('force 模式也会把引导语带进摘要请求', async () => {
+  const mock = await startMockServer([
+    { body: body([textFrame('摘要'), finishFrame('stop')]) },
+  ])
+
+  try {
+    const model: Model = { apiKey: 'k', model: 'mock', baseUrl: `http://127.0.0.1:${mock.port}/v1` }
+    const generousWindow = { contextWindow: 1_000_000, reserveTokens: 1000, keepRecentTokens: 16 }
+    const context: Context = { messages: plainMessages(30) }
+
+    let requestText = ''
+    mock.receivedRequests.length = 0
+
+    await compactContext(
+      model,
+      context,
+      undefined,
+      { force: true, guidance: '保留验证记录和每个决策的理由' },
+      generousWindow,
+    )
+
+    requestText = JSON.stringify(mock.receivedRequests[0] ?? {})
+
+    assert.ok(
+      requestText.includes('保留验证记录和每个决策的理由'),
+      `引导语应该进摘要请求,实际: ${requestText.slice(0, 300)}`,
+    )
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
 test('压缩失败时保留原状态,不用空摘要', async () => {
   // 400 是不可重试错误,立即失败
   const mock = await startMockServer([
@@ -436,4 +490,13 @@ test('估算 token 时遇到嵌套过深的工具参数不会爆栈', () => {
     content: [{ type: 'tool_use', id: 'call_1', name: 'read_file', input }],
   }
   assert.equal(Number.isFinite(estimateMessageTokens(message)), true)
+})
+
+test('还没有摘要时,发给模型的仍是完整历史', () => {
+  const messages = plainMessages(4)
+  const view = buildModelMessages(
+    { messages },
+    { summarizedCount: 0, summary: '' },
+  )
+  assert.deepEqual(view, messages)
 })

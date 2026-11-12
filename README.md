@@ -21,6 +21,7 @@
 - **错误重试** —— 网络抖动 / 429 / 5xx 指数退避重试，4xx 业务错误立即失败
 - **路径沙箱** —— 文件读写和命令执行都限制在工作区内
 - **生命周期钩子** —— 会话、提示词、工具和压缩前后可以观察、拒绝或改写
+- **监视器** —— 后台跑命令或定时回看状态，报告在回合结束后还能推回模型
 - **结构化日志** —— JSON 输出，密钥自动脱敏
 
 ## 目录结构
@@ -47,11 +48,15 @@ src/
     protocol.ts  Provider 协议 + 注册表
     messages.ts  内部消息模型（provider 无关）
     compaction.ts 压缩层：决定发给模型看哪一段，不改历史
+    completeText.ts 不带工具的一次性文本补全
+    modelRoster.ts 三个模型角色：小模型 / 主力模型 / 审批模型
     providers/   按厂商分文件：openai.ts 等
 
   agent/         回合循环与工具
     agent.ts     Agent 循环：流式调用 → 执行工具 → 结果回填 → 继续
-    tools.ts     内置工具：read_file / write_file / edit / edit_batch / run_bash
+    tools.ts     内置工具：read_file / write_file / edit / edit_batch / run_bash / monitor
+    monitor.ts   监视器：后台命令、定时报告、沙盒状态，报告推回上下文
+    approval.ts  审批模型判断写文件和命令能不能执行
     askUser.ts   向用户提问。工具本身不碰终端，怎么问由调用方注入
     hooks.ts     钩子运行时：命令 / 函数、拒绝、改写、超时
     hookConfig.ts 钩子配置：读取并校验 hooks.json
@@ -65,6 +70,7 @@ src/
   session/       会话持久化
     sessionStore.ts   SQLite 存储（node:sqlite，零依赖）
     sessionBundle.ts  会话包：把 SQLite 里的对话收成 JSON，再导回来
+    sessionTitle.ts   小模型生成会话标题
 
   ui/            终端界面
     tui.ts          组件树 + 差分渲染 + markdown 排版
@@ -77,6 +83,7 @@ src/
   instructions/  仓库里已有的约定
     projectInstructions.ts 识别 opencode / cursor / claude / kiro 的规则和提示词
     skills.ts      SKILL.md：只列名字描述，正文由 load_skill 按需取
+    prompts.ts    .grass/prompts/*.md：每份变成一条斜杠命令
 
   sandbox/       沙箱后端与控制面
     daemon.ts      跑在沙盒里的窄服务
@@ -130,9 +137,12 @@ npm start
 | `/export` | 把会话导出成文件。不带路径时写到 `.grass/grassagent-bundle.json` |
 | `/import` | 从文件导回会话。同 ID 默认跳过，`--replace` 才覆盖 |
 | `/instructions` | 列出识别到的规则和提示词 |
+| `/compact` | 手动压缩上下文。参数是摘要要重点保留的内容 |
 | `/mode` | 查看或切换沙盒权限模式 |
 
 `/resume` 不带参数时会弹出会话选择器，上下移动、回车切换、Esc 取消。
+
+`/compact` 只改发给模型的那份内容，完整历史不动——会话存储里保存的还是全部消息。
 
 ### 沙盒权限模式
 
@@ -232,6 +242,42 @@ npm start
 
 `/skills` 列出当前技能（名字、来源、状态、路径），`/skills reload` 重新扫描并热替换工具与系统提示词。
 
+### 监视器
+
+`monitor` 工具用来「过一会儿再看一眼」，省得模型自己一轮轮去问。
+
+```jsonc
+// 后台跑一条命令，结束时把结果推回上下文
+{ "kind": "command", "command": "npm test", "timeoutMs": 300000 }
+
+// 跑命令，100 秒后先报一次「还在跑」，结束时再报一次
+{ "kind": "command", "command": "npm run build", "afterMs": 100000 }
+
+// 只等一段时间，到点提醒
+{ "kind": "timer", "afterMs": 30000 }
+
+// 看沙盒还在不在、连不连得上
+{ "kind": "sandbox", "afterMs": 60000 }
+
+// wait=true：在本次调用内等到结果，直接当工具结果返回
+{ "kind": "command", "command": "npm test", "wait": true }
+```
+
+两种报告方式的区别：
+
+| | 工具调用内阻塞（`wait: true`） | 后台（默认） |
+| --- | --- | --- |
+| 什么时候拿到 | 命令结束或到点，最长等 60 秒 | 回合结束后，报告到了再开一轮 |
+| 适合 | 想要立刻看到结果 | 命令要跑很久，先干别的 |
+
+后台报告作为一条带 `[monitor]` 标记的 user 消息进上下文——产生它的那次工具调用早就返回了，不能伪造成 `tool_result`。报告到达时如果正在跑回合，会先排队，等这一轮结束再开新的，不会插进来打断。
+
+后台命令和 `run_bash` 一样要过审批模型和危险命令规则；只读沙盒直接拒绝。命令输出只保留尾部（8 KB），报告里再截到 2 KB。同时最多 8 个监视器，一个监视器最多报 3 次。
+
+会话结束（Ctrl+C、stdin 读完）会取消全部监视器，并把还在跑的后台命令杀掉——监视器不活在会话之外。所以非交互模式下管道一关就会取消，看不到定时报告。
+
+远程沙盒暂不支持 `kind: "command"`：那需要沙盒协议支持增量输出和杀进程，现在没有。`timer` 和 `sandbox` 两种在远程下可用。
+
 ### 钩子
 
 钩子是回合上的扩展点。它不改 agent 循环本身，只在固定时刻看一眼即将发生的动作，然后允许、拒绝，或改写参数和结果。
@@ -254,7 +300,6 @@ npm start
 `matcher` 是正则，匹配这一次事件的文本：工具事件匹配工具名，`UserPromptSubmit` 和 `Stop` 匹配提示词或模型刚说的话。不写就每次都跑。想精确匹配工具名要自己加锚点，`edit` 会命中 `edit_batch`。
 
 命令从 **stdin** 读到一行 JSON（`hook_event_name`、`session_id`、`cwd`，工具事件还有 `tool_name` / `tool_input` / `tool_use_id`）。结果看退出码和 stdout：
-
 | 结果 | 含义 |
 | --- | --- |
 | 退出码 0，stdout 为空 | 允许 |
@@ -303,6 +348,47 @@ JSON 里常用的字段：
 
 目前只有 `type: "command"`。没有 HTTP、prompt、agent 这几种，也不支持 `"async": true`——写上去会在启动时被校验拒绝。
 
+#### 几个事件专有的输入字段
+
+| 事件 | 字段 | 含义 |
+| --- | --- | --- |
+| `PreToolUse` | `resolved_paths` | 路径参数解析后的真实路径。每项是 `{ requested, real, insideWorkspace }` |
+| `Stop` | `stop_hook_active` | 本回合是不是已经被 Stop 钩子拉回过 |
+| `Stop` | `changed_files` | 本回合实际写过的文件路径 |
+
+`resolved_paths` 里的 `real` 是解析符号链接之后的真实路径。判断「不许写某个目录」要用它——只看模型给的原始路径，工作区里一个指向外部的软链就绕过去了。`insideWorkspace` 为 false 表示越界或解析不了。远程沙盒里没有这个字段，路径在另一台机器上，本机解析出来的结论是错的。
+
+`stop_hook_active` 让验收脚本能收手：第一次拉回后它看到 `true`，就知道该停手而不是继续要求继续。没有这个字段，脚本很容易写成自己叫不醒自己的死循环，只能靠「连续拉回上限」（默认 5 次）兜底。
+
+#### 可抄的配方
+
+`.grass/hooks/` 下有两份现成的示例：
+
+- `verify.mjs`——验收钩子。模型想停的时候自动跑检查，不过就让它再来一轮。和「在规则文件里写请运行检查脚本」的区别是**跑不跑不再由模型决定**
+- `grade-feedback.mjs`——分级反馈钩子。把工具输出按阻塞/警告/信息三级改写，成功静默
+
+用法见 `.grass/hooks/README.md`。示例配置在 `.grass/hooks/hooks.example.json`，**拷贝到 `.grass/hooks.json` 才生效**——那个路径是默认读取的位置，放上去等于默认启用。
+
+### 提示模板
+
+工作区的 `.grass/prompts/*.md` 每份变成一条斜杠命令。
+
+```markdown
+---
+description: 把刚形成的结论固化进仓库文件
+argument-hint: "[要固化的内容]"
+---
+请把下面这条在对话中形成的结论固化进仓库:$ARGUMENTS
+
+按四个子系统判断它属于哪里,只改一个最合适的位置:
+- 规则、流程、完成条件 → 项目规则文件
+- 某个技能内部的做法 → 对应技能的 SKILL.md
+```
+
+正文里的 `$ARGUMENTS` 换成命令后面跟的全部参数，`$1`..`$9` 换成单个参数。
+
+执行等价于「把展开后的正文当成一条用户消息发给模型」，和手打进去完全一样——钩子、会话存储、回合计数都不用另外接。命令名和内置命令冲突时跳过，内置优先。
+
 ### 非交互模式
 
 stdin 不是终端时（管道输入、CI、IDE 插件调用），界面自动切成逐行模式：
@@ -322,8 +408,16 @@ echo "读一下 README.md" | npm start
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
 | `GRASSAGENT_API_KEY` | API 密钥（必填） | 无 |
-| `GRASSAGENT_MODEL` | 模型名称 | `gpt-4o-mini` |
-| `GRASSAGENT_BASE_URL` | API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_MODEL` | 主力模型，负责对话和解决问题 | `gpt-4o-mini` |
+| `GRASSAGENT_BASE_URL` | 主力模型 API 地址 | `https://api.openai.com/v1` |
+| `GRASSAGENT_SMALL_MODEL` | 小模型，负责标题和压缩摘要。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_SMALL_BASE_URL` | 小模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_SMALL_API_KEY` | 小模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_SMALL_MAX_TOKENS` | 小模型单次生成上限。留空则用 `GRASSAGENT_MAX_TOKENS` | 主力上限 |
+| `GRASSAGENT_APPROVAL_MODEL` | 审批模型，决定写文件和命令能不能执行。留空则用主力模型 | 主力模型 |
+| `GRASSAGENT_APPROVAL_BASE_URL` | 审批模型 API 地址。留空则用主力地址 | 主力地址 |
+| `GRASSAGENT_APPROVAL_API_KEY` | 审批模型密钥。留空则用 `GRASSAGENT_API_KEY` | 主力密钥 |
+| `GRASSAGENT_APPROVAL_MAX_TOKENS` | 审批模型单次生成上限 | `512` |
 | `GRASSAGENT_WORKSPACE` | 工作区沙箱根目录 | 进程启动目录 |
 | `GRASSAGENT_COMMAND_TIMEOUT_MS` | `run_bash` 超时（毫秒） | `3000` |
 | `GRASSAGENT_MAX_TOKENS` | 单次生成上限 | `4096` |
@@ -382,7 +476,11 @@ echo "读一下 README.md" | npm start
 
 管道输入时，回合进行中到达的下一行先排队。提问就用这一行当回答；没人问的话，本轮结束再按顺序开下一轮。输入已经结束（EOF）还在等回答时，工具返回「没有用户可以回答」，模型按现有信息继续，进程不会挂住。
 
-**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，先让模型把旧消息总结成结构化摘要（目标、约束、进展、决定、下一步），之后发给模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+**模型分工。** 三个角色不串岗。主力模型只负责对话和调用工具把问题解决掉。小模型负责给会话起标题，以及在需要压缩时写出摘要。审批模型只在写文件、改文件、执行命令之前决定放不放行；读文件仍只过路径沙箱。没单独配置的角色会继承主力模型，旧的单模型配置不用改也能跑。审批请求失败，或者结论解析不了，一律拒绝执行。
+
+**上下文压缩。** 发给模型的内容按字符数估算 token（约 4 个字符算 1 个）。超过「窗口减去预留」时，由小模型把旧消息总结成结构化摘要（目标、约束、进展、决定、验证记录、下一步），之后发给主力模型的内容变成「摘要 + 最近一段」。读过和改过的文件路径从工具调用里抽出来附在摘要后面，不靠模型回忆。压缩失败则保留原样，不会用空摘要毁掉整个会话。
+
+摘要里的**验证记录**不能省：什么检查跑过、什么失败了、为什么失败。丢掉的只能是过程，不能是依据——依据丢了，模型会推翻既定决策或者重犯旧错。`/compact` 手动触发时还能用参数引导摘要的重点，比如 `/compact 保留验证记录和每个决策的理由`。
 
 压缩**只改发给模型的视图，不改历史**。`context.messages` 始终是完整的，摘要单独记在 `context.compaction` 里。这一点很关键，因为改历史会出两个问题：
 

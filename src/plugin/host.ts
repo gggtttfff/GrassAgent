@@ -59,6 +59,7 @@ export const BUILTIN_COMMANDS = [
   'instructions',
   'skills',
   'mode',
+  'compact',
 ] as const
 
 /**
@@ -85,6 +86,16 @@ export function registerBuiltinPlugins(host: PluginHost, options: { skillEval: b
     failure: 'isolate',
     capabilities: ['host.readConfig'],
     contributes: {},
+  })
+  host.register({
+    id: 'grass.tools.monitor',
+    version: '1.0.0',
+    api: 1,
+    plane: 'world',
+    order: 105,
+    failure: 'isolate',
+    capabilities: ['world.exec'],
+    contributes: { tools: ['monitor'] },
   })
   host.register({
     id: 'grass.tools.skills',

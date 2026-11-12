@@ -1,0 +1,26 @@
+{
+  "Stop": [
+    {
+      "matcher": ".*",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node .grass/hooks/verify.mjs",
+          "timeoutMs": 60000
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "run_bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node .grass/hooks/grade-feedback.mjs",
+          "timeoutMs": 5000
+        }
+      ]
+    }
+  ]
+}

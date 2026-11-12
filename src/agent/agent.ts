@@ -25,11 +25,14 @@ import {
 } from '../llm/compaction.ts'
 import type { Transport } from '../core/transport.ts'
 import type { Logger } from '../core/logger.ts'
+import type { Message } from '../llm/messages.ts'
 import {
   appendHookContext,
   type HookEffect,
   type HookRunner,
+  type ResolvedHookPath,
 } from './hooks.ts'
+import { createPathGuard, type PathGuard } from '../core/pathGuard.ts'
 
 // 工具定义:name + 描述 + JSON Schema 参数 + execute 函数
 export type AgentTool = {
@@ -49,13 +52,36 @@ export type AgentTool = {
    * 用于本身就不适合并发的工具。
    */
   sequential?: boolean
+  /**
+   * 执行前要经过审批模型。
+   * 写文件、改文件、跑命令会改工作区,不能由主力模型自己放行。
+   * 没注入审批器时不拦——测试和旧调用保持直接执行。
+   */
+  requiresApproval?: boolean
 }
+
+/** 交给审批模型的一次工具调用 */
+export interface ApprovalRequest {
+  toolName: string
+  args: unknown
+  /** 最近一条用户原话,用来对照这个动作是不是用户要的 */
+  userIntent: string
+}
+
+/** 审批结论。解析失败时调用方应当成拒绝 */
+export interface ApprovalDecision {
+  allowed: boolean
+  reason: string
+}
+
+export type Approver = (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>
 
 // agent 对外的事件流,给 UI 消费
 export type AgentEvent =
   | { type: 'assistant_text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
   | { type: 'tool_result'; id: string; name: string; result: string }
+  | { type: 'permission'; id: string; name: string; allowed: boolean; reason: string }
   | { type: 'hook_notice'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'turn_end'; stopReason: 'end_turn' | 'max_tokens' | 'aborted' | 'error' }
 
@@ -81,9 +107,21 @@ export async function* runAgent(
     logger?: Logger
     toolExecution?: 'parallel' | 'sequential'
     compaction?: CompactionOptions
+    /**
+     * 压缩用的小模型。不传就用主力模型,避免旧调用突然多一条配置。
+     * 正式入口会传小模型,对话循环本身仍只用 model。
+     */
+    compactionModel?: Model
+    /** 有副作用的工具在执行前问它。不传则不审批 */
+    approve?: Approver
     hooks?: HookRunner
     /** Stop 钩子最多把回合拉回来几次。测试可以把它调小。 */
     maxStopContinuations?: number
+    /**
+     * 工作区根。给了就把路径参数解析成真实路径一并交给 PreToolUse 钩子,
+     * 钩子不用自己写 realpath。远程世界的路径不在本机,别给。
+     */
+    workspaceRoot?: string
   } = {},
 ): AsyncGenerator<AgentEvent> {
   const toolMap = new Map(tools.map((tool) => [tool.name, tool]))
@@ -100,9 +138,17 @@ export async function* runAgent(
   const hooks = options.hooks
   let stopContinuations = 0
   const maxStopContinuations = options.maxStopContinuations ?? DEFAULT_MAX_STOP_CONTINUATIONS
+  // 本回合写过的文件。Stop 钩子用它判断「有没有改动」,不用再自己去查 git。
+  const changedFiles = new Set<string>()
+  // 路径解析器。建一次就够,realpath 有开销。建不出来(路径不存在等)时钩子拿不到解析结果。
+  const pathGuard = options.workspaceRoot
+    ? await createPathGuard(options.workspaceRoot).catch(() => undefined)
+    : undefined
 
   while (true) {
-    // 0. 消息过多时先压缩旧消息。钩子可以否决这一次压缩,历史保持原样。
+    // 0. 视图超预算时让小模型写摘要。钩子可以否决这一次压缩,历史保持原样。
+    // 对话循环不拿主力模型做摘要。
+    const compactionModel = options.compactionModel ?? model
     if (hooks && signal?.aborted) {
       yield { type: 'turn_end', stopReason: 'aborted' }
       return
@@ -123,10 +169,10 @@ export async function* runAgent(
           '钩子跳过了上下文压缩',
         )
       } else {
-        await compactContext(model, context, signal, options, compactionOptions)
+        await compactContext(compactionModel, context, signal, options, compactionOptions)
       }
     } else {
-      await compactContext(model, context, signal, options, compactionOptions)
+      await compactContext(compactionModel, context, signal, options, compactionOptions)
     }
 
     // 1. 流式调用 LLM,收集文本和 tool_calls
@@ -195,6 +241,7 @@ export async function* runAgent(
       const continued = yield* applyStopHook(context, text, hooks, signal, {
         stopContinuations,
         maxStopContinuations,
+        changedFiles: [...changedFiles],
         logger: options.logger,
       })
       if (continued === 'aborted') {
@@ -214,7 +261,7 @@ export async function* runAgent(
     //    argsInvalid 同理——空对象会让工具拿到 undefined 参数乱写
     //    钩子在校验之后、执行之前跑。它能拒绝,或给出一份新参数——新参数还要再校验一遍。
     const prepared = prepareToolCalls(toolCalls, toolMap)
-    const pre = await applyPreToolHooks(prepared, hooks, signal, options.logger)
+    const pre = await applyPreToolHooks(prepared, hooks, signal, options.logger, pathGuard)
     for (const notice of pre.notices) yield notice
     if (pre.aborted) {
       // 钩子还没跑完就被打断。工具一个都没执行,但每个 tool_call 仍要有 tool_result。
@@ -250,7 +297,19 @@ export async function* runAgent(
     //    顺序错了下次恢复会话会 400,API 要求每个 tool_call 有配对的 tool_result
     const results: ToolResultEntry[] = []
     const hookControl = { preventContinuation: pre.preventContinuation }
-    for await (const event of executeToolCalls(prepared, signal, options.toolExecution, hooks, hookControl)) {
+for await (const event of executeToolCalls(
+      prepared,
+      signal,
+      options.toolExecution,
+      hooks,
+      hookControl,
+      {
+        approve: options.approve,
+        logger: options.logger,
+        userIntent: latestUserIntent(context.messages),
+      },
+      changedFiles,
+    )) {
       if (event.type === 'tool_result') {
         results.push({ tool_use_id: event.id, content: event.result })
       }
@@ -399,20 +458,65 @@ async function withMutationQueues(paths: string[], operation: () => Promise<stri
   return await run()
 }
 
-// 执行一个工具调用,返回结果文本
-async function runOneTool(prepared: PreparedToolCall, signal?: AbortSignal): Promise<string> {
-  if (prepared.error) return prepared.error
-  if (signal?.aborted) return 'error:aborted'
+// 最近一条用户原话。tool_result 也是 role:user,但它是数组,不能当成意图。
+function latestUserIntent(messages: Message[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message.role !== 'user' || typeof message.content !== 'string') continue
+    const text = message.content.trim()
+    if (text) return text
+  }
+  return ''
+}
+
+type ToolRunOutcome = {
+  result: string
+  permission?: { allowed: boolean; reason: string }
+}
+
+// 需要审批的工具先问审批模型,通过了才执行。
+// 审批在拿文件锁之前做:被拒绝的调用不该占着队列。
+async function runOneTool(
+  prepared: PreparedToolCall,
+  signal: AbortSignal | undefined,
+  gate: { approve?: Approver; logger?: Logger; userIntent: string },
+): Promise<ToolRunOutcome> {
+  if (prepared.error) return { result: prepared.error }
+  if (signal?.aborted) return { result: 'error:aborted' }
+
+  let permission: ToolRunOutcome['permission']
+  if (prepared.tool?.requiresApproval && gate.approve) {
+    let decision: ApprovalDecision
+    try {
+      decision = await gate.approve(
+        { toolName: prepared.name, args: prepared.args, userIntent: gate.userIntent },
+        signal,
+      )
+    } catch (error) {
+      // 审批器自己抛错也拒绝。放行会把故障变成一次没人看过的写操作。
+      gate.logger?.warn(
+        { toolName: prepared.name, errorMessage: (error as Error).message },
+        '审批器抛错,拒绝执行',
+      )
+      decision = { allowed: false, reason: '审批过程出错,已拒绝执行' }
+    }
+    if (signal?.aborted) return { result: 'error:aborted' }
+    permission = { allowed: decision.allowed, reason: decision.reason }
+    if (!decision.allowed) {
+      return { result: `error:permission denied: ${decision.reason}`, permission }
+    }
+  }
 
   const mutatedPaths = getMutatedFilePaths(prepared)
   if (mutatedPaths.length > 0) {
-    return await withMutationQueues(mutatedPaths, async () => {
+    const result = await withMutationQueues(mutatedPaths, async () => {
       // 排队期间可能已经被 abort 了,这时不必再执行
       if (signal?.aborted) return 'error:aborted'
       return await executeOneTool(prepared, signal)
     })
+    return { result, permission }
   }
-  return await executeOneTool(prepared, signal)
+  return { result: await executeOneTool(prepared, signal), permission }
 }
 
 // 把工具批次切成若干段:连续的普通工具合成一段并发跑,
@@ -446,11 +550,23 @@ async function* executeToolCalls(
   mode: 'parallel' | 'sequential' = 'parallel',
   hooks?: HookRunner,
   hookControl: { preventContinuation: boolean } = { preventContinuation: false },
+  gate: { approve?: Approver; logger?: Logger; userIntent: string } = { userIntent: '' },
+  changedFiles?: Set<string>,
 ): AsyncGenerator<AgentEvent> {
-  const results: string[] = new Array(prepared.length)
+  const outcomes: ToolRunOutcome[] = new Array(prepared.length)
 
   const emitResult = async function* (index: number): AsyncGenerator<AgentEvent> {
-    const finalized = await applyPostToolHook(prepared[index], results[index], hooks, signal)
+    const outcome = outcomes[index]
+    if (outcome.permission) {
+      yield {
+        type: 'permission',
+        id: prepared[index].id,
+        name: prepared[index].name,
+        allowed: outcome.permission.allowed,
+        reason: outcome.permission.reason,
+      }
+    }
+    const finalized = await applyPostToolHook(prepared[index], outcome.result, hooks, signal)
     if (finalized.preventContinuation) hookControl.preventContinuation = true
     for (const notice of finalized.notices) yield notice
     yield {
@@ -463,22 +579,44 @@ async function* executeToolCalls(
 
   if (mode === 'sequential') {
     for (let index = 0; index < prepared.length; index++) {
-      results[index] = await runOneTool(prepared[index], signal)
+outcomes[index] = await runOneTool(prepared[index], signal, gate)
+      collectChangedFiles(prepared[index], outcomes[index].result, changedFiles)
       yield* emitResult(index)
     }
     return
   }
 
   // 并行:段内并发,段与段之间等前一段跑完。
-  // 钩子在段跑完之后按原顺序串行跑,避免改写结果时互相踩。
+  // 审批可以同时问。钩子在段跑完之后按原顺序串行跑,避免改写结果时互相踩。
   for (const segment of splitIntoSegments(prepared)) {
     await Promise.all(segment.map(async (index) => {
-      results[index] = await runOneTool(prepared[index], signal)
+      outcomes[index] = await runOneTool(prepared[index], signal, gate)
     }))
     for (const index of segment) {
+      collectChangedFiles(prepared[index], outcomes[index].result, changedFiles)
       yield* emitResult(index)
     }
   }
+}
+
+/**
+ * 记下这个工具实际改过的文件。
+ *
+ * 只认声明了 mutatesFiles 的工具,并且只认执行成功的——
+ * 报错的写入没落到磁盘上,记进去会让「有没有改动」的判断失真。
+ *
+ * 路径是模型给的那个(通常是相对路径)。绝对路径由钩子那边的
+ * resolved_paths 提供,两边靠原始写法对上号。
+ */
+function collectChangedFiles(
+  prepared: PreparedToolCall,
+  result: string,
+  changedFiles: Set<string> | undefined,
+): void {
+  if (!changedFiles) return
+  if (result.startsWith('error:')) return
+  const mutatedPaths = getMutatedFilePaths(prepared)
+  for (const mutatedPath of mutatedPaths) changedFiles.add(mutatedPath)
 }
 
 function noticesFrom(effect: HookEffect): AgentEvent[] {
@@ -499,7 +637,12 @@ async function* applyStopHook(
   assistantText: string,
   hooks: HookRunner | undefined,
   signal: AbortSignal | undefined,
-  options: { stopContinuations: number; maxStopContinuations: number; logger?: Logger },
+  options: {
+    stopContinuations: number
+    maxStopContinuations: number
+    changedFiles: string[]
+    logger?: Logger
+  },
 ): AsyncGenerator<AgentEvent, 'continue' | 'stop' | 'aborted'> {
   if (!hooks || signal?.aborted) return 'stop'
   if (options.stopContinuations >= options.maxStopContinuations) {
@@ -518,10 +661,27 @@ async function* applyStopHook(
     return 'stop'
   }
 
-  const effect = await hooks.run({ event: 'Stop', prompt: assistantText }, signal)
+  const effect = await hooks.run({
+    event: 'Stop',
+    prompt: assistantText,
+    // 已经拉回过就把这个标记给钩子:它该决定是再要求一次,还是放行。
+    // 不给这个标记的话,钩子脚本只能靠猜,容易写出死循环。
+    stopHookActive: options.stopContinuations > 0,
+    changedFiles: options.changedFiles,
+  }, signal)
   for (const notice of noticesFrom(effect)) yield notice
   if (effect.aborted) return 'aborted'
-  if (!effect.blocked) return 'stop'
+  if (!effect.blocked) {
+    // 没拒绝就意味着这一轮到此为止。钩子给的额外上下文没人会读了,
+    // 丢掉它得留个记录,不然用户以为钩子生效了。
+    if (effect.additionalContext) {
+      options.logger?.info(
+        { contextLength: effect.additionalContext.length },
+        'Stop 钩子返回了额外上下文,但没有拒绝本回合,内容未使用',
+      )
+    }
+    return 'stop'
+  }
 
   const reason = effect.reason ?? 'Stop 钩子要求继续'
   yield { type: 'hook_notice', level: 'warn', message: reason }
@@ -537,6 +697,7 @@ async function applyPreToolHooks(
   hooks: HookRunner | undefined,
   signal: AbortSignal | undefined,
   logger: Logger | undefined,
+  pathGuard: PathGuard | undefined,
 ): Promise<{ aborted: boolean; preventContinuation: boolean; notices: AgentEvent[] }> {
   const notices: AgentEvent[] = []
   if (!hooks) return { aborted: false, preventContinuation: false, notices }
@@ -552,6 +713,7 @@ async function applyPreToolHooks(
       toolName: item.name,
       toolInput: item.error ? item.modelArgs : item.args,
       toolUseId: item.id,
+      resolvedPaths: await resolveHookPaths(item, pathGuard, logger),
     }, signal)
     notices.push(...noticesFrom(effect))
     if (effect.aborted) return { aborted: true, preventContinuation, notices }
@@ -579,6 +741,53 @@ async function applyPreToolHooks(
   }
 
   return { aborted: false, preventContinuation, notices }
+}
+
+/**
+ * 把工具参数里的路径解析成真实路径,交给 PreToolUse 钩子。
+ *
+ * 钩子要拦「不许写某个目录」时,自己写 resolve + realpath 很容易漏掉软链那一层。
+ * 这里算好给它,钩子只要看 insideWorkspace 和 real。
+ *
+ * 只有声明了 mutatesFiles 的工具才有路径参数。没给工作区根(远程世界)时
+ * 返回空数组——本机解析不了远程的路径,硬算会给出错误结论。
+ */
+async function resolveHookPaths(
+  prepared: PreparedToolCall,
+  pathGuard: PathGuard | undefined,
+  logger: Logger | undefined,
+): Promise<ResolvedHookPath[] | undefined> {
+  if (!pathGuard) return undefined
+  const declared = prepared.tool?.mutatesFiles
+  if (!declared || declared.length === 0) return undefined
+
+  const args = prepared.args as Record<string, unknown>
+  const requestedPaths: string[] = []
+  for (const parameterName of declared) {
+    const value = args[parameterName]
+    if (typeof value === 'string' && value) requestedPaths.push(value)
+    else if (Array.isArray(value)) {
+      for (const item of value) {
+        if (typeof item === 'string' && item) requestedPaths.push(item)
+      }
+    }
+  }
+  if (requestedPaths.length === 0) return undefined
+
+  const resolved: ResolvedHookPath[] = []
+  for (const requested of requestedPaths) {
+    try {
+      const real = await pathGuard.resolve(requested)
+      resolved.push({ requested, real, insideWorkspace: true })
+    } catch (error) {
+      // 解析失败就是越界(或者路径本身有问题)。真实路径给不出,
+      // 但 insideWorkspace=false 已经够钩子做判断了。
+      const message = (error as Error).message
+      logger?.debug({ requested, errorMessage: message }, '路径解析失败,按越界处理')
+      resolved.push({ requested, real: requested, insideWorkspace: false })
+    }
+  }
+  return resolved
 }
 
 async function applyPostToolHook(

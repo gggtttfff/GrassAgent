@@ -24,11 +24,20 @@ async function startMockServer(responses?: string[]): Promise<{ port: number; cl
     'data: {"choices":[{"delta":{"content":"回复**加粗**内容"},"finish_reason":"stop"}]}\n\n' +
     'data: [DONE]\n\n'
   const queue = [...(responses ?? [])]
+  const titleResponse =
+    'data: {"choices":[{"delta":{"content":"会话标题"},"finish_reason":"stop"}]}\n\n' +
+    'data: [DONE]\n\n'
   const server = createServer((request, response) => {
-    request.on('data', () => {})
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
     request.on('end', () => {
+      // 标题请求和主力模型同时发出。它不该拿走编排好的工具回合。
+      const raw = Buffer.concat(chunks).toString('utf8')
+      const body = raw.includes('根据用户的话生成一个会话标题')
+        ? titleResponse
+        : (responses ? queue.shift() ?? defaultResponse : defaultResponse)
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
-      response.end(responses ? queue.shift() ?? defaultResponse : defaultResponse)
+      response.end(body)
     })
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -104,7 +113,7 @@ test('非交互模式能跑完整个回合并正常退出', async () => {
     assert.ok(output.includes('回复'), `输出里应有模型回复,实际: ${output.slice(-300)}`)
     // markdown 的星号被渲染掉了
     assert.ok(output.includes('加粗'), `markdown 应被渲染,实际: ${output.slice(-300)}`)
-    assert.ok(!output.includes('**'), 'markdown 标记应被渲染掉')
+    assert.ok(!output.includes('**'), `markdown 标记应被渲染掉,实际: ${output.slice(-300)}`)
   } finally {
     await mock.close()
   }
@@ -136,10 +145,54 @@ test('非交互模式的输出没有 ANSI 控制序列', async () => {
   }
 })
 
+// 跑一次 CLI,但 stdin 保持打开一段时间再关。
+// 监视器报告要等回合结束之后才到,一写完就 EOF 会把监视器直接取消掉。
+async function runCliKeepingStdin(
+  input: string,
+  keepOpenMs: number,
+  environment: Record<string, string>,
+): Promise<{ exitCode: number; output: string }> {
+  const child = spawn(
+    process.execPath,
+    ['--disable-warning=ExperimentalWarning', path.join('src', 'cli.ts')],
+    {
+      cwd: projectRoot,
+      env: { ...process.env, ...environment },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  )
+
+  let output = ''
+  child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString() })
+  child.stderr.on('data', (chunk: Buffer) => { output += chunk.toString() })
+
+  child.stdin.write(input)
+  const timer = setTimeout(() => child.stdin.end(), keepOpenMs)
+
+  const exitCode = await new Promise<number>((resolve) => {
+    const timeout = setTimeout(() => {
+      child.kill()
+      resolve(-1)
+    }, 20000)
+    child.on('exit', (code) => {
+      clearTimeout(timeout)
+      clearTimeout(timer)
+      resolve(code ?? 0)
+    })
+  })
+
+  return { exitCode, output }
+}
+
 // 斜杠命令的端到端测试。
 //
 // 关键断言:命令在本地执行,不发给模型。
 // 未知命令也得拦下来——不然会被当成普通输入发给模型。
+
+// 小模型起标题是旁路请求。按正文认出来,别跟主力模型的回合抢响应。
+function isTitleRequest(raw: string): boolean {
+  return raw.includes('会话标题')
+}
 
 const mockEnvironment = (port: number): Record<string, string> => ({
   GRASSAGENT_API_KEY: 'test-key',
@@ -188,6 +241,144 @@ test('/sessions 列出会话', async () => {
     assert.ok(!output.includes('回复'), '命令不该发给模型')
   } finally {
     await mock.close()
+  }
+})
+
+test('提示模板命令展开后当用户消息发给模型', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-prompt-'))
+  await mkdir(path.join(directory, '.grass', 'prompts'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'prompts', 'goal.md'),
+    ['---', 'description: 设定目标', '---', '目标:$ARGUMENTS'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/goal 让测试通过\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    // 模板命令要走到模型,回复应该出现
+    assert.ok(output.includes('回复'), `模板命令应该发给模型,实际: ${output.slice(-400)}`)
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('提示模板的命令名和内置命令冲突时不注册', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'grass-cli-prompt-'))
+  await mkdir(path.join(directory, '.grass', 'prompts'), { recursive: true })
+  await writeFile(
+    path.join(directory, '.grass', 'prompts', 'clear.md'),
+    ['---', 'description: 抢占 clear', '---', '不该生效'].join('\n'),
+  )
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/clear\n', {
+      ...mockEnvironment(mock.port),
+      GRASSAGENT_WORKSPACE: directory,
+      GRASSAGENT_SESSION_DATABASE_PATH: path.join(directory, 'sessions.db'),
+    })
+
+    assert.equal(exitCode, 0)
+    // 内置命令优先:仍然是清空对话,不是模板正文
+    assert.ok(output.includes('对话已清空'), `应该走内置命令,实际: ${output.slice(-400)}`)
+    assert.ok(!output.includes('不该生效'), '模板不该抢掉内置命令')
+  } finally {
+    await mock.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('/compact 手动压缩,历史保持完整', async () => {
+  const mock = await startMockServer()
+  try {
+    const { exitCode, output } = await runCliWithInput('/compact\n', mockEnvironment(mock.port))
+
+    assert.equal(exitCode, 0, output.slice(-300))
+    // 没有可压的历史时要有明确提示,不能静默
+    assert.ok(
+      output.includes('没有可压缩的历史') || output.includes('已压缩'),
+      `应该给出压缩结果,实际: ${output.slice(-300)}`,
+    )
+    // 压缩不发普通回复
+    assert.ok(!output.includes('回复**'), '压缩不该产生普通回复')
+  } finally {
+    await mock.close()
+  }
+})
+
+test('监视器到点后能把状态推回上下文并开新一轮', async () => {
+  const monitorResponse =
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_mon","function":{"name":"monitor","arguments":"{\\"kind\\":\\"timer\\",\\"afterMs\\":150}"}}]}}]}\n\n' +
+    'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
+    'data: [DONE]\n\n'
+
+  const requests: string[] = []
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
+    request.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8')
+      response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+
+      // 标题是旁路请求,不能抢走编排好的回合
+      if (raw.includes('根据用户的话生成一个会话标题')) {
+        response.end('data: {"choices":[{"delta":{"content":"监视"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+        return
+      }
+      // monitor 要过审批模型,它也是一次独立请求,同样不占回合编号
+      if (raw.includes('你是权限审批')) {
+        response.end(
+          'data: {"choices":[{"delta":{"content":"decision: allow\\nreason: 测试放行"},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+
+      requests.push(raw)
+      // 第 1 轮让模型起监视器,第 2 轮收尾,第 3 轮才是监视器报告唤醒的那一轮
+      if (requests.length === 1) {
+        response.end(monitorResponse)
+        return
+      }
+      if (requests.length === 2) {
+        response.end('data: {"choices":[{"delta":{"content":"已启动监视器"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+        return
+      }
+      response.end('data: {"choices":[{"delta":{"content":"收到监视器报告"},"finish_reason":"stop"}]}\n\n' + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+
+  try {
+    const { exitCode, output } = await runCliKeepingStdin('开始监视\n', 1500, mockEnvironment(port))
+
+    assert.equal(exitCode, 0, output.slice(-400))
+    assert.ok(output.includes('已启动监视器'), `第一轮应正常结束,实际: ${output.slice(-400)}`)
+    assert.ok(output.includes('收到监视器报告'), `监视器报告应该唤醒新一轮,实际: ${output.slice(-400)}`)
+    assert.equal(requests.length, 3, `应该跑三轮请求,实际 ${requests.length}`)
+
+    // 报告作为 user 消息进的历史,不是伪造的 tool_result
+    const reportTurn = JSON.parse(requests[2]!) as {
+      messages: Array<{ role: string; content: string }>
+    }
+    const userTexts = reportTurn.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => (typeof message.content === 'string' ? message.content : JSON.stringify(message.content)))
+    assert.ok(
+      userTexts.some((text) => text.includes('[monitor]')),
+      `监视器报告应该作为 user 消息进上下文,实际: ${JSON.stringify(userTexts).slice(0, 500)}`,
+    )
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.closeAllConnections()
+      server.close(() => resolve())
+    })
   }
 })
 
@@ -268,9 +459,19 @@ test('模型提问时，下一行是回答，不会另开一轮', async () => {
     const chunks: Buffer[] = []
     request.on('data', (chunk: Buffer) => chunks.push(chunk))
     request.on('end', () => {
-      requests.push(Buffer.concat(chunks).toString('utf-8'))
+      const raw = Buffer.concat(chunks).toString('utf-8')
+      requests.push(raw)
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
-      if (requests.length === 1) {
+      // 标题是小模型的旁路请求,不能抢走主力模型按顺序准备好的回复
+      if (isTitleRequest(raw)) {
+        response.end(
+          'data: {"choices":[{"delta":{"content":"选语言"},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      const asksUser = !raw.includes('"role":"tool"')
+      if (asksUser) {
         response.end(
           'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
             'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
@@ -293,8 +494,9 @@ test('模型提问时，下一行是回答，不会另开一轮', async () => {
     assert.equal(exitCode, 0, `应正常退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
     assert.ok(output.includes('? 用哪种语言'), `应显示问题,实际: ${output.slice(-400)}`)
     assert.ok(output.includes('已按你的选择继续'), `回答之后应继续回合,实际: ${output.slice(-400)}`)
-    assert.equal(requests.length, 2, `回答不该再开一轮用户消息,实际请求数 ${requests.length}`)
-    const followUp = JSON.parse(requests[1]) as {
+    const agentRequests = requests.filter((raw) => !isTitleRequest(raw))
+    assert.equal(agentRequests.length, 2, `回答不该再开一轮用户消息,实际请求数 ${agentRequests.length}`)
+    const followUp = JSON.parse(agentRequests[1]) as {
       messages: Array<{ role: string; content?: string | null }>
     }
     const toolMessage = followUp.messages.find((message) => message.role === 'tool')
@@ -311,13 +513,21 @@ test('模型提问时，下一行是回答，不会另开一轮', async () => {
 })
 
 test('没有人回答时回合仍能结束并退出', async () => {
-  const requests: string[] = []
   const server = createServer((request, response) => {
-    request.on('data', () => {})
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
     request.on('end', () => {
-      requests.push('hit')
+      const raw = Buffer.concat(chunks).toString('utf-8')
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
-      if (requests.length === 1) {
+      if (isTitleRequest(raw)) {
+        response.end(
+          'data: {"choices":[{"delta":{"content":"选语言"},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      const asksUser = !raw.includes('"role":"tool"')
+      if (asksUser) {
         response.end(
           'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ask","function":{"name":"ask_user","arguments":"{\\"question\\":\\"用哪种语言\\"}"}}]}}]}\n\n' +
             'data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n' +
@@ -348,12 +558,21 @@ test('没有人回答时回合仍能结束并退出', async () => {
 })
 
 test('管道里的下一行在本轮结束后继续，而不是被丢掉', async () => {
-  let requests = 0
+  let agentRequests = 0
   const server = createServer((request, response) => {
-    request.on('data', () => {})
+    const chunks: Buffer[] = []
+    request.on('data', (chunk: Buffer) => chunks.push(chunk))
     request.on('end', () => {
-      requests += 1
+      const raw = Buffer.concat(chunks).toString('utf-8')
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+      if (isTitleRequest(raw)) {
+        response.end(
+          'data: {"choices":[{"delta":{"content":"第一件事"},"finish_reason":"stop"}]}\n\n' +
+            'data: [DONE]\n\n',
+        )
+        return
+      }
+      agentRequests += 1
       response.end(
         'data: {"choices":[{"delta":{"content":"回复完毕"},"finish_reason":"stop"}]}\n\n' +
           'data: [DONE]\n\n',
@@ -366,7 +585,7 @@ test('管道里的下一行在本轮结束后继续，而不是被丢掉', async
   try {
     const { exitCode, output } = await runCliWithInput('第一句\n第二句\n', mockEnvironment(port))
     assert.equal(exitCode, 0, `应跑完两轮再退出,实际 ${exitCode},输出: ${output.slice(-400)}`)
-    assert.equal(requests, 2, '第二行应再开一轮')
+    assert.equal(agentRequests, 2, '第二行应再开一轮')
     assert.equal(output.split('回复完毕').length - 1, 2)
   } finally {
     await new Promise<void>((resolve) => {
@@ -422,7 +641,9 @@ test('始终生效的项目规则会发给模型,提示词不会', async () => {
     const chunks: Buffer[] = []
     request.on('data', (chunk: Buffer) => chunks.push(chunk))
     request.on('end', () => {
-      requests.push(Buffer.concat(chunks).toString('utf8'))
+      const raw = Buffer.concat(chunks).toString('utf8')
+      // 小模型起标题会多打一发,不计入发给主力模型的请求。
+      if (!raw.includes('根据用户的话生成一个会话标题')) requests.push(raw)
       response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
       response.end(
         'data: {"choices":[{"delta":{"content":"看过了"},"finish_reason":"stop"}]}\n\n' +

@@ -8,6 +8,7 @@
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runAgent } from './agent/agent.ts'
+import { createMonitorRegistry } from './agent/monitor.ts'
 import { Tui } from './ui/tui.ts'
 import { builtinTools, replaceLoadSkillTool } from './agent/tools.ts'
 import { openExecutionWorld } from './sandbox/openWorld.ts'
@@ -40,6 +41,7 @@ import {
   loadDangerousCommandsFile,
   type DangerousCommandRule,
 } from './agent/dangerousCommands.ts'
+import { createModelApprover } from './agent/approval.ts'
 import {
   appendPromptSection,
   discoverProjectInstructions,
@@ -47,13 +49,24 @@ import {
   summarizeInstructions,
 } from './instructions/projectInstructions.ts'
 import { commandOnlySkills, createSkillCache, createSkillRegistry, createLocalSkillFiles, createWorldSkillFiles, describeDisabledSkills, describeSkippedSkills, discoverSkills, formatCommandOnlySkill, formatSkillList, isUsableCommandName, mergeSkillCatalogs, summarizeSkills, SKILL_CACHE_RELATIVE_PATH, type SkillCatalog, type SkillLog, type SkillOrigin, type SkillRegistry } from './instructions/skills.ts'
+import {
+  discoverPromptTemplates,
+  expandPromptTemplate,
+  isUsablePromptCommandName,
+  matchPromptTemplate,
+  type PromptTemplate,
+} from './instructions/prompts.ts'
+import { compactContext } from './llm/compaction.ts'
+import { ensureSessionTitle } from './session/sessionTitle.ts'
+import { buildModelRoster } from './llm/modelRoster.ts'
 import type { Model, Context } from './llm/llm.ts'
 
 /** 固定 system prompt */
 const SYSTEM_PROMPT =
   '你是一个编码助手。用提供的工具读写文件和执行命令来完成任务。先阅读再修改，修改后可运行命令验证。' +
   '信息不足，或有多种做法必须由用户决定时，调用 ask_user 提问并等待回答。能从代码或命令里查到的不要问，一次只问一个问题。' +
-  '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。'
+  '如果 ask_user 返回没有用户可以回答，不要再问，按现有信息继续。' +
+  '写入、修改和执行命令会先经过权限审批。如果工具返回 permission denied，不要原样重试，向用户说明原因或改用更安全的做法。'
 
 async function main() {
   // --version 在加载配置之前处理。查版本不该要求先配好 API Key。
@@ -78,12 +91,16 @@ async function main() {
 
   const logger = createLoggerFromConfig(config)
 
-  const model: Model = {
-    apiKey: config.ApiKey,
-    model: config.Model,
-    baseUrl: config.BaseUrl,
-    maxTokens: config.MaxTokens,
-  }
+  // 三个模型各干各的:小模型起标题和判断压缩,主力模型对话,审批模型放行副作用。
+  const models = buildModelRoster(config)
+  logger.info({
+    primaryModel: models.primary.model,
+    smallModel: models.small.model,
+    approvalModel: models.approval.model,
+    primaryBaseUrl: models.primary.baseUrl,
+    smallBaseUrl: models.small.baseUrl,
+    approvalBaseUrl: models.approval.baseUrl,
+  }, '模型分工已就绪')
 
   // 传输层在进程内共享，保证并发闸门对所有请求生效
   const transport = createTransport({
@@ -94,6 +111,7 @@ async function main() {
     maxConcurrency: config.MaxConcurrency,
     logger,
   })
+  const approve = createModelApprover(models.approval, { transport, logger })
 
   // 会话存储:SQLite,多进程可同时读写同一个库。
   // 每个进程用独立 sessionId,各存各的会话,互不干扰。
@@ -284,6 +302,16 @@ async function main() {
     throw error
   }
 
+  // 监视器:后台命令和定时报告都归它管。真正的投递函数在回合循环建好之后才赋值,
+  // 这里先用占位——监视器最早也要等工具被调用之后才会产生报告。
+  let deliverMonitorReport: (text: string) => void = () => {}
+  const monitors = createMonitorRegistry({
+    world,
+    workspaceRoot: world.workspaceRoot,
+    logger,
+    report: (text) => deliverMonitorReport(text),
+  })
+
   // 工具的文件访问被限制在这个世界里。
   // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
   const fileTools = await builtinTools({
@@ -293,6 +321,7 @@ async function main() {
     approval,
     dangerousCommands,
     dangerousCommandsPath,
+    monitors,
   })
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
@@ -377,6 +406,9 @@ async function main() {
     sessionStore.close()
   }
   const shutdown = async (): Promise<void> => {
+    // 先关监视器:后台命令和定时器不该活到进程之外,
+    // 否则 Ctrl+C 退出后还有命令在跑。
+    monitors.cancelAll()
     if (sessionStarted) {
       sessionStarted = false
       try {
@@ -490,6 +522,47 @@ async function main() {
 
   registerCommandOnlySkills(skillCatalog)
 
+  // /compact:手动压缩上下文。
+  //
+  // 自动压缩只在「已用 > 窗口 - 预留」时触发,用户没法主动压,
+  // 也没法引导摘要的重点。参数会拼进摘要提示词,比如
+  // /compact 保留验证记录和每个决策的理由。
+  //
+  // 只改发给模型的视图,历史不动——context.messages 始终是完整历史。
+  commandRegistry.register({
+    name: 'compact',
+    description: '手动压缩上下文,参数是摘要要重点保留的内容',
+    argumentHint: '[重点]',
+    execute: async (argument) => {
+      const guidance = argument.trim()
+      const before = context.compaction?.summarizedCount ?? 0
+      // 压缩要发一次 LLM 请求,期间不能算空闲——
+      // 空闲状态的 Ctrl+C 是退出进程,会把请求和会话收尾一起掐掉。
+      tui.setBusy(true)
+      try {
+        // 摘要走小模型,和自动压缩一致——压缩的活不该占主力模型。
+        await compactContext(models.small, context, undefined, {
+          transport,
+          logger,
+          force: true,
+          guidance: guidance || undefined,
+        }, {
+          contextWindow: config.ContextWindow,
+          reserveTokens: config.CompactReserveTokens,
+          keepRecentTokens: config.CompactKeepRecentTokens,
+        })
+      } finally {
+        tui.setBusy(false)
+      }
+      const after = context.compaction?.summarizedCount ?? 0
+      if (after <= before) {
+        return '没有可压缩的历史,或压缩失败了(历史保持原样)'
+      }
+      logger.info({ before, after, guidance }, '上下文已手动压缩')
+      return `已压缩 ${after - before} 条消息到摘要。历史没有删除,只是发给模型的内容变短了。`
+    },
+  })
+
   // Shift+Tab 循环模式。只在只读和可写之间转:
   // 升级到全权限要走 /mode,回合中途弹审批会跟 ask_user 抢同一个输入框。
   tui.onModeCycle(() => {
@@ -504,27 +577,145 @@ async function main() {
     })
   })
 
-  // 切换会话:存盘当前会话,切过去,载入目标会话的历史
-  const switchToSession = async (targetSessionId: string): Promise<string> => {
-    if (targetSessionId === sessionStore.sessionId) return '已经在该会话中'
-    sessionStore.switchSession(targetSessionId, context.messages)
-    context.messages = sessionStore.load()
-    // 压缩状态跟着会话走——不同会话的历史长度不一样
-    context.compaction = undefined
-    tui.clearTranscript()
-    logger.info({ sessionId: targetSessionId }, '已切换会话')
-    return `已切换到会话 ${targetSessionId}(${context.messages.length} 条消息)`
+  // 提示模板。.grass/prompts/*.md 每份变成一条斜杠命令,
+  // 执行等价于把展开后的正文当成一条用户消息发给模型。
+  let promptTemplates: PromptTemplate[] = []
+  try {
+    promptTemplates = await discoverPromptTemplates(config.Workspace, {
+      warn: (object, message) => logger.warn(object, message),
+      info: (object, message) => logger.info(object, message),
+    })
+  } catch (error) {
+    logger.error({ errorMessage: (error as Error).message }, '识别提示模板失败,继续启动')
   }
+  // 内置命令优先:名字撞上内置命令的模板不注册,免得把 /compact 之类顶掉。
+  const usableTemplates = promptTemplates.filter((template) => {
+    if (!isUsablePromptCommandName(template.name)) {
+      logger.warn({ name: template.name }, '提示模板的名字不能当命令名,已跳过')
+      return false
+    }
+    if (commandRegistry.find(template.name)) {
+      logger.warn({ name: template.name }, '提示模板的命令名和内置命令冲突,已跳过')
+      return false
+    }
+    return true
+  })
 
   // 命令名补全。交互模式才有意义——非交互模式没键盘。
   tui.setSlashCommands(
-    commandRegistry.all().map((command) => ({
-      name: command.name,
-      description: command.description,
-      argumentHint: command.argumentHint,
-    })),
+    [
+      ...commandRegistry.all().map((command) => ({
+        name: command.name,
+        description: command.description,
+        argumentHint: command.argumentHint,
+      })),
+      ...usableTemplates.map((template) => ({
+        name: template.name,
+        description: template.description,
+        argumentHint: template.argumentHint,
+      })),
+    ],
     config.Workspace,
   )
+
+  // 跑一个模型回合,把事件转发给 TUI。用户输入和监视器报告共用这一条。
+  // 中断、审批、钩子提示都在这里落到界面上,调用方只管把消息先进 context。
+  const runAgentTurn = async (ctrl: AbortController): Promise<void> => {
+    for await (const ev of runAgent(models.primary, context, tools, ctrl.signal, {
+      transport,
+      logger,
+      toolExecution: config.ToolExecution,
+      compactionModel: models.small,
+      approve,
+      hooks: hookRunner,
+      compaction: {
+        contextWindow: config.ContextWindow,
+        reserveTokens: config.CompactReserveTokens,
+        keepRecentTokens: config.CompactKeepRecentTokens,
+      },
+      // 只有本地世界才给工作区根:远程的路径在另一台机器上,
+      // 本机解析出来的结论是错的。全权限模式没有边界,
+      // 报 insideWorkspace=false 反而会误导钩子。
+      workspaceRoot: config.ExecutionWorld === 'remote'
+        || world.policy.mode === 'danger-full-access'
+        ? undefined
+        : config.Workspace,
+    })) {
+      switch (ev.type) {
+        case 'assistant_text': tui.printText(ev.delta); break
+        case 'tool_call': tui.printToolCall(ev.name, ev.args); break
+        case 'permission':
+          tui.printNotice(`${ev.allowed ? '审批通过' : '审批拒绝'} ${ev.name}: ${ev.reason}`)
+          break
+        case 'tool_result': tui.printToolResult(ev.name, ev.result); break
+        case 'hook_notice':
+          if (ev.level === 'error') tui.printError(ev.message)
+          else tui.printNotice(ev.message)
+          break
+        case 'turn_end':
+          // 收尾:把流式文本换成排好版的 markdown
+          tui.finishTurn()
+          if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
+          if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
+          if (ev.stopReason === 'error') tui.printError('[执行出错]')
+          break
+      }
+    }
+  }
+
+  // 监视器报告不是任何一次工具调用的结果——那次调用早就返回了。
+  // 所以它只能作为一条 user 消息塞回上下文,并单独开一轮。
+  // 忙的时候排队,空闲的时候再送。
+  const monitorReports: string[] = []
+  let monitorRoundRunning = false
+
+  const pumpMonitorReports = async (): Promise<void> => {
+    // 会话要结束了就不再开新回合,排队的报告直接丢(退出路径会记日志)
+    if (monitorRoundRunning || roundRunning || inputClosed) return
+    const report = monitorReports.shift()
+    if (!report) return
+
+    monitorRoundRunning = true
+    roundRunning = true
+    tui.setBusy(true)
+    const ctrl = new AbortController()
+    tui.onAbort(() => ctrl.abort())
+    try {
+      context.messages.push({ role: 'user', content: report })
+      await runAgentTurn(ctrl)
+      await sessionStore.sync(context.messages)
+    } catch (error) {
+      logger.error({ errorMessage: (error as Error).message }, '监视器报告回合失败')
+      tui.printError((error as Error).message)
+    } finally {
+      monitorRoundRunning = false
+      roundRunning = false
+      tui.setBusy(false)
+    }
+    // 监视器回合期间用户敲的行被拦在队列里,这时候没有 runInput 在跑,
+    // 不主动取走的话它会一直卡着,直到用户再敲一次。
+    const held = tui.takeNextHeldLine()
+    if (held !== undefined) {
+      void runInput(held)
+      return
+    }
+    // 这一轮里可能又攒了报告
+    if (monitorReports.length > 0) void pumpMonitorReports()
+  }
+
+  // 会话结束:监视器全部取消,排队的报告丢掉。
+  // 不在这里再跑一轮——用户已经看不着了,而且新回合还可能再起监视器。
+  const discardPendingMonitorReports = (): void => {
+    if (monitorReports.length > 0) {
+      logger.info({ pendingReports: monitorReports.length }, '会话结束,未送达的监视器报告已丢弃')
+      monitorReports.length = 0
+    }
+  }
+
+  deliverMonitorReport = (text: string): void => {
+    monitorReports.push(text)
+    void pumpMonitorReports()
+  }
 
   // 每轮：用户输入 → 斜杠命令 or runAgent → 事件转发到 TUI → 持久化。
   // 回合进行中到达的后续行先排队。提问会把其中一行当成回答，
@@ -536,8 +727,20 @@ async function main() {
       pending = undefined
       roundRunning = true
       try {
-        // 斜杠命令在本地执行,不发给模型
-        const commandResult = await commandRegistry.execute(text)
+        // 提示模板先匹配:模板命令的正文展开后当用户消息发出去,
+        // 不走本地命令表。模板正文里带 / 开头也不会被当成命令。
+        const templateMatch = matchPromptTemplate(usableTemplates, text)
+        const effectiveText = templateMatch
+          ? expandPromptTemplate(templateMatch.template.body, templateMatch.argument)
+          : text
+        if (templateMatch) {
+          logger.info({ template: templateMatch.template.name }, '提示模板已展开')
+        }
+
+        // 斜杠命令在本地执行,不发给模型。模板命令不在命令表里,直接进模型。
+        const commandResult = templateMatch
+          ? null
+          : await commandRegistry.execute(effectiveText)
         if (commandResult !== null) {
           if (commandResult) tui.printNotice(commandResult)
         } else {
@@ -545,7 +748,10 @@ async function main() {
           const ctrl = new AbortController()
           tui.onAbort(() => ctrl.abort())
 
-          const promptEffect = await hookRunner.run({ event: 'UserPromptSubmit', prompt: text }, ctrl.signal)
+          const promptEffect = await hookRunner.run(
+            { event: 'UserPromptSubmit', prompt: effectiveText },
+            ctrl.signal,
+          )
           for (const message of promptEffect.systemMessages) tui.printNotice(message)
           for (const errorMessage of promptEffect.errors) tui.printError(errorMessage)
           if (promptEffect.aborted || ctrl.signal.aborted) {
@@ -555,37 +761,23 @@ async function main() {
           } else {
             context.messages.push({
               role: 'user',
-              content: appendHookContext(text, promptEffect.additionalContext),
+              content: appendHookContext(effectiveText, promptEffect.additionalContext),
             })
 
-            for await (const ev of runAgent(model, context, tools, ctrl.signal, {
+            // 标题交给小模型,和主力模型的这一轮叠在一起跑,不挡回复。
+            const titleTask = ensureSessionTitle({
+              store: sessionStore,
+              model: models.small,
+              userText: text,
+              signal: ctrl.signal,
               transport,
               logger,
-              toolExecution: config.ToolExecution,
-              compaction: {
-                contextWindow: config.ContextWindow,
-                reserveTokens: config.CompactReserveTokens,
-                keepRecentTokens: config.CompactKeepRecentTokens,
-              },
-              hooks: hookRunner,
-            })) {
-              switch (ev.type) {
-                case 'assistant_text': tui.printText(ev.delta); break
-                case 'tool_call': tui.printToolCall(ev.name, ev.args); break
-                case 'tool_result': tui.printToolResult(ev.name, ev.result); break
-                case 'hook_notice':
-                  if (ev.level === 'error') tui.printError(ev.message)
-                  else tui.printNotice(ev.message)
-                  break
-                case 'turn_end':
-                  // 收尾:把流式文本换成排好版的 markdown
-                  tui.finishTurn()
-                  if (ev.stopReason === 'max_tokens') tui.printNotice('[输出被 max_tokens 截断]')
-                  if (ev.stopReason === 'aborted') tui.printNotice('[已打断]')
-                  if (ev.stopReason === 'error') tui.printError('[执行出错]')
-                  break
-              }
-            }
+            })
+
+            await runAgentTurn(ctrl)
+
+            const title = await titleTask
+            if (title) tui.printNotice(`会话标题: ${title}`)
 
             await sessionStore.sync(context.messages)
           }
@@ -604,16 +796,28 @@ async function main() {
     // 输入已经读完且排队的行都跑完了,这才是能退的时候。
     // SessionEnd 要先跑完,不能在 exit 事件里 await。
     if (inputClosed) {
+      // 定时器和后台命令都不该活到会话之外
+      monitors.cancelAll()
+      discardPendingMonitorReports()
       await shutdown()
-      process.exit(0)
+      // 不直接 process.exit:此时可能还有 HTTP socket 正在关闭,
+      // 硬退会撞上 libuv 的 UV_HANDLE_CLOSING 断言(Windows 上尤其明显)。
+      // 交给事件循环自己排空,没有存活句柄时进程自然结束。
+      process.exitCode = 0
+      return
     }
+    // 交互模式:用户暂时没有新输入,把等待中的监视器报告送出去
+    void pumpMonitorReports()
   }
 
   tui.bindSubmit((text) => {
     void runInput(text)
   })
 
-  tui.printHeader('GrassAgent 已启动。输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。')
+  tui.printHeader(
+    `GrassAgent 已启动。对话 ${models.primary.model}，标题和压缩 ${models.small.model}，审批 ${models.approval.model}。` +
+      '输入内容后回车，Ctrl+C 打断当前回合。需要你决定时会停下来提问。',
+  )
   if (instructionNotice) tui.printNotice(instructionNotice)
   for (const message of skillNotices) tui.printNotice(message)
   for (const message of sessionNotices) tui.printNotice(message)

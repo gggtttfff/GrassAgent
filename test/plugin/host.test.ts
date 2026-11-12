@@ -71,7 +71,7 @@ test('同名工具在启动时失败,技能评估默认不进工具表', () => {
   assert.equal(withEval.contributedTools().includes('grass.rsi'), false)
   assertToolNames(
     host,
-    ['read_file', 'write_file', 'edit', 'edit_batch', 'run_bash', 'ask_user'],
+    ['read_file', 'write_file', 'edit', 'edit_batch', 'run_bash', 'monitor', 'ask_user'],
     ['load_skill'],
   )
 })

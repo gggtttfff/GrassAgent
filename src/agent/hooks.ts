@@ -35,6 +35,22 @@ export const HOOK_EVENTS = [
 
 export type HookEventName = (typeof HOOK_EVENTS)[number]
 
+/**
+ * 一个路径的解析结果。
+ *
+ * requested 是模型给的那份(通常是相对路径),
+ * real 是解析符号链接之后的真实路径,
+ * insideWorkspace 是它是否落在工作区内。
+ *
+ * 钩子要判断「不许写某个目录」时,用 real 比对最准——
+ * 只看 requested 的话,软链指向外面就绕过去了。
+ */
+export interface ResolvedHookPath {
+  requested: string
+  real: string
+  insideWorkspace: boolean
+}
+
 /** 交给钩子的输入。字段用蛇形,和命令脚本看到的 JSON 一致。 */
 export interface HookInput {
   hook_event_name: HookEventName
@@ -47,6 +63,22 @@ export interface HookInput {
   prompt?: string
   error?: string
   message_count?: number
+  /**
+   * Stop 事件专用:本回合是不是已经被 Stop 钩子拉回来过。
+   * 钩子据此判断自己该不该继续要求继续——否则会写出一个自己把自己
+   * 永远叫不醒的循环。
+   */
+  stop_hook_active?: boolean
+  /**
+   * Stop 事件专用:本回合里实际写过的文件路径。
+   * 「有改动才验收」这类判断不用再自己去查 git。
+   */
+  changed_files?: string[]
+  /**
+   * PreToolUse 事件专用:工具参数里路径字段的解析结果。
+   * 钩子不用自己写 realpath,也不会漏掉软链那一层。
+   */
+  resolved_paths?: ResolvedHookPath[]
 }
 
 /** agent 和 cli 发起一次钩子调用时带的字段。蛇形转换在 runner 里做。 */
@@ -59,6 +91,12 @@ export interface HookRequest {
   prompt?: string
   error?: string
   messageCount?: number
+  /** Stop 事件专用:本回合是否已被拉回过。 */
+  stopHookActive?: boolean
+  /** Stop 事件专用:本回合写过的文件路径。 */
+  changedFiles?: string[]
+  /** PreToolUse 事件专用:路径参数解析后的真实路径。 */
+  resolvedPaths?: ResolvedHookPath[]
 }
 
 /**
@@ -247,6 +285,9 @@ function toHookInput(request: HookRequest, options: HookRunnerOptions): HookInpu
   if (request.prompt !== undefined) input.prompt = request.prompt
   if (request.error !== undefined) input.error = request.error
   if (request.messageCount !== undefined) input.message_count = request.messageCount
+  if (request.stopHookActive !== undefined) input.stop_hook_active = request.stopHookActive
+  if (request.changedFiles !== undefined) input.changed_files = request.changedFiles
+  if (request.resolvedPaths !== undefined) input.resolved_paths = request.resolvedPaths
   return input
 }
 

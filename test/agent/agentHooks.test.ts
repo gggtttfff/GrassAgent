@@ -1,8 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import * as path from 'node:path'
 import { runAgent, type AgentTool, type AgentEvent } from '../../src/agent/agent.ts'
-import { createHookRunner, type HookHandler } from '../../src/agent/hooks.ts'
+import { createHookRunner, type HookHandler, type ResolvedHookPath } from '../../src/agent/hooks.ts'
 import type { Model, Context } from '../../src/llm/llm.ts'
 import type { Message } from '../../src/llm/messages.ts'
 
@@ -309,6 +312,142 @@ test('Stop 钩子可以把回合拉回来,并受次数上限约束', async () =>
       message.role === 'user' && typeof message.content === 'string' && message.content.includes('还没做完')
     ))
     assert.ok(hookMessage)
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('Stop 钩子能拿到 stop_hook_active 和 changed_files', async () => {
+  const mock = await startMockServer([
+    {
+      status: 200,
+      body: body([
+        toolCallFrame(0, 'call_1', 'write_tool', JSON.stringify({ path: 'src/a.ts' })),
+        finishFrame('tool_calls'),
+      ]),
+    },
+    { status: 200, body: body([textFrame('写完了'), finishFrame('stop')]) },
+  ])
+  try {
+    const observed: { stopHookActive?: boolean; changedFiles?: string[] }[] = []
+    const hooks = createHookRunner([
+      {
+        event: 'Stop',
+        handler: (input) => {
+          observed.push({ stopHookActive: input.stop_hook_active, changedFiles: input.changed_files })
+          return {}
+        },
+      },
+    ], { sessionId: 's', cwd: process.cwd(), defaultTimeoutMs: 1000 })
+
+    const writeTool: AgentTool = {
+      name: 'write_tool',
+      description: '写文件',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+      mutatesFiles: ['path'],
+      execute: async () => 'ok',
+    }
+
+    const context: Context = { messages: [{ role: 'user', content: '写一下' }] }
+    await collect(runAgent(modelAt(mock.port), context, [writeTool], undefined, { hooks }))
+
+    assert.equal(observed.length, 1)
+    // 第一次被叫醒时还没拉回过
+    assert.equal(observed[0]?.stopHookActive, false)
+    assert.deepEqual(observed[0]?.changedFiles, ['src/a.ts'])
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('Stop 钩子被拉回过时 stop_hook_active 为 true', async () => {
+  const mock = await startMockServer([
+    { status: 200, body: body([textFrame('第一次'), finishFrame('stop')]) },
+    { status: 200, body: body([textFrame('第二次'), finishFrame('stop')]) },
+    { status: 200, body: body([textFrame('第三次'), finishFrame('stop')]) },
+  ])
+  try {
+    const observed: boolean[] = []
+    const hooks = createHookRunner([
+      {
+        event: 'Stop',
+        handler: (input) => {
+          observed.push(input.stop_hook_active === true)
+          return { decision: 'block', reason: '还没做完' }
+        },
+      },
+    ], { sessionId: 's', cwd: process.cwd(), defaultTimeoutMs: 1000 })
+
+    const context: Context = { messages: [{ role: 'user', content: '继续' }] }
+    await collect(runAgent(modelAt(mock.port), context, [], undefined, {
+      hooks,
+      // 两次就够:第一次拉回后第二次钩子看到 active=true,
+      // 再拉回一次达到上限,回合结束。
+      maxStopContinuations: 2,
+    }))
+
+    assert.deepEqual(observed, [false, true])
+  } finally {
+    await stopMockServer(mock.server)
+  }
+})
+
+test('PreToolUse 能拿到解析后的真实路径', async () => {
+  const mock = await startMockServer([
+    {
+      status: 200,
+      body: body([
+        toolCallFrame(0, 'call_1', 'write_tool', JSON.stringify({ path: 'src/a.ts' })),
+        finishFrame('tool_calls'),
+      ]),
+    },
+    { status: 200, body: body([textFrame('好'), finishFrame('stop')]) },
+  ])
+  try {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'grass-hook-paths-'))
+    try {
+      const observed: ResolvedHookPath[][] = []
+      const hooks = createHookRunner([
+        {
+          event: 'PreToolUse',
+          handler: (input) => {
+            observed.push(input.resolved_paths ?? [])
+            return {}
+          },
+        },
+      ], { sessionId: 's', cwd: workspace, defaultTimeoutMs: 1000 })
+
+      const writeTool: AgentTool = {
+        name: 'write_tool',
+        description: '写文件',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+        mutatesFiles: ['path'],
+        execute: async () => 'ok',
+      }
+
+      const context: Context = { messages: [{ role: 'user', content: '写一下' }] }
+      await collect(runAgent(modelAt(mock.port), context, [writeTool], undefined, {
+        hooks,
+        workspaceRoot: workspace,
+      }))
+
+      assert.equal(observed.length, 1)
+      const paths = observed[0] ?? []
+      assert.equal(paths.length, 1)
+      assert.equal(paths[0]?.requested, 'src/a.ts')
+      assert.equal(paths[0]?.insideWorkspace, true)
+      assert.ok(paths[0]?.real.includes('src'), `真实路径应该带相对部分,实际: ${paths[0]?.real}`)
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
   } finally {
     await stopMockServer(mock.server)
   }

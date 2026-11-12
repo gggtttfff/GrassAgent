@@ -89,8 +89,9 @@ export function createSessionCommands(deps: SessionCommandDeps): SlashCommand[] 
         const sessions = deps.session.listSessionDetails()
         if (sessions.length === 0) return '还没有任何会话'
         return sessions.map((session) => {
-          const marker = session.id === deps.session.sessionId ? '*' : ' '
-          return `${marker} ${session.id}  (${session.messageCount} 条消息)`
+        const marker = session.id === deps.session.sessionId ? '*' : ' '
+        const title = session.title ? `${session.title} · ` : ''
+        return `${marker} ${title}${session.id}  (${session.messageCount} 条消息)`
         }).join('\n')
       },
     },
