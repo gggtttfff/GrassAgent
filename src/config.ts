@@ -175,8 +175,8 @@ export const configSchema = z.object({
   }).default('ask'),
 
   // facing 是面对用户的会话,带 ask_user。cloud 是另一块沙盒上的会话,不带 ask_user。
-  SessionProfile: z.enum(['facing', 'cloud'], {
-    error: 'SessionProfile 只能是 facing 或 cloud',
+  SessionProfile: z.enum(['facing', 'cloud', 'router'], {
+    error: 'SessionProfile 只能是 facing、cloud 或 router',
   }).default('facing'),
   CloudSessionDirectory: z.string().min(1, { error: 'CloudSessionDirectory 不能为空' })
     .default(() => path.join(os.homedir(), '.grassagent', 'cloud-sessions')),

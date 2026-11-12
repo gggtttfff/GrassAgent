@@ -77,8 +77,41 @@ export const BUILTIN_COMMANDS = [
  */
 export function registerBuiltinPlugins(host: PluginHost, options: {
   skillEval: boolean
-  profile?: 'facing' | 'cloud'
+  profile?: 'facing' | 'cloud' | 'router'
 }): void {
+  if (options.profile === 'router') {
+    host.register({
+      id: 'grass.router.dispatch',
+      version: '1.0.0',
+      api: 1,
+      plane: 'host',
+      order: 100,
+      failure: 'isolate',
+      capabilities: ['ui.notice'],
+      contributes: { tools: ['dispatch_worker'] },
+    })
+    host.register({
+      id: 'grass.router.recall',
+      version: '1.0.0',
+      api: 1,
+      plane: 'host',
+      order: 101,
+      failure: 'isolate',
+      capabilities: ['session.read'],
+      contributes: { tools: ['recall_worker'] },
+    })
+    host.register({
+      id: 'grass.tools.ask-user',
+      version: '1.0.0',
+      api: 1,
+      plane: 'host',
+      order: 120,
+      failure: 'isolate',
+      capabilities: ['ui.ask'],
+      contributes: { tools: ['ask_user'] },
+    })
+    return
+  }
   host.register({
     id: 'grass.tools.files',
     version: '1.0.0',
