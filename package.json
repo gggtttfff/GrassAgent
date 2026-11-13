@@ -1,6 +1,6 @@
 {
   "name": "grassagent",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "跑在终端里的 AI Agent：可流式、能读写文件与执行命令，支持本地、容器与远程沙盒",
   "type": "module",
   "main": "dist/cli.js",
@@ -16,7 +16,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/gggtttfff/GrassAgent"
+    "url": "git+https://github.com/gggtttfff/GrassAgent.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "keywords": [
     "ai",

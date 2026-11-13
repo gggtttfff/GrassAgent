@@ -9,30 +9,29 @@ on:
 
 permissions:
   contents: read
-  id-token: write # 配好 Trusted Publisher 后走 OIDC，不再需要长期 token
+  id-token: write # Trusted Publisher 走 OIDC 的必需权限,没有它换不到发布令牌
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      # secrets 不能直接写进 if，先落到 env；删掉 NPM_TOKEN secret 就自动切到 OIDC
-      NPM_TOKEN_VALUE: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      # 用 v7:它不再写 always-auth(已在 npm 11 移除),也不再往环境里塞
+      # XXXX-XXXXX 占位符。没有占位符,setup-node 写的认证行展开后是字面量,
+      # npm 认得出「没配真 token」,才会老老实实走 OIDC 交换。
+      - uses: actions/setup-node@v7
         with:
-          # node:sqlite 和 type stripping 都要 Node 24+；registry-url 会生成带 NODE_AUTH_TOKEN 的 .npmrc
+          # node:sqlite 和 type stripping 都要 Node 24+
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           cache: 'npm'
 
-      # token 首发不走 OIDC，只有 Trusted Publisher 那条路才对 npm 版本有要求
+      # npm 11.5.1 起才有 OIDC 发布。版本低于它时 npm publish 只报误导性的
+      # 404,不提示版本问题,所以在这里先升好。
       - name: 确保 npm 支持 OIDC
-        if: ${{ env.NPM_TOKEN_VALUE == '' }}
         run: |
-          # 版本低于 11.5.1 时 npm publish 只会报误导性的 404，不提示版本问题
           current="$(npm --version)"
           if [ "$(printf '%s\n' 11.5.1 "$current" | sort -V | head -n 1)" != "11.5.1" ]; then
             npm install -g npm@^11
@@ -79,21 +78,12 @@ jobs:
             console.log('发布包校验通过，共 ' + paths.size + ' 个文件');
           "
 
-      # 首发时包还不存在，npm 不给不存在的包配 Trusted Publisher，只能用 token 发一次。
-      # 配好 Trusted Publisher 后删掉 NPM_TOKEN secret，就自动走 OIDC，代码不用改。
-      - name: 发布到 npm（OIDC）
-        if: ${{ env.NPM_TOKEN_VALUE == '' }}
-        # 绝不能设 NODE_AUTH_TOKEN，连空值都会让 npm 放弃 OIDC 交换
-        run: npm publish --access public --registry=https://registry.npmjs.org
-
-      - name: 发布到 npm（token，仅首次发布）
-        if: ${{ env.NPM_TOKEN_VALUE != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          # prepublishOnly 会再编译一次；dist/ 在 .gitignore 里，不能指望 checkout 带下来
-          # 显式指定 registry，避免环境里的镜像配置把包发到别处
-          npm publish --access public --registry=https://registry.npmjs.org
+      # 认证由 Trusted Publisher 负责:GitHub 签发短期 OIDC 令牌,npm 用它换发布令牌。
+      # 这里绝不能设 NODE_AUTH_TOKEN——哪怕是空值,npm 也会当成「已配凭据」而跳过交换。
+      # provenance 显式打开:官方说托管发布会自动带,但那依赖 npm 从令牌里推断,
+      # 推断失败时只有 warn,包照样发出去却没有溯源证明。写明更可靠。
+      - name: 发布到 npm
+        run: npm publish --access public --provenance --registry=https://registry.npmjs.org
 
       - name: 确认版本已在 npm 可见
         run: |

@@ -709,6 +709,8 @@ git push origin v0.3.0
 
 ### 首次发布：Granular Access Token
 
+> 这条路只用于**包还不存在**时的第一次发布。本项目已经发过（npm 上已有 `grassagent`），日常发版走下面的 Trusted Publishing，不用再配 token。
+
 npm 在 2025-12-09 永久撤销了 classic token（老教程里的 Automation token 也在内），网页上已经没这个选项。现在到 npmjs.com → Access Tokens → Generate New Token → **Granular Access Token**，把生成的 token 存进仓库 Settings → Secrets and variables → Actions，名字 `NPM_TOKEN`：
 
 - **Bypass two-factor authentication 必须勾**。npm 现在要求所有包发布都过 2FA 或带 bypass 的 token，CI 里没法交互输验证码，不勾会卡在 2FA 上失败。账户本身建议开启 2FA，两者不冲突——勾了这个选项的 token 会绕过账户级和包级的 2FA 要求。
@@ -722,10 +724,27 @@ npm 在 2025-12-09 永久撤销了 classic token（老教程里的 Automation to
 不需要任何长期 token，也绕开 2FA 交互，发布自动附带 provenance。但 npm 不给还不存在的包配 Trusted Publisher，所以要先用上面的 token 发一次，让包存在，然后：
 
 1. npmjs.com → `grassagent` → Settings → Trusted Publisher → GitHub Actions：owner `gggtttfff`、repo `GrassAgent`、workflow filename `publish.yml`、environment 留空、Allowed actions 勾 **`npm publish`**（2026-09-03 之后新建的配置默认只允许 stage）。
-2. 删掉仓库里的 `NPM_TOKEN` secret。工作流检测到 secret 为空就自动走 OIDC，代码不用改，`id-token: write` 权限已经加好。
+2. 删掉仓库里的 `NPM_TOKEN` secret。工作流已经只剩 OIDC 一条路，不需要 token。
 3. 配置要在 **2 天内**完成一次成功发布，否则过期得删掉重建。首个 OIDC 发布建议用推 tag 触发，别用手动触发（OIDC 校验的是调用方工作流名）。
 
-`package.json` 的 `repository.url` 要与 GitHub 仓库地址精确匹配，否则 provenance 校验会报 422。
+`package.json` 的 `repository.url` 要与 GitHub 仓库地址精确匹配，否则 provenance 校验会报 422。写成 `git+https://github.com/gggtttfff/GrassAgent.git` 最稳——注册中心是按字节比对包元数据与 provenance 里的仓库地址的。
+
+#### 三个容易踩的坑
+
+**`setup-node` 必须是 v7。** v4 会往环境里塞一个 `NODE_AUTH_TOKEN=XXXXX-XXXXX-XXXXX-XXXXX` 占位符，npm 认得出这是假 token 时未必会跳过 OIDC（实测 npm 11.21.2 仍会正常发起交换），但这行 `always-auth=true` 在 npm 11 已是未知配置项、npm 12 会移除。v7 不写 `always-auth`，也不注入占位符，只在你显式提供 token 时才导出 `NODE_AUTH_TOKEN`——干净。
+
+**发布步骤绝不能设 `NODE_AUTH_TOKEN`，连空值都不行。** npm 把「配了凭据」当成「不需要 OIDC 交换」，哪怕值是空的也会跳过交换，然后报一个完全看不出原因的 `ENEEDAUTH` 或 404。
+
+**`--provenance` 要显式写。** 官方说托管发布会自动带，但那依赖 npm 从 OIDC 令牌里推断仓库可见性，推断失败时只有一条 warn，包照样发出去却没有溯源证明。`publishConfig.provenance` 也已设为 `true` 兜底。
+
+#### 出错了怎么查
+
+| 报错 | 原因 |
+| --- | --- |
+| `ENEEDAUTH` | 没给 `id-token: write`、npm 低于 11.5.1、或工作流文件名和 Trusted Publisher 上的不一致（区分大小写，含 `.yml`） |
+| `404 Not Found` PUT | 同上，或 environment 配了但工作流里没有，或还在用旧 token |
+| `E422` 校验仓库信息失败 | `package.json` 的 `repository.url` 与注册中心比对的不一致 |
+| 包发出去了但没有 provenance | 检查 `npm view grassagent@<version> dist.attestations`，空的就是没带上 |
 
 ### 校验
 
