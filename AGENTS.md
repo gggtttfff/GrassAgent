@@ -165,3 +165,10 @@ Conventional Commits，中文描述：
 
 type 取 feat / fix / docs / style / refactor / perf / test / build / ci / chore / revert。
 可以本地提交，推送必须经用户同意。禁用 `git checkout`，禁止任何破坏 git 历史的命令。
+
+## 发布约定
+
+- 版本号提到目标版本 → 提交 → 打附注 tag（`git tag -a v0.3.1 -m "..."`）→ 推 tag，工作流自动发 npm
+- GitHub Release 标题固定 `grassagent v版本号`（如 `grassagent v0.3.1`），**不要往标题里加描述性文字**；改动摘要写进 notes
+- Release 不由 CI 创建，要手建：`gh release create v0.3.1 --title "grassagent v0.3.1" --notes "..."`
+- 发布走 Trusted Publisher（OIDC），仓库里不保留 `NPM_TOKEN`；详见 README 的「发布」章节

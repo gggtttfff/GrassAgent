@@ -707,6 +707,14 @@ git push origin v0.3.0
 
 也可以在 GitHub Actions 页面手动运行 **Publish to npm**（`workflow_dispatch`），发布当前 `package.json` 的版本。
 
+npm 上的包发出去后，再建对应的 GitHub Release：
+
+```bash
+gh release create v0.3.1 --title "grassagent v0.3.1" --notes "..."
+```
+
+标题固定用 `grassagent v版本号`，不要往里塞描述性文字——版本号和改动摘要各归各位，改动摘要写进 notes。
+
 ### 首次发布：Granular Access Token
 
 > 这条路只用于**包还不存在**时的第一次发布。本项目已经发过（npm 上已有 `grassagent`），日常发版走下面的 Trusted Publishing，不用再配 token。
