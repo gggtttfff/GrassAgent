@@ -38,6 +38,7 @@ import { assertToolNames, createPluginHost, registerBuiltinPlugins } from './plu
 import { createSessionPort } from './plugin/ports.ts'
 import { createSessionCommands } from './plugin/sessionCommands.ts'
 import { createHandoffTool, answerCloudHandoff, bindCloudSandbox, enqueueCloudSession, readCloudSession } from './plugin/cloudSession.ts'
+import { createRouterTools } from './plugin/router.ts'
 import { loadWorkspacePlugins } from './plugin/workspacePlugins.ts'
 import {
   DangerousCommandsError,
@@ -151,7 +152,12 @@ async function main() {
   if (config.SandboxMode === 'danger-full-access') {
     logger.warn({ sandboxMode: config.SandboxMode }, '以全权限模式启动,工作区边界不再拦截')
   }
-  let world: ExecutionWorld
+  const isRouter = config.SessionProfile === 'router'
+  let world: ExecutionWorld | undefined
+  if (isRouter) {
+    logger.info({ sessionId }, '路由会话不打开执行世界')
+    modeSection = '路由会话不执行文件和命令。任务派给各自的 worker 会话。'
+  } else {
   try {
     world = await openExecutionWorld(config, {
       sessionId,
@@ -178,7 +184,7 @@ async function main() {
   if (config.SessionProfile === 'cloud') {
     if (!world.sandboxId) {
       console.error('[grassagent] 云端会话必须有远程沙盒,不改绑本机')
-      await world.close()
+      await world?.close()
       sessionStore.close()
       tui.stop()
       process.exit(1)
@@ -191,7 +197,7 @@ async function main() {
       })
     } catch (error) {
       console.error(`[grassagent] ${(error as Error).message}`)
-      await world.close()
+      await world?.close()
       sessionStore.close()
       tui.stop()
       process.exit(1)
@@ -200,6 +206,7 @@ async function main() {
   // 模式段跟着世界走。切换时由 modeSwitcher 的 onChanged 更新。
   modeSection = formatModeSection(world.policy.mode)
   tui.setMode(world.policy.mode)
+  }
 
   // 技能:正文不进系统提示词,只列名字和描述,模型要做这件事时用 load_skill 取全文。
   // 技能从执行世界里读,远程时读的是沙盒里的文件,不是本机那份。
@@ -208,14 +215,19 @@ async function main() {
   let skillCatalog: SkillCatalog | undefined
   let skillReport = '技能加载已关闭'
   const skillNotices: string[] = []
-  const scannedSkills = await loadSkillSection({ config, world, logger })
-  skillSection = scannedSkills.skillSection
-  skillReport = scannedSkills.skillReport
-  skills = scannedSkills.skills
-  skillCatalog = scannedSkills.skillCatalog
-  skillNotices.push(...scannedSkills.skillNotices)
+  if (world) {
+    const scannedSkills = await loadSkillSection({ config, world, logger })
+    skillSection = scannedSkills.skillSection
+    skillReport = scannedSkills.skillReport
+    skills = scannedSkills.skills
+    skillCatalog = scannedSkills.skillCatalog
+    skillNotices.push(...scannedSkills.skillNotices)
+  }
 
-  const scanSkills = (): Promise<SkillCatalog> => scanProjectSkills({ config, world, logger })
+  const scanSkills = (): Promise<SkillCatalog> => {
+    if (!world) return Promise.resolve({ skills: [], promptSection: '' })
+    return scanProjectSkills({ config, world, logger })
+  }
 
   const context: Context = {
     systemPrompt: SYSTEM_PROMPT,
@@ -237,16 +249,25 @@ async function main() {
   const approval = createApprovalGate(config.ApproveSkills, () => tui, logger)
 
   // 模式切换。斜杠命令和快捷键共用这一个入口,审批、串行、通知都在里面。
-  const modeSwitcher = createModeSwitcher({
-    world,
-    approval,
-    logger,
-    onChanged: (mode) => {
-      modeSection = formatModeSection(mode)
-      tui.setMode(mode)
-      rebuildSystemPrompt()
-    },
-  })
+  const modeSwitcher = world
+    ? createModeSwitcher({
+      world,
+      approval,
+      logger,
+      onChanged: (mode) => {
+        modeSection = formatModeSection(mode)
+        tui.setMode(mode)
+        rebuildSystemPrompt()
+      },
+    })
+    : {
+      current: (): SandboxMode => 'workspace-write',
+      switchTo: async (): Promise<{ mode: SandboxMode, message: string, changed: boolean }> => ({
+        mode: 'workspace-write',
+        message: '路由会话没有执行世界',
+        changed: false,
+      }),
+    }
 
   // 危险命令规则。读本机工作区的那份——沙盒里的文件模型能改,
   // 规则得是用户这台机器上的配置。
@@ -264,7 +285,7 @@ async function main() {
     if (error instanceof DangerousCommandsError) {
       console.error(`[grassagent] ${error.message}`)
       for (const issue of error.issues) console.error(issue)
-      await world.close()
+      await world?.close()
       sessionStore.close()
       tui.stop()
       process.exit(1)
@@ -275,24 +296,28 @@ async function main() {
   // 监视器:后台命令和定时报告都归它管。真正的投递函数在回合循环建好之后才赋值,
   // 这里先用占位——监视器最早也要等工具被调用之后才会产生报告。
   let deliverMonitorReport: (text: string) => void = () => {}
-  const monitors = createMonitorRegistry({
-    world,
-    workspaceRoot: world.workspaceRoot,
-    logger,
-    report: (text) => deliverMonitorReport(text),
-  })
-
-  // 工具的文件访问被限制在这个世界里。
-  // ask_user 不碰文件，它只是把「问用户」交给终端，所以单独接在后面。
-  const fileTools = await builtinTools({
-    world,
-    commandTimeoutMs: config.CommandTimeoutMs,
-    skills,
-    approval,
-    dangerousCommands,
-    dangerousCommandsPath,
-    monitors,
-  })
+  let fileTools: Awaited<ReturnType<typeof builtinTools>> = []
+  let monitors: { cancelAll: () => void }
+  if (world) {
+    const registry = createMonitorRegistry({
+      world,
+      workspaceRoot: world.workspaceRoot,
+      logger,
+      report: (text) => deliverMonitorReport(text),
+    })
+    monitors = registry
+    fileTools = await builtinTools({
+      world,
+      commandTimeoutMs: config.CommandTimeoutMs,
+      skills,
+      approval,
+      dangerousCommands,
+      dangerousCommandsPath,
+      monitors: registry,
+    })
+  } else {
+    monitors = { cancelAll() {} }
+  }
 
   // 钩子配置。默认文件可以不存在;写了但格式不对要在启动时失败。
   const hooksPath = config.HooksPath ?? defaultHooksFilePath(config.Workspace)
@@ -312,7 +337,7 @@ async function main() {
     if (error instanceof HookConfigError) {
       console.error(`[grassagent] ${error.message}`)
       for (const issue of error.issues) console.error(issue)
-      await world.close()
+      await world?.close()
       sessionStore.close()
       tui.stop()
       process.exit(1)
@@ -324,7 +349,7 @@ async function main() {
   if (sessionStart.blocked || sessionStart.preventContinuation) {
     console.error(`[grassagent] 会话被钩子拒绝: ${sessionStart.reason ?? 'Blocked by hook'}`)
     for (const message of sessionStart.systemMessages) console.error(`[grassagent] ${message}`)
-    await world.close()
+    await world?.close()
     sessionStore.close()
     tui.stop()
     process.exit(1)
@@ -338,22 +363,28 @@ async function main() {
   let sessionStarted = true
   const sessionNotices = sessionStart.systemMessages
 
+  const askUserTool = createAskUserTool({
+    ask: (question, signal) => tui.ask(question, signal),
+    logger,
+  })
   const tools = config.SessionProfile === 'cloud'
     ? [
       ...fileTools,
       createHandoffTool({
         directory: config.CloudSessionDirectory,
         sessionId,
-        sandboxId: world.sandboxId ?? '',
+        sandboxId: world?.sandboxId ?? '',
       }),
     ]
-    : [
-      ...fileTools,
-      createAskUserTool({
-        ask: (question, signal) => tui.ask(question, signal),
-        logger,
-      }),
-    ]
+    : config.SessionProfile === 'router'
+      ? [
+        ...createRouterTools({ directory: config.CloudSessionDirectory }),
+        askUserTool,
+      ]
+      : [
+        ...fileTools,
+        askUserTool,
+      ]
   try {
     const pluginHost = createPluginHost()
     registerBuiltinPlugins(pluginHost, {
@@ -384,7 +415,7 @@ async function main() {
   } catch (error) {
     if (error instanceof PluginError) {
       console.error(`[grassagent] ${error.message}`)
-      await world.close()
+      await world?.close()
       sessionStore.close()
       tui.stop()
       process.exit(1)
@@ -416,9 +447,9 @@ async function main() {
       }
     }
     try {
-      await world.close()
+      await world?.close()
     } catch (error) {
-      logger.error({ errorMessage: (error as Error).message, sandboxId: world.sandboxId }, '释放执行世界失败')
+      logger.error({ errorMessage: (error as Error).message, sandboxId: world?.sandboxId }, '释放执行世界失败')
     }
     cleanupSync()
   }
@@ -667,7 +698,7 @@ async function main() {
       // 本机解析出来的结论是错的。全权限模式没有边界,
       // 报 insideWorkspace=false 反而会误导钩子。
       workspaceRoot: config.ExecutionWorld === 'remote'
-        || world.policy.mode === 'danger-full-access'
+        || world?.policy.mode === 'danger-full-access'
         ? undefined
         : config.Workspace,
     })) {
