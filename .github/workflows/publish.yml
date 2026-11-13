@@ -94,3 +94,21 @@ jobs:
           # prepublishOnly 会再编译一次；dist/ 在 .gitignore 里，不能指望 checkout 带下来
           # 显式指定 registry，避免环境里的镜像配置把包发到别处
           npm publish --access public --registry=https://registry.npmjs.org
+
+      - name: 确认版本已在 npm 可见
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          # 首次发布有约 5 分钟的异步处理窗口：CLI 会打印 + pkg@version，registry 却只有 0.0.0-stage 占位包。
+          # 立刻查会误报失败，所以轮询到真正可安装为止；超时才判失败，别让工作流假成功。
+          for attempt in $(seq 1 30); do
+            if npm view "grassagent@$version" version --registry=https://registry.npmjs.org > /dev/null 2>&1; then
+              echo "grassagent@$version 已可从 npm 安装（第 $attempt 次检查）"
+              exit 0
+            fi
+            echo "尚未可见，20 秒后重试（$attempt/30）"
+            if [ "$attempt" -lt 30 ]; then
+              sleep 20
+            fi
+          done
+          echo "::error::发布后 10 分钟内 grassagent@$version 仍不可见，请检查 npm 的 staged 队列和发布日志"
+          exit 1

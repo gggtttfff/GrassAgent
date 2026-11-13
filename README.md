@@ -689,6 +689,8 @@ npm 在 2025-12-09 永久撤销了 classic token（老教程里的 Automation to
 
 工作流会拦下：tag 与 `package.json` 版本不一致、该版本已发过、包里没有 `dist/cli.js` 或它丢了 shebang。`dist/` 在 `.gitignore` 里，checkout 带不下来，所以靠 `prepublishOnly` 在发布前编译，`files` 白名单负责把编译产物打进包（白名单优先于 `.gitignore`）。手动 `npm publish` 走的是同一套编译。
 
+发布命令返回后还会轮询最多 10 分钟（每 20 秒一次），确认 `npm view grassagent@<version>` 能查到才判成功。首次发布存在约 5 分钟的异步窗口：CLI 已经打印 `+ grassagent@0.2.0`，registry 上却还只有 `0.0.0-stage` 占位包，此时包是可望不可装的；不做这一步校验就会出现「工作流全绿但装不到」。占位版本会残留在版本列表里，不影响 `latest`。
+
 ## 扩展
 
 ### 加一个新 provider
