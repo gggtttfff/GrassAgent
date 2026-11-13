@@ -2,9 +2,29 @@
 
 > 像小草一样生长 —— 微小却顽强。
 
-一个用来学习「AI Agent 到底怎么跑起来」的骨架。你能读到一个 Agent 的每一块零件：固定的回合循环、SSE 流解析、工具调用、上下文压缩、会话持久化、配置校验、错误重试，以及一块可替换的执行世界。
+一个跑在终端里的 AI Agent。能读文件、改代码、跑命令，能打断、能追问、能记住你是谁，也能把活儿派到本地、容器或远程机器上去做。
 
-不是框架，不打算替你做决定。回合循环是固定的 `runAgent`，插件换不掉它。它是你可以拆、可以改、可以往里长东西的原型。
+回合循环是固定的 `runAgent`，插件换不掉它。这是刻意的：核心流程稳下来之后，你可以在它上面长出自己的东西，而不是反过来被框架牵着走。
+
+## 安装
+
+```bash
+# 需要 Node.js >= 24
+npm install -g grassagent
+
+grassagent
+```
+
+也可以不装，直接用 `npx grassagent`。
+
+装完先配 API key：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入你自己的 key
+```
+
+想跑源码版，clone 下来 `npm install && npm start` 也一样。
 
 ## 特性
 
@@ -124,15 +144,14 @@ e2e-smoke.ts     端到端测试：起本地 mock SSE 服务，覆盖 6 个场�
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
-npm install
-
-# 2. 配置 API
+# 1. 配置 API
 cp .env.example .env
 # 然后编辑 .env 填入你自己的 key
 
-# 3. 启动
-npm start
+# 2. 启动
+grassagent        # 全局安装的
+npx grassagent    # 或者直接跑
+npm start         # 或者从源码跑
 ```
 
 启动后直接输入内容回车即可。模型回复过程中可以按 Ctrl+C 打断当前回合。
@@ -655,7 +674,7 @@ npm run test:all     # 上面三样一起跑
 
 ## 发布
 
-推一个 `v*` tag 就会触发 `.github/workflows/publish.yml`：跑完整测试、校验版本、编译、检查发布包内容，然后发布到 npm。
+推一个 `v*` tag 就会触发 `.github/workflows/publish.yml`：跑完整测试、校验版本、编译、检查发布包内容，发布到 npm，最后轮询确认版本真的可安装。
 
 ```bash
 # 先把 package.json 的 version 改成目标版本并提交
@@ -663,7 +682,7 @@ git tag v0.3.0
 git push origin v0.3.0
 ```
 
-也可以在 GitHub Actions 页面手动运行 **Publish to npm**（`workflow_dispatch`），发布当前 `package.json` 的版本——`v0.2.0` 比这个工作流更早，用它补发首个包不用重打 tag。
+也可以在 GitHub Actions 页面手动运行 **Publish to npm**（`workflow_dispatch`），发布当前 `package.json` 的版本。
 
 ### 首次发布：Granular Access Token
 

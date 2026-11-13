@@ -1,7 +1,7 @@
 {
   "name": "grassagent",
   "version": "0.2.0",
-  "description": "极简 AI Agent 骨架：零依赖、可流式、能读写文件与执行命令",
+  "description": "跑在终端里的 AI Agent：可流式、能读写文件与执行命令，支持本地、容器与远程沙盒",
   "type": "module",
   "main": "dist/cli.js",
   "bin": {
