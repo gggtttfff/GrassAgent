@@ -665,9 +665,29 @@ git push origin v0.3.0
 
 也可以在 GitHub Actions 页面手动运行 **Publish to npm**（`workflow_dispatch`），发布当前 `package.json` 的版本——`v0.2.0` 比这个工作流更早，用它补发首个包不用重打 tag。
 
-**前置条件**：在 npmjs.com 生成 Automation token，加到仓库 Settings → Secrets and variables → Actions，名字叫 `NPM_TOKEN`。首次发布时 `grassagent` 这个包还不存在，Automation token 最省事；发布成功后建议换成只授权这个包的 granular token。
+### 首次发布：Granular Access Token
 
-工作流会拦下：tag 与 `package.json` 版本不一致、该版本已发过、缺 `NPM_TOKEN`、包里没有 `dist/cli.js` 或它丢了 shebang。`dist/` 在 `.gitignore` 里，checkout 带不下来，所以靠 `prepublishOnly` 在发布前编译，`files` 白名单负责把编译产物打进包（白名单优先于 `.gitignore`）。手动 `npm publish` 走的是同一套编译。
+npm 在 2025-12-09 永久撤销了 classic token（老教程里的 Automation token 也在内），网页上已经没这个选项。现在到 npmjs.com → Access Tokens → Generate New Token → **Granular Access Token**，把生成的 token 存进仓库 Settings → Secrets and variables → Actions，名字 `NPM_TOKEN`：
+
+- **Bypass two-factor authentication 必须勾**。npm 现在要求所有包发布都过 2FA 或带 bypass 的 token，CI 里没法交互输验证码，不勾会卡在 2FA 上失败。账户本身建议开启 2FA，两者不冲突——勾了这个选项的 token 会绕过账户级和包级的 2FA 要求。
+- Packages and scopes → `Read and write (publish and stage)`；Select packages 选 `All packages`（包还不存在，下拉里选不到），发布成功后收窄到 `grassagent`。
+- Organizations → `No access`；Expiration 最长 **90 天**，到期前要轮换，否则 CI 会突然认证失败。
+
+带 bypass 2FA 的 token 是过渡方案：npm 计划 2027 年 1 月起取消它直接发布的能力。
+
+### 之后：Trusted Publishing（OIDC）
+
+不需要任何长期 token，也绕开 2FA 交互，发布自动附带 provenance。但 npm 不给还不存在的包配 Trusted Publisher，所以要先用上面的 token 发一次，让包存在，然后：
+
+1. npmjs.com → `grassagent` → Settings → Trusted Publisher → GitHub Actions：owner `gggtttfff`、repo `GrassAgent`、workflow filename `publish.yml`、environment 留空、Allowed actions 勾 **`npm publish`**（2026-09-03 之后新建的配置默认只允许 stage）。
+2. 删掉仓库里的 `NPM_TOKEN` secret。工作流检测到 secret 为空就自动走 OIDC，代码不用改，`id-token: write` 权限已经加好。
+3. 配置要在 **2 天内**完成一次成功发布，否则过期得删掉重建。首个 OIDC 发布建议用推 tag 触发，别用手动触发（OIDC 校验的是调用方工作流名）。
+
+`package.json` 的 `repository.url` 要与 GitHub 仓库地址精确匹配，否则 provenance 校验会报 422。
+
+### 校验
+
+工作流会拦下：tag 与 `package.json` 版本不一致、该版本已发过、包里没有 `dist/cli.js` 或它丢了 shebang。`dist/` 在 `.gitignore` 里，checkout 带不下来，所以靠 `prepublishOnly` 在发布前编译，`files` 白名单负责把编译产物打进包（白名单优先于 `.gitignore`）。手动 `npm publish` 走的是同一套编译。
 
 ## 扩展
 

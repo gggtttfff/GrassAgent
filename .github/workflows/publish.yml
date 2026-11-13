@@ -9,10 +9,14 @@ on:
 
 permissions:
   contents: read
+  id-token: write # 配好 Trusted Publisher 后走 OIDC，不再需要长期 token
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      # secrets 不能直接写进 if，先落到 env；删掉 NPM_TOKEN secret 就自动切到 OIDC
+      NPM_TOKEN_VALUE: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +27,17 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           cache: 'npm'
+
+      # token 首发不走 OIDC，只有 Trusted Publisher 那条路才对 npm 版本有要求
+      - name: 确保 npm 支持 OIDC
+        if: ${{ env.NPM_TOKEN_VALUE == '' }}
+        run: |
+          # 版本低于 11.5.1 时 npm publish 只会报误导性的 404，不提示版本问题
+          current="$(npm --version)"
+          if [ "$(printf '%s\n' 11.5.1 "$current" | sort -V | head -n 1)" != "11.5.1" ]; then
+            npm install -g npm@^11
+          fi
+          npm --version
 
       - name: 校验版本
         run: |
@@ -64,14 +79,18 @@ jobs:
             console.log('发布包校验通过，共 ' + paths.size + ' 个文件');
           "
 
-      - name: 发布到 npm
+      # 首发时包还不存在，npm 不给不存在的包配 Trusted Publisher，只能用 token 发一次。
+      # 配好 Trusted Publisher 后删掉 NPM_TOKEN secret，就自动走 OIDC，代码不用改。
+      - name: 发布到 npm（OIDC）
+        if: ${{ env.NPM_TOKEN_VALUE == '' }}
+        # 绝不能设 NODE_AUTH_TOKEN，连空值都会让 npm 放弃 OIDC 交换
+        run: npm publish --access public --registry=https://registry.npmjs.org
+
+      - name: 发布到 npm（token，仅首次发布）
+        if: ${{ env.NPM_TOKEN_VALUE != '' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::缺少 NPM_TOKEN，请在仓库 Settings → Secrets and variables → Actions 里配置"
-            exit 1
-          fi
           # prepublishOnly 会再编译一次；dist/ 在 .gitignore 里，不能指望 checkout 带下来
           # 显式指定 registry，避免环境里的镜像配置把包发到别处
           npm publish --access public --registry=https://registry.npmjs.org
