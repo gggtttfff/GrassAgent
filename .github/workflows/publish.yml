@@ -1,0 +1,77 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 老 tag 早于本工作流存在，手动跑一次可以补发当前版本，不必重打 tag
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite 和 type stripping 都要 Node 24+；registry-url 会生成带 NODE_AUTH_TOKEN 的 .npmrc
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: 校验版本
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$package_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME 与 package.json 的 $package_version 不一致"
+              exit 1
+            fi
+          fi
+          if npm view "grassagent@$package_version" version --registry=https://registry.npmjs.org > /dev/null 2>&1; then
+            echo "::error::grassagent@$package_version 已发布过，npm 不允许覆盖同版本，请先提升版本号"
+            exit 1
+          fi
+          echo "准备发布 grassagent@$package_version"
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查与测试
+        run: npm run test:all
+
+      - name: 编译
+        run: npm run build
+
+      - name: 校验发布包内容
+        run: |
+          test -f dist/cli.js || { echo "::error::dist/cli.js 不存在"; exit 1; }
+          head -n 1 dist/cli.js | grep -q '^#!' || { echo "::error::bin 入口缺少 shebang"; exit 1; }
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node --input-type=module -e "
+            import fs from 'node:fs';
+            const info = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + '/pack.json', 'utf8'))[0];
+            const paths = new Set(info.files.map(file => file.path));
+            for (const required of ['dist/cli.js', 'src/cli.ts', '.env.example']) {
+              if (!paths.has(required)) throw new Error('发布包缺少 ' + required);
+            }
+            console.log('发布包校验通过，共 ' + paths.size + ' 个文件');
+          "
+
+      - name: 发布到 npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::缺少 NPM_TOKEN，请在仓库 Settings → Secrets and variables → Actions 里配置"
+            exit 1
+          fi
+          # prepublishOnly 会再编译一次；dist/ 在 .gitignore 里，不能指望 checkout 带下来
+          # 显式指定 registry，避免环境里的镜像配置把包发到别处
+          npm publish --access public --registry=https://registry.npmjs.org

@@ -653,6 +653,22 @@ npm run test:all     # 上面三样一起跑
 
 用本地 mock 而不是真实 API，测试才稳定可复现，也不消耗额度。
 
+## 发布
+
+推一个 `v*` tag 就会触发 `.github/workflows/publish.yml`：跑完整测试、校验版本、编译、检查发布包内容，然后发布到 npm。
+
+```bash
+# 先把 package.json 的 version 改成目标版本并提交
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+也可以在 GitHub Actions 页面手动运行 **Publish to npm**（`workflow_dispatch`），发布当前 `package.json` 的版本——`v0.2.0` 比这个工作流更早，用它补发首个包不用重打 tag。
+
+**前置条件**：在 npmjs.com 生成 Automation token，加到仓库 Settings → Secrets and variables → Actions，名字叫 `NPM_TOKEN`。首次发布时 `grassagent` 这个包还不存在，Automation token 最省事；发布成功后建议换成只授权这个包的 granular token。
+
+工作流会拦下：tag 与 `package.json` 版本不一致、该版本已发过、缺 `NPM_TOKEN`、包里没有 `dist/cli.js` 或它丢了 shebang。`dist/` 在 `.gitignore` 里，checkout 带不下来，所以靠 `prepublishOnly` 在发布前编译，`files` 白名单负责把编译产物打进包（白名单优先于 `.gitignore`）。手动 `npm publish` 走的是同一套编译。
+
 ## 扩展
 
 ### 加一个新 provider

@@ -30,6 +30,7 @@
     "build": "tsc -p tsconfig.build.json",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "prebuild": "npm run clean",
+    "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning e2e-smoke.ts",
     "test:unit": "node --disable-warning=ExperimentalWarning --test --test-reporter=spec \"test/**/*.test.ts\"",
