@@ -20,6 +20,7 @@ import {
 } from '../../src/sandbox/sshTunnel.ts'
 import { resolveSshConfig, expandHome } from '../../src/sandbox/sshConfig.ts'
 import { createLogger } from '../../src/core/logger.ts'
+import { generateTestKeyPair } from './testKeys.ts'
 
 // ssh2 是 CommonJS 包,ESM 下用默认导入拿具名导出。
 const { Server, utils } = ssh2
@@ -103,7 +104,7 @@ test('known_hosts 按 OpenSSH 规则拼主机名', () => {
 test('known_hosts 读出主机到指纹的映射', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-'))
   try {
-    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const key = publicSshBlob(generateTestKeyPair().public)
     const fingerprint = keyFingerprint(key)
     const knownHostsPath = path.join(directory, 'known_hosts')
     await writeFile(
@@ -121,7 +122,7 @@ test('known_hosts 读出主机到指纹的映射', async () => {
 test('非标端口的 [host]:port 条目能命中,端口不同就是不同条目', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-port-'))
   try {
-    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const key = publicSshBlob(generateTestKeyPair().public)
     const fingerprint = keyFingerprint(key)
     const knownHostsPath = path.join(directory, 'known_hosts')
     await writeFile(
@@ -141,9 +142,9 @@ test('非标端口的 [host]:port 条目能命中,端口不同就是不同条目
 test('known_hosts 支持同主机多密钥、通配符和否定模式', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-mixed-'))
   try {
-    const first = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
-    const second = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
-    const third = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const first = publicSshBlob(generateTestKeyPair().public)
+    const second = publicSshBlob(generateTestKeyPair().public)
+    const third = publicSshBlob(generateTestKeyPair().public)
     const knownHostsPath = path.join(directory, 'known_hosts')
     await writeFile(
       knownHostsPath,
@@ -174,7 +175,7 @@ test('known_hosts 支持同主机多密钥、通配符和否定模式', async ()
 test('哈希形式的 known_hosts 条目也能命中', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-known-hashed-'))
   try {
-    const key = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const key = publicSshBlob(generateTestKeyPair().public)
     const fingerprint = keyFingerprint(key)
     const salt = Buffer.from('0123456789abcdef')
     const hash = createHmac('sha1', salt).update('[example.com]:2222').digest()
@@ -207,7 +208,7 @@ test('首次连接把指纹写回 known_hosts,下次连接仍然认得', async (
       username: 'dev',
       knownHostsPath,
     })
-    const hostKey = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const hostKey = publicSshBlob(generateTestKeyPair().public)
 
     // 第一次:没人能证明对错,接受并落盘
     assert.equal(createHostVerifier(config, silentLogger)(hostKey), true)
@@ -219,7 +220,7 @@ test('首次连接把指纹写回 known_hosts,下次连接仍然认得', async (
     assert.equal(secondProcess(hostKey), true)
 
     // 换成另一把:必须拒绝,不然就是中间人
-    const otherKey = publicSshBlob(utils.generateKeyPairSync('ed25519').public)
+    const otherKey = publicSshBlob(generateTestKeyPair().public)
     assert.equal(secondProcess(otherKey), false)
   } finally {
     await rm(directory, { recursive: true, force: true })
@@ -267,7 +268,7 @@ async function startSshServer(options: {
   /** 隧道要转到的目标端口。给了就实现 tcpip 转发。 */
   tcpipTargetPort?: number
 } = {}): Promise<TestHost> {
-  const hostKeyPair = utils.generateKeyPairSync('ed25519')
+  const hostKeyPair = generateTestKeyPair()
   const sockets: Array<{ destroy: () => void }> = []
   const server = new Server({ hostKeys: [hostKeyPair.private] }, (client) => {
     // 客户端拒绝主机密钥时会发 DISCONNECT,服务端这边会抛。
@@ -324,7 +325,7 @@ async function startSshServer(options: {
 }
 
 test('SSH 服务能接受公钥认证', async () => {
-  const clientKeyPair = utils.generateKeyPairSync('ed25519')
+  const clientKeyPair = generateTestKeyPair()
   const privateKey = clientKeyPair.private
 
   const host = await startSshServer({ onExec: () => 'ok' })
@@ -366,12 +367,12 @@ test('SSH 服务能接受公钥认证', async () => {
 })
 
 test('主机密钥对不上时连接被拒', async () => {
-  const clientKeyPair = utils.generateKeyPairSync('ed25519')
+  const clientKeyPair = generateTestKeyPair()
   const privateKey = clientKeyPair.private
   const host = await startSshServer()
 
   // 伪造一个 known_hosts,里面存的是另一把钥匙
-  const wrongKeyPair = utils.generateKeyPairSync('ed25519')
+  const wrongKeyPair = generateTestKeyPair()
 
   try {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-ssh-wrong-'))
@@ -421,7 +422,7 @@ test('SSH 客户端的连接配置能带上主机校验', async () => {
     const verifier = createHostVerifier(config, silentLogger)
     assert.equal(typeof verifier, 'function')
     // 没有任何记录时按 TOFU 放行
-    assert.equal(verifier(publicSshBlob(utils.generateKeyPairSync('ed25519').public)), true)
+    assert.equal(verifier(publicSshBlob(generateTestKeyPair().public)), true)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -450,7 +451,7 @@ test('隧道把 HTTP 原样送到远端,不解析不改写', { timeout: 30_000 }
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-tunnel-'))
   try {
     const keyPath = path.join(directory, 'id_ed25519')
-    await writeFile(keyPath, utils.generateKeyPairSync('ed25519').private, {
+    await writeFile(keyPath, generateTestKeyPair().private, {
       encoding: 'utf-8',
       mode: 0o600,
     })

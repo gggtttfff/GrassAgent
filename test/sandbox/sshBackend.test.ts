@@ -11,6 +11,7 @@ import ssh2 from 'ssh2'
 import { createSshBackend } from '../../src/sandbox/sshBackend.ts'
 import { createLogger } from '../../src/core/logger.ts'
 import { SANDBOX_PROTOCOL_VERSION } from '../../src/sandbox/protocol.ts'
+import { generateTestKeyPair } from './testKeys.ts'
 
 // SSH 后端的测试。
 //
@@ -19,7 +20,7 @@ import { SANDBOX_PROTOCOL_VERSION } from '../../src/sandbox/protocol.ts'
 //
 // 这样整条链路——部署、开隧道、转发调用——都在本地跑通。
 
-const { Server, utils } = ssh2
+const { Server } = ssh2
 
 const silentLogger = createLogger({
   level: 'fatal',
@@ -51,7 +52,7 @@ type FakeRemote = {
  * 作者：Pieory 创建日期：2025-07-18
  */
 async function startFakeRemote(options: { daemonVersion?: number } = {}): Promise<FakeRemote> {
-  const keyPair = utils.generateKeyPairSync('ed25519')
+  const keyPair = generateTestKeyPair()
   const sockets: Array<{ destroy: () => void }> = []
   const forwardedSockets: Array<{ destroy: () => void }> = []
   const daemonVersion = options.daemonVersion ?? SANDBOX_PROTOCOL_VERSION
@@ -258,7 +259,7 @@ async function startFakeRemote(options: { daemonVersion?: number } = {}): Promis
 async function makeKeyFile(): Promise<{ keyPath: string; directory: string }> {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-sshbackend-'))
   const keyPath = path.join(directory, 'id_ed25519')
-  await writeFile(keyPath, utils.generateKeyPairSync('ed25519').private, {
+  await writeFile(keyPath, generateTestKeyPair().private, {
     encoding: 'utf-8',
     mode: 0o600,
   })

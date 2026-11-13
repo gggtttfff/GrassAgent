@@ -13,6 +13,7 @@ import { resolveSshConfig } from '../../src/sandbox/sshConfig.ts'
 import { deployRemoteDaemon } from '../../src/sandbox/sshDeploy.ts'
 import type { ProvisionProgress } from '../../src/sandbox/backend.ts'
 import { createLogger } from '../../src/core/logger.ts'
+import { generateTestKeyPair } from './testKeys.ts'
 
 // 远程部署的测试。
 //
@@ -22,7 +23,7 @@ import { createLogger } from '../../src/core/logger.ts'
 // 假远程实现了 SFTP 子系统——部署模块走 SFTP 写文件,
 // 不用 shell 重定向。
 
-const { Server, utils } = ssh2
+const { Server } = ssh2
 
 const silentLogger = createLogger({
   level: 'fatal',
@@ -56,7 +57,7 @@ type FakeRemote = {
 }
 
 async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<FakeRemote> {
-  const keyPair = utils.generateKeyPairSync('ed25519')
+  const keyPair = generateTestKeyPair()
   const commands: string[] = []
   const writes: string[] = []
   const nodeVersion = options.nodeVersion ?? 'v24.22.2'
@@ -250,7 +251,7 @@ async function startFakeRemote(options: { nodeVersion?: string } = {}): Promise<
  */
 async function connectTo(remote: FakeRemote): Promise<{ client: Awaited<ReturnType<typeof connectSsh>>, cleanup: () => Promise<void> }> {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'grass-deploy-'))
-  const keyPair = utils.generateKeyPairSync('ed25519')
+  const keyPair = generateTestKeyPair()
   const keyPath = path.join(directory, 'id_ed25519')
   await writeFile(keyPath, keyPair.private, {
     encoding: 'utf-8',
