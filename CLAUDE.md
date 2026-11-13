@@ -43,6 +43,8 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 - Node >= 24，直接跑 TypeScript 不编译（type stripping 在 24.3+ 默认启用，不需要 `--experimental-strip-types` flag）
 - 启动：`npm start`；类型检查：`npm run typecheck`；单元测试：`npm run test:unit`；端到端：`npm test`
 - 配置走 `.env`，所有变量在 `src/config.ts` 的 schema 里集中定义，新增变量必须同时更新 schema 和 `.env.example`
+- 宿主目录用系统环境变量 `GRASSAGENT_HOME` 配置（默认 `~/.grassagent`），规则集中在 `src/core/homeDirectory.ts`；`.env`、会话库、插件信任记录、云端会话、技能评估卡都跟着它
+- `.env` 的位置必须先于它的内容定下来，所以**只有系统环境变量**里的 `GRASSAGENT_HOME` 能改变 `.env` 的位置；写在 `.env` 里的只影响派生的数据路径。宿主目录下没有 `.env` 时回退项目根目录并记 warn 日志
 - 系统提示词在 `src/cli.ts`，不在 `.env` 里
 
 ## 编码约定
@@ -270,7 +272,7 @@ config.ts / version.ts   叶子：只被引用，不引用任何模块
 
 ## 会话存储
 
-`~/.grassagent/sessions.db`，SQLite 库。`SessionStore` 负责读写，详见 `src/session/sessionStore.ts`。
+`<GRASSAGENT_HOME>/sessions.db`（默认 `~/.grassagent/sessions.db`），SQLite 库。`SessionStore` 负责读写，详见 `src/session/sessionStore.ts`。
 
 `sync(messages)` 传的是**完整会话列表**，不是增量——内部按 `persistedCount` 切片只写新增部分。传增量会写不进去（切片后为空）。写入在一个事务里完成，中途失败会回滚，不会留下半截消息破坏配对关系。
 

@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import {
@@ -7,8 +8,11 @@ import {
   collectEnvValues,
   validateConfig,
   loadConfig,
+  resolveEnvFilePath,
   ConfigError,
+  type EnvFileResolution,
 } from '../../src/config.ts'
+import { defaultHomeDirectory } from '../../src/core/homeDirectory.ts'
 
 const minimalValues = { ApiKey: 'test-key' }
 
@@ -327,4 +331,153 @@ test('docker 后端的远程世界仍然要求控制面地址', () => {
       return true
     },
   )
+})
+
+// ---- 宿主目录 GRASSAGENT_HOME ----
+
+test('宿主目录有默认值,数据路径都从它派生', () => {
+  const config = validateConfig({ ApiKey: 'k' })
+  assert.equal(config.Home, defaultHomeDirectory())
+  assert.equal(config.SessionDatabasePath, path.join(config.Home, 'sessions.db'))
+  assert.equal(config.CloudSessionDirectory, path.join(config.Home, 'cloud-sessions'))
+  assert.equal(config.PluginTrustFile, path.join(config.Home, 'plugin-trust.json'))
+  assert.equal(config.SkillEvalDirectory, path.join(config.Home, 'skill-eval'))
+})
+
+test('配了 GRASSAGENT_HOME 后默认路径整体搬过去', () => {
+  const home = path.join(os.tmpdir(), `grass-home-${process.pid}`)
+  const config = validateConfig({ ApiKey: 'k', Home: home })
+  assert.equal(config.Home, path.resolve(home))
+  assert.equal(config.SessionDatabasePath, path.join(path.resolve(home), 'sessions.db'))
+  assert.equal(config.CloudSessionDirectory, path.join(path.resolve(home), 'cloud-sessions'))
+  assert.equal(config.PluginTrustFile, path.join(path.resolve(home), 'plugin-trust.json'))
+  assert.equal(config.SkillEvalDirectory, path.join(path.resolve(home), 'skill-eval'))
+})
+
+test('单项路径显式配置时优先于宿主目录', () => {
+  const home = path.join(os.tmpdir(), `grass-home-${process.pid}`)
+  const databasePath = path.join(os.tmpdir(), 'legacy-session.db')
+  const config = validateConfig({ ApiKey: 'k', Home: home, SessionDatabasePath: databasePath })
+  assert.equal(config.SessionDatabasePath, databasePath)
+  assert.equal(config.CloudSessionDirectory, path.join(path.resolve(home), 'cloud-sessions'))
+})
+
+test('路径写成空字符串时回退到宿主目录派生值', () => {
+  const home = path.join(os.tmpdir(), `grass-home-${process.pid}`)
+  const config = validateConfig({
+    ApiKey: 'k',
+    Home: home,
+    SessionDatabasePath: '',
+    CloudSessionDirectory: '',
+    PluginTrustFile: '',
+    SkillEvalDirectory: '',
+  })
+  assert.equal(config.SessionDatabasePath, path.join(path.resolve(home), 'sessions.db'))
+  assert.equal(config.CloudSessionDirectory, path.join(path.resolve(home), 'cloud-sessions'))
+  assert.equal(config.PluginTrustFile, path.join(path.resolve(home), 'plugin-trust.json'))
+  assert.equal(config.SkillEvalDirectory, path.join(path.resolve(home), 'skill-eval'))
+})
+
+test('宿主目录支持 ~ 前缀', () => {
+  const config = validateConfig({ ApiKey: 'k', Home: '~/my-grass' })
+  assert.equal(config.Home, path.join(os.homedir(), 'my-grass'))
+  assert.equal(config.SessionDatabasePath, path.join(os.homedir(), 'my-grass', 'sessions.db'))
+})
+
+test('收集环境变量时 GRASSAGENT_HOME 也走系统优先规则', () => {
+  assert.equal(collectEnvValues({ GRASSAGENT_HOME: 'from-file' }, {}).Home, 'from-file')
+  assert.equal(
+    collectEnvValues({ GRASSAGENT_HOME: 'from-file' }, { GRASSAGENT_HOME: 'from-env' }).Home,
+    'from-env',
+  )
+})
+
+test('没设 GRASSAGENT_HOME 时 .env 仍在项目根目录', async () => {
+  const projectEnvFilePath = path.join(os.tmpdir(), 'grass-project.env')
+  const resolution = await resolveEnvFilePath(undefined, projectEnvFilePath)
+  assert.deepEqual(resolution, { filePath: projectEnvFilePath, source: 'project' })
+})
+
+test('宿主目录下有 .env 时优先读它', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-home-env-'))
+  await fs.writeFile(path.join(directory, '.env'), 'GRASSAGENT_API_KEY=home-key\n', 'utf-8')
+  const projectEnvFilePath = path.join(os.tmpdir(), 'grass-project.env')
+  const resolution = await resolveEnvFilePath(directory, projectEnvFilePath)
+  assert.deepEqual(resolution, {
+    filePath: path.join(directory, '.env'),
+    source: 'home',
+  })
+  await fs.rm(directory, { recursive: true, force: true })
+})
+
+test('宿主目录下没有 .env 时回退项目根,并记录找过的路径', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-home-empty-'))
+  const projectEnvFilePath = path.join(os.tmpdir(), 'grass-project.env')
+  const resolution = await resolveEnvFilePath(directory, projectEnvFilePath)
+  assert.deepEqual(resolution, {
+    filePath: projectEnvFilePath,
+    source: 'project',
+    expectedFilePath: path.join(directory, '.env'),
+  })
+  await fs.rm(directory, { recursive: true, force: true })
+})
+
+test('GRASSAGENT_HOME 是空白字符串时视为没配', async () => {
+  const projectEnvFilePath = path.join(os.tmpdir(), 'grass-project.env')
+  const resolution = await resolveEnvFilePath('   ', projectEnvFilePath)
+  assert.deepEqual(resolution, { filePath: projectEnvFilePath, source: 'project' })
+})
+
+test('loadConfig 用宿主目录里的 .env,并通过回调报出来源', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-home-load-'))
+  const envFilePath = path.join(directory, '.env')
+  await fs.writeFile(envFilePath, 'GRASSAGENT_API_KEY=home-key\n', 'utf-8')
+  let resolution: EnvFileResolution | undefined
+  const config = await loadConfig({
+    environment: { GRASSAGENT_HOME: directory },
+    onEnvFile: (value) => { resolution = value },
+  })
+  assert.equal(config.ApiKey, 'home-key')
+  assert.equal(config.Home, path.resolve(directory))
+  assert.equal(config.SessionDatabasePath, path.join(path.resolve(directory), 'sessions.db'))
+  assert.equal(resolution?.source, 'home')
+  assert.equal(resolution?.filePath, envFilePath)
+  await fs.rm(directory, { recursive: true, force: true })
+})
+
+test('loadConfig 显式指定 .env 路径时不受宿主目录影响', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-home-explicit-'))
+  const envFilePath = path.join(directory, 'custom.env')
+  await fs.writeFile(envFilePath, 'GRASSAGENT_API_KEY=explicit-key\n', 'utf-8')
+  let resolution: EnvFileResolution | undefined
+  const config = await loadConfig({
+    envFilePath,
+    environment: { GRASSAGENT_HOME: directory },
+    onEnvFile: (value) => { resolution = value },
+  })
+  assert.equal(config.ApiKey, 'explicit-key')
+  assert.equal(resolution?.source, 'explicit')
+  await fs.rm(directory, { recursive: true, force: true })
+})
+
+test('.env 里写 GRASSAGENT_HOME 只影响数据路径,不改变 .env 自己的位置', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'grass-home-infile-'))
+  const envFilePath = path.join(directory, 'custom.env')
+  const home = path.join(directory, 'data-home')
+  await fs.writeFile(
+    envFilePath,
+    `GRASSAGENT_API_KEY=file-key\nGRASSAGENT_HOME=${home}\n`,
+    'utf-8',
+  )
+  let resolution: EnvFileResolution | undefined
+  const config = await loadConfig({
+    envFilePath,
+    environment: {},
+    onEnvFile: (value) => { resolution = value },
+  })
+  assert.equal(config.ApiKey, 'file-key')
+  assert.equal(config.Home, path.resolve(home))
+  assert.equal(config.SessionDatabasePath, path.join(path.resolve(home), 'sessions.db'))
+  assert.equal(resolution?.filePath, envFilePath)
+  await fs.rm(directory, { recursive: true, force: true })
 })

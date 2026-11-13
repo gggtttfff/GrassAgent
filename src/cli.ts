@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // src/cli.ts
 // 拼装层 —— 把 llm / agent / tui / tools / config 粘起来，是唯一入口。
-// session 持久化：每轮结束把 context.messages 写进 ~/.grassagent/sessions.db。
+// session 持久化：每轮结束把 context.messages 写进宿主目录下的 sessions.db。
 //
 // 第一行是 shebang,给 npm bin 用。`node src/cli.ts` 照样跑,Node 会跳过它。
 
@@ -20,7 +20,7 @@ import {
   type ApprovalDecision,
   type ApprovalGate,
 } from './world/approvalGate.ts'
-import { loadConfig, ConfigError, type AgentConfig } from './config.ts'
+import { loadConfig, ConfigError, type AgentConfig, type EnvFileResolution } from './config.ts'
 import { readVersion } from './version.ts'
 import { createLoggerFromConfig, type Logger } from './core/logger.ts'
 import { createTransport } from './core/transport.ts'
@@ -79,19 +79,35 @@ async function main() {
 
   // 配置先加载并校验:启动阶段就报错，比第一次调 API 失败好排查
   let config: AgentConfig
+  let envFileResolution: EnvFileResolution | undefined
   try {
-    config = await loadConfig()
+    config = await loadConfig({ onEnvFile: (resolution) => { envFileResolution = resolution } })
   } catch (error) {
     if (error instanceof ConfigError) {
       console.error(`[grassagent] ${error.message}`)
       for (const issue of error.issues) console.error(issue)
-      console.error('提示: 可在 .env 里配置这些变量，参考 .env.example')
+      console.error('提示: .env 可放在 GRASSAGENT_HOME 目录下，或项目根目录，参考 .env.example')
       process.exit(1)
     }
     throw error
   }
 
   const logger = createLoggerFromConfig(config)
+  if (envFileResolution) {
+    logger.info({
+      home: config.Home,
+      envFilePath: envFileResolution.filePath,
+      source: envFileResolution.source,
+    }, '配置已加载')
+    // 宿主目录里没放 .env 是允许的兜底，但要留下痕迹，不然很难查配置到底从哪读的
+    if (envFileResolution.expectedFilePath) {
+      logger.warn({
+        home: config.Home,
+        expectedFilePath: envFileResolution.expectedFilePath,
+        usedFilePath: envFileResolution.filePath,
+      }, '宿主目录下没有 .env，回退到项目根目录')
+    }
+  }
 
   // 三个模型各干各的:小模型起标题和判断压缩,主力模型对话,审批模型放行副作用。
   const models = buildModelRoster(config)

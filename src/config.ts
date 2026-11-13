@@ -4,9 +4,13 @@
 
 import { promises as fs } from 'node:fs'
 import * as path from 'node:path'
-import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
+import {
+  HOME_ENV_NAME,
+  defaultHomeDirectory,
+  resolveHomeDirectory,
+} from './core/homeDirectory.ts'
 
 // 环境变量名统一前缀,避免和宿主环境里其他变量撞名
 const ENV_PREFIX = 'GRASSAGENT_'
@@ -97,6 +101,14 @@ export const configSchema = z.object({
     minimum: 1, maximum: 1_000_000, label: 'ApprovalMaxTokens',
   }),
 
+  // 宿主目录:所有不进工作区的文件(会话库、信任记录、云端会话等)都落在这里。
+  // 它还要决定 .env 的位置,而 .env 的内容得先读到才知道,所以「改变 .env 位置」只认系统环境变量;
+  // 写在 .env 里的 GRASSAGENT_HOME 只影响下面这些派生路径。
+  Home: z.preprocess(
+    emptyToUndefined,
+    z.string().min(1, { error: 'Home 不能为空' }).default(() => defaultHomeDirectory()),
+  ),
+
   // 工作目录沙箱:所有文件读写和命令执行都限制在这个目录内
   Workspace: z.string().min(1, { error: 'Workspace 不能为空' }).default(() => process.cwd()),
 
@@ -120,9 +132,8 @@ export const configSchema = z.object({
   }).default('json'),
 
   // 会话存储。SQLite 数据库文件,多个进程可以同时读写同一个文件,
-  // 各自的会话用 sessionId 隔离。
-  SessionDatabasePath: z.string().min(1, { error: 'SessionDatabasePath 不能为空' })
-    .default(() => path.join(os.homedir(), '.grassagent', 'sessions.db')),
+  // 各自的会话用 sessionId 隔离。留空则用 <Home>/sessions.db。
+  SessionDatabasePath: optionalText('SessionDatabasePath'),
   // 会话 ID。留空则每次启动自动生成,相当于开一个新会话。
   SessionId: z.string().min(1, { error: 'SessionId 不能为空' }).optional(),
 
@@ -178,20 +189,20 @@ export const configSchema = z.object({
   SessionProfile: z.enum(['facing', 'cloud', 'router'], {
     error: 'SessionProfile 只能是 facing、cloud 或 router',
   }).default('facing'),
-  CloudSessionDirectory: z.string().min(1, { error: 'CloudSessionDirectory 不能为空' })
-    .default(() => path.join(os.homedir(), '.grassagent', 'cloud-sessions')),
+  // 留空则用 <Home>/cloud-sessions。不要指到工作区里,沙盒里的工具写得到。
+  CloudSessionDirectory: optionalText('CloudSessionDirectory'),
 
   // 工作区 .grass/plugins 要先信任。ask 问一次并记在宿主目录;allow 是宿主配置放行;deny 一律不登记。
   TrustPlugins: z.enum(['ask', 'allow', 'deny'], {
     error: 'TrustPlugins 只能是 ask、allow 或 deny',
   }).default('ask'),
-  PluginTrustFile: z.string().min(1, { error: 'PluginTrustFile 不能为空' })
-    .default(() => path.join(os.homedir(), '.grassagent', 'plugin-trust.json')),
+  // 留空则用 <Home>/plugin-trust.json。不要指到工作区里。
+  PluginTrustFile: optionalText('PluginTrustFile'),
 
   SkillEval: booleanOption(false, 'SkillEval'),
   // 效果验证卡的目录。必须在工作区外面,模型用世界端口写不到这里。
-  SkillEvalDirectory: z.string().min(1, { error: 'SkillEvalDirectory 不能为空' })
-    .default(() => path.join(os.homedir(), '.grassagent', 'skill-eval')),
+  // 留空则用 <Home>/skill-eval。
+  SkillEvalDirectory: optionalText('SkillEvalDirectory'),
 
   // 执行世界。local 是本机工作区。remote 把文件和命令交给控制面上的沙盒。
   ExecutionWorld: z.enum(['local', 'remote'], {
@@ -324,7 +335,19 @@ export const configSchema = z.object({
     path: ['SandboxSshUser'],
     message: 'SSH 后端必须配置远程用户名',
   },
-))
+)).transform((config) => {
+  // 路径默认值要引用同一个对象里的 Home,字段级 default 拿不到别的字段,统一在这里派生。
+  // 显式配过单项路径的保留原值,免得加了 HOME 反而把用户原来的位置改掉。
+  const home = resolveHomeDirectory(config.Home)
+  return {
+    ...config,
+    Home: home,
+    SessionDatabasePath: config.SessionDatabasePath ?? path.join(home, 'sessions.db'),
+    CloudSessionDirectory: config.CloudSessionDirectory ?? path.join(home, 'cloud-sessions'),
+    PluginTrustFile: config.PluginTrustFile ?? path.join(home, 'plugin-trust.json'),
+    SkillEvalDirectory: config.SkillEvalDirectory ?? path.join(home, 'skill-eval'),
+  }
+})
 
 export type AgentConfig = z.infer<typeof configSchema>
 
@@ -341,6 +364,7 @@ export class ConfigError extends Error {
 
 // 环境变量名 -> schema 字段名
 const FIELD_TO_ENV_NAME: Record<keyof AgentConfig, string> = {
+  Home: HOME_ENV_NAME,
   ApiKey: `${ENV_PREFIX}API_KEY`,
   Model: `${ENV_PREFIX}MODEL`,
   BaseUrl: `${ENV_PREFIX}BASE_URL`,
@@ -445,9 +469,42 @@ export async function parseEnvFile(filePath: string): Promise<Record<string, str
   return parsed
 }
 
-// 项目根目录下的 .env 路径
+// 项目根目录下的 .env 路径。没配 GRASSAGENT_HOME 时用这个,和改造前一致。
 export function defaultEnvFilePath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.env')
+}
+
+/** .env 最终落在哪里。回退时把找过的路径一起交出去,日志才说得清原因。 */
+export interface EnvFileResolution {
+  filePath: string
+  source: 'explicit' | 'home' | 'project'
+  expectedFilePath?: string
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 只有系统环境变量里的 GRASSAGENT_HOME 能改变 .env 的位置:写在 .env 里就成先有鸡还是先有蛋。
+// HOME 目录下没放 .env 时回退项目根,老安装不会因为设了 HOME 就突然读不到配置。
+// 项目根路径做成参数,测试就不用碰仓库里真实的 .env。
+export async function resolveEnvFilePath(
+  homeFromEnvironment: string | undefined,
+  projectEnvFilePath: string = defaultEnvFilePath(),
+): Promise<EnvFileResolution> {
+  if (homeFromEnvironment && homeFromEnvironment.trim() !== '') {
+    const expectedFilePath = path.join(resolveHomeDirectory(homeFromEnvironment), '.env')
+    if (await fileExists(expectedFilePath)) {
+      return { filePath: expectedFilePath, source: 'home' }
+    }
+    return { filePath: projectEnvFilePath, source: 'project', expectedFilePath }
+  }
+  return { filePath: projectEnvFilePath, source: 'project' }
 }
 
 // 把环境变量来源拍平成一个对象:系统环境变量优先于 .env。
@@ -481,13 +538,19 @@ export function validateConfig(values: Record<string, unknown>): AgentConfig {
   throw new ConfigError('配置校验失败:', issues)
 }
 
-// 完整加载流程:读 .env → 合并环境变量 → 校验。
+// 完整加载流程:定位 .env → 读 .env → 合并环境变量 → 校验。
 export async function loadConfig(options: {
   envFilePath?: string
   environment?: NodeJS.ProcessEnv
+  onEnvFile?: (resolution: EnvFileResolution) => void
 } = {}): Promise<AgentConfig> {
-  const envFilePath = options.envFilePath ?? defaultEnvFilePath()
-  const fileValues = await parseEnvFile(envFilePath)
-  const values = collectEnvValues(fileValues, options.environment ?? process.env)
+  const environment = options.environment ?? process.env
+  const resolution: EnvFileResolution = options.envFilePath
+    ? { filePath: options.envFilePath, source: 'explicit' }
+    : await resolveEnvFilePath(environment[HOME_ENV_NAME])
+  // 用回调交出定位结果,不改返回值形状:调用方拿它记一条日志就够了。
+  options.onEnvFile?.(resolution)
+  const fileValues = await parseEnvFile(resolution.filePath)
+  const values = collectEnvValues(fileValues, environment)
   return validateConfig(values)
 }

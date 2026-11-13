@@ -5,6 +5,7 @@
 // HTTP 服务本体在 controlHttp.ts。这里只负责选后端、起服务。
 
 import * as path from 'node:path'
+import { resolveHomeDirectory } from '../core/homeDirectory.ts'
 import { createDockerBackend } from './dockerBackend.ts'
 import { createInProcessBackend } from './inProcessBackend.ts'
 import { createSshBackend, type SshBackendOptions } from './sshBackend.ts'
@@ -15,8 +16,9 @@ async function main(): Promise<void> {
   const host = process.env.GRASSAGENT_SANDBOX_CONTROL_HOST || '127.0.0.1'
   const port = Number(process.env.GRASSAGENT_SANDBOX_CONTROL_PORT || 9473)
   const backendName = process.env.GRASSAGENT_SANDBOX_BACKEND || 'docker'
+  // 控制面不加载 .env,只认系统环境变量;和 CLI 共用同一套宿主目录规则。
   const stateDir = process.env.GRASSAGENT_SANDBOX_STATE_DIR
-    || path.join(process.env.HOME || '/tmp', '.grassagent', 'sandboxes')
+    || path.join(resolveHomeDirectory(process.env.GRASSAGENT_HOME), 'sandboxes')
   const credentialsFile = process.env.GRASSAGENT_SANDBOX_CREDENTIALS_FILE || undefined
   const backend = backendName === 'inprocess'
     ? createInProcessBackend({ stateDir })

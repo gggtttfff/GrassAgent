@@ -156,6 +156,8 @@ npm start         # 或者从源码跑
 
 启动后直接输入内容回车即可。模型回复过程中可以按 Ctrl+C 打断当前回合。
 
+不想把 `.env` 放在项目里，可以用 `GRASSAGENT_HOME` 指定宿主目录，再把 `.env` 拷进去（详见「配置项 → 宿主目录」）。
+
 ### 斜杠命令
 
 输入 `/` 会弹出命令补全列表，回车执行。命令在本地执行，不会发给模型。
@@ -246,7 +248,7 @@ daemon 只做文件和命令。模型循环留在 Grass 进程里，不进容器
 
 默认 `GRASSAGENT_SESSION_PROFILE=facing`，这是面对用户的会话，带 `ask_user`。
 
-`/cloud 任务描述` 只在宿主目录 `~/.grassagent/cloud-sessions` 里排队，不在当前进程里开沙盒。接着另开一个进程，带上排队时打印的会话 ID，并使用远程执行世界：
+`/cloud 任务描述` 只在宿主目录的 `cloud-sessions` 里排队（默认 `~/.grassagent/cloud-sessions`，可用 `GRASSAGENT_HOME` 改），不在当前进程里开沙盒。接着另开一个进程，带上排队时打印的会话 ID，并使用远程执行世界：
 
 ```bash
 GRASSAGENT_SESSION_PROFILE=cloud
@@ -497,8 +499,28 @@ echo "读一下 README.md" | npm start
 
 全部通过 `.env` 提供，也可以用系统环境变量覆盖（**系统环境变量优先级更高**）。
 
+### 宿主目录 `GRASSAGENT_HOME`
+
+所有「不进工作区」的文件共用同一个根目录：`.env`、会话库、插件信任记录、云端会话记录、技能评估卡。不设时默认 `~/.grassagent`，行为和以前完全一样。
+
+```bash
+# 把配置文件和状态一起搬走
+GRASSAGENT_HOME=/path/to/grass-home npm start
+```
+
+查找规则：
+
+- **系统环境变量**里设了 `GRASSAGENT_HOME`，`.env` 优先读 `<HOME>/.env`；那里没有 `.env` 就回退项目根目录的 `.env`，并记一条 warn 日志。
+- 没设 `GRASSAGENT_HOME`，`.env` 读项目根目录，数据路径落在 `~/.grassagent/`。
+- 写在 `.env` 里的 `GRASSAGENT_HOME` 只改数据路径，不改变 `.env` 自己的位置——配置文件在哪必须先于配置文件的内容定下来，否则就是先有鸡还是先有蛋。
+- 四个路径项（`GRASSAGENT_SESSION_DATABASE_PATH`、`GRASSAGENT_CLOUD_SESSION_DIRECTORY`、`GRASSAGENT_PLUGIN_TRUST_FILE`、`GRASSAGENT_SKILL_EVAL_DIRECTORY`）显式填了就以它为准，优先级高于 `GRASSAGENT_HOME`。
+- 路径支持绝对路径、相对启动目录的路径和 `~` 前缀。目录不存在时由各写入方自行创建。
+
+控制面（`npm run sandbox:control`）不读 `.env`，只认系统环境变量，但同样遵循 `GRASSAGENT_HOME`，沙盒状态放在 `<HOME>/sandboxes`；显式设了 `GRASSAGENT_SANDBOX_STATE_DIR` 则以它为准。
+
 | 变量 | 说明 | 默认值 |
 | --- | --- | --- |
+| `GRASSAGENT_HOME` | 宿主目录：`.env` 与所有不进工作区的状态文件的根目录 | `~/.grassagent` |
 | `GRASSAGENT_API_KEY` | API 密钥（必填） | 无 |
 | `GRASSAGENT_MODEL` | 主力模型，负责对话和解决问题 | `gpt-4o-mini` |
 | `GRASSAGENT_BASE_URL` | 主力模型 API 地址 | `https://api.openai.com/v1` |
@@ -524,7 +546,7 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_CONTEXT_WINDOW` | 上下文窗口（token），用来判断该不该压缩 | `128000` |
 | `GRASSAGENT_COMPACT_RESERVE_TOKENS` | 留给回复和摘要的 token，超过窗口减去它就开始压 | `16384` |
 | `GRASSAGENT_COMPACT_KEEP_RECENT_TOKENS` | 压缩后尽量保留的最近 token | `20000` |
-| `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径 | `~/.grassagent/sessions.db` |
+| `GRASSAGENT_SESSION_DATABASE_PATH` | 会话数据库路径。留空则用 `<GRASSAGENT_HOME>/sessions.db` | `~/.grassagent/sessions.db` |
 | `GRASSAGENT_SESSION_ID` | 会话 ID（留空则每次开新会话） | 自动生成 |
 | `GRASSAGENT_HOOKS_PATH` | 钩子配置文件。留空则用 `<工作区>/.grass/hooks.json` | 默认路径，文件可不存在 |
 | `GRASSAGENT_HOOK_TIMEOUT_MS` | 命令钩子默认超时（毫秒） | `10000` |
@@ -534,10 +556,11 @@ echo "读一下 README.md" | npm start
 | `GRASSAGENT_EXECUTION_WORLD` | `local` 或 `remote`。remote 失败不退回本机 | `local` |
 | `GRASSAGENT_SANDBOX_MODE` | 沙盒权限模式。`read-only` / `workspace-write` / `danger-full-access` | `workspace-write` |
 | `GRASSAGENT_SESSION_PROFILE` | `facing` 或 `cloud`。cloud 不带 `ask_user` | `facing` |
-| `GRASSAGENT_CLOUD_SESSION_DIRECTORY` | 云端会话记录目录。不要指到工作区里 | `~/.grassagent/cloud-sessions` |
+| `GRASSAGENT_CLOUD_SESSION_DIRECTORY` | 云端会话记录目录。不要指到工作区里 | `<GRASSAGENT_HOME>/cloud-sessions` |
 | `GRASSAGENT_TRUST_PLUGINS` | `.grass/plugins` 是否信任。`ask` / `allow` / `deny` | `ask` |
-| `GRASSAGENT_PLUGIN_TRUST_FILE` | 插件信任记录。不要指到工作区里 | `~/.grassagent/plugin-trust.json` |
+| `GRASSAGENT_PLUGIN_TRUST_FILE` | 插件信任记录。不要指到工作区里 | `<GRASSAGENT_HOME>/plugin-trust.json` |
 | `GRASSAGENT_SKILL_EVAL` | 是否打开技能评估。打开后也不进模型工具表 | `false` |
+| `GRASSAGENT_SKILL_EVAL_DIRECTORY` | 技能效果验证卡目录。不要指到工作区里 | `<GRASSAGENT_HOME>/skill-eval` |
 
 配置在启动阶段统一校验，非法值会直接报出是哪个变量、期望什么：
 
@@ -549,7 +572,7 @@ echo "读一下 README.md" | npm start
 
 用本地模型（如 Ollama）时，把 `GRASSAGENT_BASE_URL` 指向 `http://localhost:11434/v1` 即可。
 
-> `.env` 已被 `.gitignore` 忽略，不会进版本库。仓库里带的是 `.env.example`。
+> `.env` 已被 `.gitignore` 忽略，不会进版本库。仓库里带的是 `.env.example`。用 `GRASSAGENT_HOME` 把 `.env` 放到别处时，它本来就在仓库外，更不会误提交。
 
 ## 工作原理
 
@@ -640,7 +663,7 @@ echo "读一下 README.md" | npm start
 
 想退回串行：`GRASSAGENT_TOOL_EXECUTION=sequential`。
 
-**会话存储。** 会话历史存在 SQLite 里（`~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
+**会话存储。** 会话历史存在 SQLite 里（`<GRASSAGENT_HOME>/sessions.db`，默认即 `~/.grassagent/sessions.db`），用的是 Node 内置的 `node:sqlite`，不引运行时依赖。
 
 WAL 模式 + `busy_timeout`，多个进程可以同时读写同一个数据库文件。每个进程有独立的 `sessionId`，各存各的会话，互不干扰——允许多实例同时跑。
 
